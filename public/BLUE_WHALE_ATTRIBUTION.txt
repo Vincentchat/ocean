@@ -1,0 +1,8 @@
+Blue Whale - Textured
+Creator: Bohdan Lvov (https://sketchfab.com/ostapblendercg)
+Source: https://sketchfab.com/3d-models/blue-whale-textured-d24d19021c724c3a9134eebcb76b0e0f
+License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+License URL: https://creativecommons.org/licenses/by/4.0/
+
+The model is used and adapted in this ocean study. Its embedded animation,
+geometry, albedo, normal, and occlusion/roughness textures are retained.
