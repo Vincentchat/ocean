@@ -652,6 +652,45 @@ function bindingsCleared(h) {
       }
     },
   );
+  await check("P toggles the frame rate counter", async () => {
+    const h = await boot({ reduced: true });
+    try {
+      const fps = h.d.querySelector(".fps-counter");
+      assert.equal(fps.hidden, true);
+      const press = () =>
+        h.w.dispatchEvent(
+          new h.w.KeyboardEvent("keydown", {
+            key: "p",
+            code: "KeyP",
+            bubbles: true,
+          }),
+        );
+      press();
+      assert.equal(fps.hidden, false);
+      press();
+      assert.equal(fps.hidden, true);
+    } finally {
+      h.close();
+    }
+  });
+  await check("holding W moves the free camera forward", async () => {
+    const h = await boot({ reduced: true });
+    try {
+      h.frames(2);
+      const before = h.get("camera").position.z;
+      h.w.dispatchEvent(
+        new h.w.KeyboardEvent("keydown", {
+          key: "w",
+          code: "KeyW",
+          bubbles: true,
+        }),
+      );
+      h.frames(30);
+      assert(h.get("camera").position.z < before - 0.5);
+    } finally {
+      h.close();
+    }
+  });
   await check("all shader stages are composed", async () => {
     const h = await boot({ reduced: true });
     try {

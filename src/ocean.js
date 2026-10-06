@@ -30,6 +30,12 @@ import {
   installRefractionUniforms,
   createRefractionPass,
 } from "./refraction.js";
+import { createKeyboard } from "./input/keyboard.js";
+import { createFreeCamera } from "./camera/free-camera.js";
+import { createFpsCounter } from "./ui/fps-counter.js";
+import { createI18n } from "./i18n/i18n.js";
+import { englishLocale } from "./i18n/locales/en.js";
+import { japaneseLocale } from "./i18n/locales/ja.js";
 const $ = (id) => document.getElementById(id);
 const shaderCommon = `
 uniform float uTime,uWave,uWind,uSun,uMood,uDetail,uSpectral,uEnvironmentReady,uEnvironmentMix,uSkySun,uSkyMood,uEnvironmentSizeA,uEnvironmentSizeB,uGridRadialStep,uGridAngularStep,uEnvironmentIntensity,uSpectralSize,uSkyReflectionBlur,uFoamScale;
@@ -378,9 +384,9 @@ let current = "storm",
   high = true,
   time = Number.isFinite(inspectionTime) && inspectionTime >= 0 ? inspectionTime : 0;
 const qualityProfiles = {
-  balanced: { label: "標準", rate: 30, detail: 1 },
-  high: { label: "高精細", rate: 60, detail: 1 },
-  light: { label: "軽量", rate: 20, detail: 0 },
+  balanced: { labelKey: "qualityBalanced", rate: 30, detail: 1 },
+  high: { labelKey: "qualityHigh", rate: 60, detail: 1 },
+  light: { labelKey: "qualityLight", rate: 20, detail: 0 },
 };
 const pixelCap = () =>
   quality === "high"
@@ -457,12 +463,32 @@ let renderer,
   lastSpectralTime = 0,
   updateFoam = () => {},
   resizeFoam = () => {};
-let targetYaw = 0,
-  yaw = 0,
-  targetPitch = -0.28,
-  pitch = -0.28,
-  height = 4.2,
-  targetHeight = 4.2;
+let yaw = 0,
+  pitch = -0.28;
+const i18n = createI18n({
+    locales: { en: englishLocale, ja: japaneseLocale },
+    fallback: "en",
+    storageKey: "ocean-locale",
+  }),
+  { t } = i18n,
+  freeCam = createFreeCamera({
+    radius: 150,
+    speed: 6,
+    boost: 3,
+    eyeY: 4.8,
+    minY: -50,
+    maxY: 400,
+  }),
+  fpsCounter = createFpsCounter({ parent: document.body, label: t("fpsLabel") }),
+  keyboard = createKeyboard({
+    target: window,
+    onShortcut(action) {
+      if (action === "pause") setPause(!paused);
+      else if (action === "hud") toggleHUD();
+      else if (action === "escape" && hidden) toggleHUD();
+      else if (action === "fps") fpsCounter.toggle();
+    },
+  });
 function fail(e) {
   console.error(e);
   $("loading").hidden = true;
@@ -523,12 +549,11 @@ function setPreset(name) {
 }
 function setPause(value) {
   paused = value;
-  $("pause").innerHTML = paused
-    ? "▷ <span>再生</span>"
-    : "Ⅱ <span>一時停止</span>";
+  $("pause-mark").textContent = paused ? "▷" : "Ⅱ";
+  $("pause-label").textContent = t(paused ? "play" : "pause");
   $("pause").setAttribute(
     "aria-label",
-    paused ? "アニメーションを再生" : "アニメーションを一時停止",
+    t(paused ? "playAria" : "pauseAria"),
   );
 }
 function setHUDHidden(value) {
@@ -540,10 +565,41 @@ function setHUDHidden(value) {
   });
   $("hide").setAttribute(
     "aria-label",
-    hidden ? "設定を表示" : "設定を隠す",
+    t(hidden ? "settingsShow" : "settingsHide"),
   );
   $("hide").setAttribute("aria-expanded", String(!hidden));
-  $("hide").title = hidden ? "設定を表示 (H)" : "設定を隠す (H)";
+  $("hide").title = t(hidden ? "settingsShowTitle" : "settingsHideTitle");
+}
+function updateQualityLabel() {
+  const label = t(qualityProfiles[quality].labelKey);
+  $("quality").textContent = label;
+  $("quality").title = t("qualityStatus", { label });
+}
+function updateShadowLabel() {
+  $("shadow").querySelector("small").textContent = t(
+    creatureEnabled ? "shadowOn" : "shadowOff",
+  );
+}
+function updateLanguageButton() {
+  const button = $("lang");
+  button.textContent = i18n.getLocale() === "ja" ? "JA" : "EN";
+  button.title = t("languageTitle");
+  button.setAttribute("aria-label", t("languageAria"));
+}
+function renderLocale() {
+  i18n.applyTranslations(document);
+  setPause(paused);
+  setHUDHidden(hidden);
+  updateQualityLabel();
+  updateShadowLabel();
+  updateLanguageButton();
+  fpsCounter.setLabel(t("fpsLabel"));
+  updateSpeedLabel();
+}
+function updateSpeedLabel() {
+  const level = String(freeCam.speedLevel);
+  $("speed").textContent = t("speedLabel") + " " + level;
+  $("speed-out").value = level;
 }
 function toggleHUD() {
   setHUDHidden(!hidden);
@@ -1010,6 +1066,7 @@ try {
   };
   function draw(now) {
     requestAnimationFrame(draw);
+    fpsCounter.tick(now);
     let dt = Math.min((now - last) / 1000, 0.04);
     last = now;
     if (document.hidden || !atmosphereLoadSettled || !patternSettled) return;
@@ -1034,20 +1091,29 @@ try {
       presets[current].mood,
       smooth,
     );
-    yaw = settle(yaw, targetYaw, smooth);
-    pitch = settle(pitch, targetPitch, smooth);
-    height = settle(height, targetHeight, smooth);
-    camera.position.set(
-      0,
-      Math.max(height, 3.2 * uniforms.uWave.value) +
-        Math.sin(time * 0.22) * 0.08,
-      8,
-    );
+    if (
+      freeCam.update(
+        dt,
+        yaw,
+        {
+          forward: keyboard.isDown("KeyW"),
+          back: keyboard.isDown("KeyS"),
+          left: keyboard.isDown("KeyA"),
+          right: keyboard.isDown("KeyD"),
+          up: keyboard.isDown("KeyE"),
+          down: keyboard.isDown("KeyQ"),
+          boost: keyboard.isDown("ShiftLeft") || keyboard.isDown("ShiftRight"),
+        },
+        pitch,
+      )
+    )
+      needsRender = true;
+    camera.position.set(freeCam.x, freeCam.y, 8 + freeCam.z);
     const horizontal = Math.cos(pitch) * 100;
     camera.lookAt(
-      Math.sin(yaw) * horizontal,
+      freeCam.x + Math.sin(yaw) * horizontal,
       camera.position.y + Math.sin(pitch) * 100,
-      8 - Math.cos(yaw) * horizontal,
+      8 + freeCam.z - Math.cos(yaw) * horizontal,
     );
     if (spectral && (needsRender || !paused)) {
       try {
@@ -1158,7 +1224,7 @@ try {
   const pointers = new Map(),
     cv = renderer.domElement;
   let pinchDistance = 0;
-  const clampHeight = (value) => Math.max(3.5, Math.min(30, value));
+  const PITCH_LIMIT = 1.52;
   const span = () => {
     const [a, b] = [...pointers.values()];
     return a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0;
@@ -1173,17 +1239,13 @@ try {
     if (!previous) return;
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (pointers.size === 1) {
-      targetYaw -= (e.clientX - previous.x) * 0.0025;
-      targetPitch = Math.max(
-        -1.42,
-        Math.min(0.24, targetPitch + (e.clientY - previous.y) * 0.002),
+      yaw += (e.clientX - previous.x) * 0.0025;
+      pitch = Math.max(
+        -PITCH_LIMIT,
+        Math.min(PITCH_LIMIT, pitch - (e.clientY - previous.y) * 0.002),
       );
-    } else {
-      const distance = span();
-      if (distance > 8 && pinchDistance > 8)
-        targetHeight = clampHeight((targetHeight * pinchDistance) / distance);
-      pinchDistance = distance;
-    }
+      needsRender = true;
+    } else pinchDistance = span();
   });
   const releasePointer = (e) => {
     pointers.delete(e.pointerId);
@@ -1191,14 +1253,28 @@ try {
   };
   for (const event of ["pointerup", "pointercancel", "lostpointercapture"])
     cv.addEventListener(event, releasePointer);
-  cv.addEventListener(
+  let wheelRemainder = 0;
+  addEventListener(
     "wheel",
     (e) => {
       e.preventDefault();
-      targetHeight = clampHeight(targetHeight + e.deltaY * 0.008);
+      const pixels =
+        e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? innerHeight : 1;
+      wheelRemainder += e.deltaY * pixels;
+      const notch = 100;
+      while (wheelRemainder >= notch) {
+        wheelRemainder -= notch;
+        freeCam.setSpeedLevel(freeCam.speedLevel - 1);
+      }
+      while (wheelRemainder <= -notch) {
+        wheelRemainder += notch;
+        freeCam.setSpeedLevel(freeCam.speedLevel + 1);
+      }
+      updateSpeedLabel();
     },
-    { passive: false },
+    { passive: false, capture: true },
   );
+  addEventListener("contextmenu", (e) => e.preventDefault());
   addEventListener("resize", () => {
     needsRender = true;
     camera.aspect = innerWidth / innerHeight;
@@ -1206,7 +1282,7 @@ try {
     renderer.setPixelRatio(Math.min(devicePixelRatio, pixelCap()));
     renderer.setSize(innerWidth, innerHeight);
   });
-  $("quality").textContent = qualityProfiles[quality].label;
+  updateQualityLabel();
   $("quality").onclick = () => {
     needsRender = true;
     quality =
@@ -1222,18 +1298,14 @@ try {
     sea.geometry = oceanGeometry();
     oldGeometry.dispose();
     renderer.setPixelRatio(Math.min(devicePixelRatio, pixelCap()));
-    $("quality").textContent = qualityProfiles[quality].label;
-    $("quality").title =
-      "画質: " + qualityProfiles[quality].label + "（時間補間あり）";
+    updateQualityLabel();
   };
   $("shadow").onclick = () => {
     creatureEnabled = !creatureEnabled;
     creature?.setEnabled(creatureEnabled);
     whaleBreath?.setEnabled(creatureEnabled);
     $("shadow").setAttribute("aria-pressed", String(creatureEnabled));
-    $("shadow").querySelector("small").textContent = creatureEnabled
-      ? "表示中"
-      : "非表示";
+    updateShadowLabel();
     needsRender = true;
   };
 } catch (e) {
@@ -1248,32 +1320,25 @@ $("pause").onclick = () => setPause(!paused);
 $("hide").onclick = toggleHUD;
 $("reset").onclick = () => {
   setPreset(current);
-  targetYaw = 0;
-  targetPitch = -0.28;
-  targetHeight = 4.2;
+  yaw = 0;
+  pitch = -0.28;
+  freeCam.reset();
 };
 $("fullscreen").onclick = async () => {
   try {
     if (document.fullscreenElement) await document.exitFullscreen();
     else await document.documentElement.requestFullscreen();
   } catch (e) {
-    $("fullscreen").title = "このブラウザでは全画面表示を利用できません";
+    $("fullscreen").title = t("fullscreenUnavailable");
   }
 };
-addEventListener("keydown", (e) => {
-  if (e.target.matches("input,textarea,select,[contenteditable='true']")) return;
-  if (e.code === "Space") {
-    if (e.target.matches("button,a")) return;
-    e.preventDefault();
-    setPause(!paused);
-  }
-  if (e.key.toLowerCase() === "h") toggleHUD();
-  if (e.key === "Escape" && hidden) toggleHUD();
-});
+$("lang").onclick = () => {
+  i18n.setLocale(i18n.getLocale() === "en" ? "ja" : "en");
+};
+i18n.onLocaleChange(renderLocale);
 setPreset(current);
-setPause(paused);
-setHUDHidden(hidden);
 updateInputs();
+renderLocale();
 if (document.modelContext?.registerTool) {
   try {
     document.modelContext.registerTool({

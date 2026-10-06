@@ -160,7 +160,7 @@ h1 {
   letter-spacing: 1.1px;
   opacity: 0.63;
 }
-.intro p span {
+.intro p span[aria-hidden] {
   padding: 0 8px;
 }
 .panel {
@@ -305,8 +305,44 @@ input[type="range"]:focus-visible {
 .panel-footer button {
   padding: 3px 0;
 }
-.panel-footer span {
+#pause-label,
+#reset span {
   margin-left: 5px;
+}
+.speed-readout {
+  padding: 7px 10px;
+  border: 1px solid #e5f3eb38;
+  border-radius: 999px;
+  font-size: 10px;
+  letter-spacing: 1.2px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+.speed-setting {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 0 0 12px;
+  font-size: 10px;
+  letter-spacing: 0.8px;
+}
+.speed-setting output {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.65;
+}
+.fps-counter {
+  position: fixed;
+  top: 78px;
+  right: 38px;
+  z-index: 3;
+  padding: 6px 10px;
+  border: 1px solid #e5f3eb38;
+  border-radius: 999px;
+  background: #0c1e2591;
+  font-size: 11px;
+  letter-spacing: 0.8px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
 }
 footer {
   position: fixed;
@@ -404,6 +440,10 @@ footer button {
   }
   .brand svg {
     width: 25px;
+  }
+  .fps-counter {
+    top: 64px;
+    right: 20px;
   }
   .intro {
     left: 24px;

@@ -7,6 +7,7 @@
     <title>NAGI — Ocean study</title>
     <meta
       name="description"
+      data-i18n-content="metaDescription"
       content="光と波を、リアルタイムに。Three.js ocean shader study."
     />
     <link
@@ -18,6 +19,7 @@
   <body class="hide-ui">
     <main
       id="scene"
+      data-i18n-aria-label="sceneAria"
       aria-label="インタラクティブな海。ドラッグで視点を移動"
     ></main>
     <header>
@@ -26,6 +28,8 @@
         href="https://github.com/noxellab/nagi-ocean-sim"
         target="_blank"
         rel="noopener"
+        data-i18n-title="brandTitle"
+        data-i18n-aria-label="brandAria"
         title="noxellab による NAGI のソース"
         aria-label="noxellab による NAGI のソースを開く"
         ><svg viewBox="0 0 40 24" fill="none">
@@ -34,19 +38,23 @@
       >
       <div class="top-actions">
         <span class="live"><i></i> REALTIME</span
+        ><span id="speed" class="speed-readout">Speed 2</span
         ><a
           class="github"
           href="https://github.com/noxellab/nagi-ocean-sim"
           target="_blank"
           rel="noopener"
           title="GitHub"
+          data-i18n-aria-label="githubAria"
           aria-label="GitHub リポジトリ"
           ><svg viewBox="0 0 16 16" aria-hidden="true">
             <path
               d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"
             /></svg></a
+        ><button id="lang" type="button">JA</button
         ><button
           id="hide"
+          data-i18n="settings"
           title="設定を表示 (H)"
           aria-label="設定を表示"
           aria-expanded="false"
@@ -57,25 +65,43 @@
     </header>
     <div class="intro hud">
       <div class="eyebrow">A STUDY IN LIGHT & WATER</div>
-      <h1>ただ、波を眺める。</h1>
-      <p>ドラッグで見渡す<span> · </span>スクロール / ピンチで近づく</p>
+      <h1 data-i18n="headline">ただ、波を眺める。</h1>
+      <p>
+        <span data-i18n="introLook">ドラッグで見渡す</span
+        ><span aria-hidden="true"> · </span
+        ><span data-i18n="introZoom">スクロールでカメラ速度</span>
+      </p>
     </div>
-    <section class="panel hud" aria-label="海の設定">
+    <section
+      class="panel hud"
+      data-i18n-aria-label="panelAria"
+      aria-label="海の設定"
+    >
       <div class="panel-head">
-        <span>海の表情</span><span class="index">01 — 03</span>
+        <span data-i18n="panelHead">海の表情</span
+        ><span class="index">01 — 03</span>
       </div>
-      <div class="presets" role="group" aria-label="情景">
+      <div
+        class="presets"
+        role="group"
+        data-i18n-aria-label="presetsAria"
+        aria-label="情景"
+      >
         <button data-preset="golden" aria-pressed="false">
-          <i class="golden"></i>夕凪</button
+          <i class="golden"></i
+          ><span data-i18n="presetGolden">夕凪</span></button
         ><button data-preset="azure" aria-pressed="false">
-          <i class="azure"></i>青の時間</button
+          <i class="azure"></i
+          ><span data-i18n="presetAzure">青の時間</span></button
         ><button data-preset="storm" class="active" aria-pressed="true">
-          <i class="storm"></i>雨のあと
+          <i class="storm"></i
+          ><span data-i18n="presetStorm">雨のあと</span>
         </button>
       </div>
       <div class="sliders">
         <label for="wave"
-          ><span>波の高さ</span><output id="wave-out">1.5</output></label
+          ><span data-i18n="waveHeight">波の高さ</span
+          ><output id="wave-out">1.5</output></label
         ><input
           id="wave"
           type="range"
@@ -84,7 +110,8 @@
           step="0.05"
           value="1.5"
         /><label for="wind"
-          ><span>風の強さ</span><output id="wind-out">1.0</output></label
+          ><span data-i18n="windStrength">風の強さ</span
+          ><output id="wind-out">1.0</output></label
         ><input
           id="wind"
           type="range"
@@ -93,22 +120,36 @@
           step="0.05"
           value="1"
         /><label for="light"
-          ><span>太陽の高さ</span><output id="light-out">50°</output></label
+          ><span data-i18n="sunHeight">太陽の高さ</span
+          ><output id="light-out">50°</output></label
         ><input id="light" type="range" min="2" max="55" step="1" value="38" />
+      </div>
+      <div class="speed-setting">
+        <span data-i18n="cameraSpeed">カメラ速度</span
+        ><output id="speed-out">2</output>
       </div>
       <button
         id="shadow"
         class="shadow-toggle"
         type="button"
         aria-pressed="true"
+        data-i18n-title="shadowTitle"
         title="波間の影の表示切替"
       >
-        <span>波間の影</span><small>表示中</small>
+        <span data-i18n="shadow">波間の影</span><small>表示中</small>
       </button>
       <div class="panel-footer">
-        <button id="pause" aria-label="アニメーションを一時停止">
-          Ⅱ <span>一時停止</span></button
-        ><button id="reset" title="視点と設定をリセット">↺ リセット</button>
+        <button id="pause" type="button" aria-label="アニメーションを一時停止">
+          <span id="pause-mark" aria-hidden="true">Ⅱ</span
+          ><span id="pause-label">一時停止</span></button
+        ><button
+          id="reset"
+          type="button"
+          data-i18n-title="resetTitle"
+          title="視点と設定をリセット"
+        >
+          ↺ <span data-i18n="reset">リセット</span>
+        </button>
       </div>
     </section>
     <footer class="hud">
@@ -122,24 +163,33 @@
         rel="noopener"
       >Whale · Bohdan Lvov</a></div>
       <div>
-        <button id="quality" title="描画品質の切替（標準・高精細・軽量）">
+        <button id="quality" type="button" title="描画品質の切替（標準・高精細・軽量）">
           標準</button
-        ><button id="fullscreen" title="全画面表示" aria-label="全画面表示">
+        ><button
+          id="fullscreen"
+          type="button"
+          data-i18n-title="fullscreen"
+          data-i18n-aria-label="fullscreen"
+          title="全画面表示"
+          aria-label="全画面表示"
+        >
           ⛶
         </button>
       </div>
     </footer>
     <div id="loading">
       <div class="loading-wave">〜</div>
-      <span>海を描いています</span>
+      <span data-i18n="loading">海を描いています</span>
     </div>
     <div id="error" hidden role="alert">
-      <h2>海を表示できませんでした</h2>
-      <p>
+      <h2 data-i18n="errorTitle">海を表示できませんでした</h2>
+      <p data-i18n="errorBody">
         WebGL 2
         が使えるブラウザで開き、ハードウェアアクセラレーションを有効にしてください。
       </p>
-      <button onclick="location.reload()">もう一度試す</button>
+      <button type="button" data-i18n="retry" onclick="location.reload()">
+        もう一度試す
+      </button>
     </div>
     <script
       type="module"

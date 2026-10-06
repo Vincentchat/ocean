@@ -25,12 +25,16 @@ Open the displayed local URL in a WebGL 2 compatible browser.
 
 ## Controls
 
-- Drag: move the viewpoint
-- Scroll or pinch: adjust the camera height
+- Drag: look around. Moving right or up turns the view right or up
+- Scroll: camera speed only, from 1 to 5. The default is 2. The current setting is shown in the header and in the settings panel. Movement stays on the keys
+- `W` `A` `S` `D` (or `Z` `Q` `S` `D` on an AZERTY keyboard): fly along the look direction, including above and below the surface. Hold `Shift` to move faster. Horizontal movement stays within 150 m of the start
+- `Q` and `E` move straight down and up. On an AZERTY keyboard those keys are labeled `A` and `E`
 - `Space`: play or pause
 - `H`: show or hide the settings panel
-- **Settings** (`設定`): choose the scene and adjust waves, wind, sun, and rendering quality
-- **Shadow between the waves** (`波間の影`): show or hide the whale
+- `P`: show or hide the frame rate counter
+- **Settings**: choose the scene and adjust waves, wind, sun, and rendering quality
+- **Shadow between the waves**: show or hide the whale
+- **EN / JA**: switch between English and Japanese. The choice is remembered in this browser
 
 ## Verification
 
