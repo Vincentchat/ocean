@@ -1,0 +1,14 @@
+[
+  { "name": "lod-c1-h4.8", "query": "shot&t=10&debug=lod&cam=0,4.8,8,0,-16" },
+  { "name": "lod-c5-h1.2", "query": "shot&t=10&debug=lod&cam=0,1.2,8,-17,-1.1" },
+  { "name": "lod-c4-h60", "query": "shot&t=10&debug=lod&cam=0,60,8,0,-43" },
+  { "name": "lod-h400-horizon", "query": "shot&t=10&debug=lod&cam=0,400,8,0,-8" },
+  { "name": "lod-h500-horizon", "query": "shot&t=10&debug=lod&cam=0,500,8,30,-3" },
+  { "name": "lod-h500-down", "query": "shot&t=10&debug=lod&cam=0,500,8,0,-60" },
+  { "name": "lod-topdown-h30", "query": "shot&t=10&debug=lod&cam=0.37,30,8.21,0,-90" },
+  { "name": "lod-c6-closedown", "query": "shot&t=10&debug=lod&cam=20,3,-20,0,-69" },
+  { "name": "water-c5-h1.2", "query": "shot&t=10&cam=0,1.2,8,-17,-1.1" },
+  { "name": "water-h400", "query": "shot&t=10&cam=0,400,8,0,-8" },
+  { "name": "water-h500", "query": "shot&t=10&cam=0,500,8,30,-3" },
+  { "name": "water-c4-h60", "query": "shot&t=10&cam=0,60,8,0,-43" }
+]

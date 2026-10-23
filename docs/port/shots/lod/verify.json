@@ -1,0 +1,21 @@
+[
+  { "name": "swim-base", "query": "shot&t=10&cam=0,4.8,8,0,-16" },
+  { "name": "swim-lodoff", "query": "shot&t=10&cam=0,4.8,8,0,-16&debug=lodoff:0.37:0.23" },
+  { "name": "swim-facets-base", "query": "shot&t=10&cam=0,4.8,8,0,-16&debug=facets" },
+  { "name": "swim-facets-lodoff", "query": "shot&t=10&cam=0,4.8,8,0,-16&debug=facets,lodoff:0.37:0.23" },
+  { "name": "swim-facets-nosnap", "query": "shot&t=10&cam=0,4.8,8,0,-16&debug=facets,nosnap" },
+  { "name": "swim-facets-nosnap-lodoff", "query": "shot&t=10&cam=0,4.8,8,0,-16&debug=facets,nosnap,lodoff:0.37:0.23" },
+  { "name": "swim-nosnap", "query": "shot&t=10&cam=0,4.8,8,0,-16&debug=nosnap" },
+  { "name": "swim-nosnap-lodoff", "query": "shot&t=10&cam=0,4.8,8,0,-16&debug=nosnap,lodoff:0.37:0.23" },
+  { "name": "pan-a", "query": "shot&t=10&cam=0.0,200,8,0,-89&debug=facets" },
+  { "name": "pan-b", "query": "shot&t=10&cam=6.8417,200,8,0,-89&debug=facets" },
+  { "name": "pan-a-nosnap", "query": "shot&t=10&cam=0.0,200,8,0,-89&debug=facets,nosnap" },
+  { "name": "pan-b-nosnap", "query": "shot&t=10&cam=6.8417,200,8,0,-89&debug=facets,nosnap" },
+  { "name": "origin-0", "query": "shot&t=10&cam=0,4.8,8,0,-16" },
+  { "name": "origin-101376", "query": "shot&t=10&cam=0,4.8,8,0,-16&origin=101376,0,101376" },
+  { "name": "origin-9999360", "query": "shot&t=10&cam=0,4.8,8,0,-16&origin=9999360,0,9999360" },
+  { "name": "origin-100000", "query": "shot&t=10&cam=0,4.8,8,0,-16&origin=100000,0,100000" },
+  { "name": "origin-shift-live", "query": "shot&t=10&cam=0,4.8,8,0,-16", "eval": "(window.__demo.origin.shift(1234.567,0,-987.65), JSON.stringify(window.__demo.origin.origin))" },
+  { "name": "origin-1e7-lod", "query": "shot&t=10&cam=0,4.8,8,0,-16&debug=lod&origin=9999360,0,9999360" },
+  { "name": "origin-0-lod", "query": "shot&t=10&cam=0,4.8,8,0,-16&debug=lod" }
+]

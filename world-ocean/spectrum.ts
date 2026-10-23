@@ -59,8 +59,27 @@
 // The surface point at rest r is drawn at r + D.horiz, height D.up.
 //
 // Crossfade (wind / preset changes, no pop): the drawn h0 is
-//     h0 = lerp(h0[fromSlot], h0[toSlot], blend)    (both h0 and h0m),   chop = state.chop
-// with `blend` and `chop` read from OceanState every frame (see index.ts getState()).
+//     h0 = lerp(h0[fromSlot], h0[toSlot], w(t))   (both h0 and h0m),   chop = lerp(chop_from, chop_to, w(t))
+//     w(t) = smoothstep(clamp((t - blendStart) / blendDuration, 0, 1))      (w = 1 if fromSlot == toSlot)
+// fromSlot / toSlot / blendStart / blendDuration come from ocean.getState() (they change when
+// state.blendVersion bumps; blendStart may lie up to ~1.6 s in the future: w = 0 until then).
+// Evaluate w and chop at the draw time with ocean.blendAt(t) / ocean.choppinessAt(t).
+//
+// GPU checklist for CPU = GPU parity (what index.ts's WATER_QUERY assumes is drawn):
+//  1. Upload state.slots[s].h0[c] (256 master layout; spectrum.resampleCentred() for tier size N)
+//     whenever slots[s].version changes, plus state.omegaIndex[c] once. Size-N grids of the same
+//     cascade are exact subsets / zero-paddings of the 256 master: same waves at every tier.
+//  2. Evolve at the EXACT draw time (FrameInfo.interpolatedTime) with the integer-index phase above
+//     (no snapshot interpolation in time; the reference's 20-60 Hz snapshots + lerp are dropped).
+//  3. h0 = lerp(slot[fromSlot], slot[toSlot], ocean.blendAt(t)); chop = ocean.choppinessAt(t).
+//  4. Displacement texture per cascade = (up, east, north) as defined above, chop applied to east /
+//     north only. rgba16float is fine (~2 mm quantisation at 4 m amplitudes).
+//  5. Vertex displacement: chained lookup (above), BILINEAR at LOD 0 with uv = a / L + 0.5 / N
+//     (a = east + OFF, b = -north + OFF, both wrapped with origin.wrapped(L) on the GPU). The CPU
+//     samples the same 256 grids bilinearly; a smoothing filter (the reference's B-spline at LOD 0)
+//     or a different N for cascades 0 / 1 changes the drawn heights by up to a few % of Hs.
+//     Mip levels for distant vertices are fine (parity matters near the camera).
+//  6. Measured CPU vs "256^3 bilinear exact-time" parity: tests/core-parity.test.ts.
 //
 // =====================================================================================
 // REFERENCE CONSTANTS (src/spectral-ocean.js unless noted)

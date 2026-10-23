@@ -10,7 +10,7 @@
     "./three": "./three/index.ts"
   },
   "scripts": {
-    "test": "node --experimental-strip-types --test tests/",
+    "test": "node --experimental-strip-types --test \"tests/*.test.ts\"",
     "demo": "vite --config vite.config.mjs --host 127.0.0.1 --port 5180 --strictPort",
     "reference": "node tools/serve.mjs --reference --port 5173",
     "capture": "node tools/capture.mjs",

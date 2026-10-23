@@ -1,6 +1,6 @@
 // Config + parameter definitions for world/ocean. No three import.
 //
-// Single import location for the engine contracts (spec ??9): on import into the engine, change the
+// Single import location for the engine contracts (spec section 9): on import into the engine, change the
 // line below to `from '@dreamp/world-core'` and delete stubs/.
 export type {
   Vec3, TangentFrame, WorldShape, FloatingOrigin, WaterQuery, WindQuery, EnvironmentState,
@@ -11,7 +11,7 @@ export {
   WATER_QUERY, WIND_QUERY, ENVIRONMENT, TERRAIN_QUERY, TERRAIN_GPU, SKY_LIGHT,
 } from './stubs/world-core.ts';
 
-import type { Vec3 } from './stubs/world-core.ts';
+import type { Vec3, WorldShape } from './stubs/world-core.ts';
 import type { SpectrumParams } from './spectrum.ts';
 export type { SpectrumParams, CascadeDef } from './spectrum.ts';
 
@@ -82,7 +82,7 @@ export interface OceanOptions extends Partial<SpectrumParams>, Partial<SimParams
   /** Optional perf sink (engine perf.begin/end). */
   perf?: PerfSink;
   /** Shape to use before install() (standalone / tests). install() uses world.shape if not given. */
-  shape?: import('./stubs/world-core.ts').WorldShape;
+  shape?: WorldShape;
 }
 
 /** One tunable's definition (UI / docs / validation). */
@@ -110,15 +110,17 @@ export const DEFAULT_SIM_PARAMS: Readonly<SimParams> = Object.freeze({
 });
 
 /**
- * CPU query cascades. Cascade 0 (1024 m) carries ~96 % of the height variance, so the CPU runs it
- * at the GPU's 256 with the same bilinear filter (bit-for-bit the same grid as the GPU draws).
- * Cascade 1 (96 m, ~4 %) at 128 with Catmull-Rom; cascade 2 (9 m, ~0.03 %) at 32.
- * Measured parity vs a full 256^3 bilinear evaluation: see tests/core-parity.test.ts.
+ * CPU query cascades. Cascades 0 (1024 m, ~96 % of the height variance at 'breeze') and 1 (96 m,
+ * ~4 %) run at 256, i.e. the same grid + bilinear filter the GPU draws at 256 (identical numbers
+ * up to float32 / Hermite-in-time rounding). Cascade 2 (9 m, ~0.03 %) runs at 128, an exact
+ * spectral subset of the 256 grid (modes |k| < 64 dk). Snapshot spacing in time: 0.4 / 0.25 / 0.1 s.
+ * Cost and measured parity vs a full 256^3 evaluation: see tests/core-parity.test.ts and the report.
+ * LITE alternative (half the CPU): [{256, .4}, {128, .25, 'cubic'}, {64, .1}] (p99 error ~1.2 % of Hs).
  */
 export const DEFAULT_QUERY_CASCADES: readonly QueryCascadeConfig[] = Object.freeze([
   Object.freeze({ size: 256, snapshotDt: 0.4, filter: 'bilinear' as const }),
   Object.freeze({ size: 256, snapshotDt: 0.25, filter: 'bilinear' as const }),
-  Object.freeze({ size: 64, snapshotDt: 0.1, filter: 'bilinear' as const }),
+  Object.freeze({ size: 128, snapshotDt: 0.1, filter: 'bilinear' as const }),
 ]);
 
 /** Every tunable with min / max / unit / label / default (default = the 'breeze' preset). */

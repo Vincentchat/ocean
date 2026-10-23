@@ -163,21 +163,35 @@ export function naiveDft2d(n: number, re: Float64Array, im: Float64Array, sign: 
 // One CascadeSim per cascade evaluates the SAME spectrum the GPU draws (the centred sub-block of
 // the 256 master h0, see spectrum.ts) at the CPU size n, following the conventions in spectrum.ts.
 //
+// Sources: the evolved spectrum is h0(t) = lerp(h0[from], h0[to], w(t)) with the crossfade weight
+// w(t) = smoothstep((t - start) / duration) (w = 1 when from == to): exactly what the GPU draws.
+// A source is (id, from, to, start, duration); at most two are alive per cascade: the ACTIVE one
+// and a PENDING one (the next crossfade, defined ahead of time with a start in the future so its
+// snapshots can be computed in the background; switching to it changes nothing before `start`).
+//
 // Time: full fields ("snapshots": height + horizontal displacement AND their exact time
-// derivatives, analytic i*omega terms, 3 complex IFFTs) are computed at times j * snapshotDt.
-// Any time t is evaluated by cubic Hermite interpolation between the two bracketing snapshots
-// using those exact derivatives (error ~ (omega dt)^4 / 384: < 1e-3 of the fastest mode's
-// amplitude with the defaults). Velocities are the derivative of the same Hermite curve.
+// derivatives, analytic i*omega terms incl. the dw/dt crossfade term, 3 complex IFFTs) are computed
+// at times j * snapshotDt. Any time t is evaluated by cubic Hermite interpolation between the two
+// bracketing snapshots using those exact derivatives (error ~ (omega dt)^4 / 384: < 0.3 % of Hs
+// with the defaults). Velocities are the derivative of the same Hermite curve.
 // Snapshots are computed AHEAD of time and amortised over ticks (resumable job: evolve rows,
 // row FFTs, column stages, pack rows), so a tick never pays a whole 256^2 x 3 FFT.
 //
 // Snapshot layout: Float32Array n*n*6, texel (x, y) at 6*(y*n + x):
 //   [ H (m, up), E (m, east, WITHOUT choppiness), N (m, north, without choppiness),
 //     dH/dt, dE/dt, dN/dt (m/s) ]
-// Frame layout ("materialised" field at one time, crossfade + choppiness applied): same 6 channels,
-// E / N / dE / dN include choppiness.
+// Frames ("materialised" field at one time, choppiness applied): positions Float32Array n*n*3
+// [H, E, N] (filled lazily per 16x16 block on first query touch) and velocities n*n*3
+// [dH/dt, dE/dt, dN/dt] (filled when a velocity query needs them). Two frames are cached.
 
 export const FIELD_STRIDE = 6;
+
+/**
+ * Argument block for the calls that take doubles (setSource: [start, duration]; schedule:
+ * [T, tickDt]; materialise: [t, chop, dchop]). Doubles passed as call arguments to a non-inlined
+ * function are boxed by V8 (a heap allocation per call); a typed-array slot is not.
+ */
+export const CALL = new Float64Array(8);
 
 export interface QueryCascadeSettings {
   readonly size: number;
@@ -186,15 +200,16 @@ export interface QueryCascadeSettings {
 }
 
 interface Snapshot {
-  slot: number;
-  version: number;
-  j: number;
+  src: number;   // source id
+  j: number;     // time index (t = j * snapshotDt)
   valid: boolean;
   lastUse: number;
   readonly data: Float32Array;
 }
 
-const MAX_PINS = 12;
+const MAX_PINS = 8;
+/** lastUse marker that keeps a snapshot from being evicted during materialise() (a Smi: no boxing). */
+const PINNED_USE = 0x3fffffff;
 
 export class CascadeSim {
   readonly n: number;
@@ -203,13 +218,21 @@ export class CascadeSim {
   readonly snapshotDt: number;
   readonly cubic: boolean;
   readonly plan: FftPlan;
-  /** Materialised fields (2 cache entries), FIELD_STRIDE floats per texel. */
+  /** Materialised positions (2 cache entries), 3 floats per texel: H, E, N. */
   readonly frames: Float32Array[];
   /** Velocity frames (dH/dt, dE/dt, dN/dt), filled only when materialised withVel. */
   readonly velFrames: Float32Array[];
   readonly frameHasVel: Uint8Array;
   readonly frameTime: Float64Array;
   readonly frameStamp: Float64Array;
+  /**
+   * Lazy materialisation: position frames of bilinear cascades are filled per 16 x 16 texel block
+   * on first touch by a query (blockValid[frame][by * nb + bx]); materialise() only records the
+   * Hermite coefficients and snapshot references. Cuts the per-tick cost to what queries use.
+   */
+  readonly blockShift: number;
+  readonly nb: number;
+  readonly blockValid: Uint8Array[];
   readonly unitsPerSnapshot: number;
   /** Number of snapshots computed so far (diagnostics). */
   computed = 0;
@@ -218,14 +241,19 @@ export class CascadeSim {
   private readonly kxn: Float64Array;
   private readonly kzn: Float64Array;
   private readonly slotH0: Float32Array[];
-  private readonly slotVersion: Int32Array;
+  // Source table: entry 0 = active, 1 = pending (id -1 = empty).
+  private readonly srcId: Int32Array;
+  private readonly srcFrom: Int32Array;
+  private readonly srcTo: Int32Array;
+  private readonly srcStart: Float64Array;
+  private readonly srcDur: Float64Array;
   private readonly re1: Float64Array; private readonly im1: Float64Array;
   private readonly re2: Float64Array; private readonly im2: Float64Array;
   private readonly re3: Float64Array; private readonly im3: Float64Array;
   private readonly pool: Snapshot[];
   private useCounter = 0;
-  private readonly pinSlot: Int32Array;
-  private readonly pinJ: Float64Array;
+  private readonly pinSrc: Int32Array;
+  private readonly pinJ: Int32Array;
   private pinCount = 0;
   // Resumable job
   private jobSnap = -1;
@@ -233,6 +261,9 @@ export class CascadeSim {
   private jobProgress = 0;
   private readonly rowsEvolve: number;
   private readonly rowsFft: number;
+  // Lazy frame state: per frame 2 pool references (A, B; -1 = none) + coefficients.
+  private readonly lazyRef: Int32Array;
+  private readonly lazyCoef: Float64Array; // per frame: a0 a1 b0 b1 chop
 
   constructor(def: Readonly<CascadeDef>, cfg: Readonly<QueryCascadeSettings>, masterOmegaIndex: Float32Array, numSlots: number, poolSize: number) {
     const n = cfg.size;
@@ -261,21 +292,31 @@ export class CascadeSim {
     }
     this.slotH0 = [];
     for (let s = 0; s < numSlots; s++) this.slotH0.push(new Float32Array(nn * 4));
-    this.slotVersion = new Int32Array(numSlots).fill(-1);
+    this.srcId = new Int32Array(2).fill(-1);
+    this.srcFrom = new Int32Array(2);
+    this.srcTo = new Int32Array(2);
+    this.srcStart = new Float64Array(2);
+    this.srcDur = new Float64Array(2).fill(1);
     this.re1 = new Float64Array(nn); this.im1 = new Float64Array(nn);
     this.re2 = new Float64Array(nn); this.im2 = new Float64Array(nn);
     this.re3 = new Float64Array(nn); this.im3 = new Float64Array(nn);
     this.pool = [];
     for (let i = 0; i < poolSize; i++) {
-      this.pool.push({ slot: -1, version: -1, j: 0, valid: false, lastUse: 0, data: new Float32Array(nn * FIELD_STRIDE) });
+      this.pool.push({ src: -1, j: 0, valid: false, lastUse: 0, data: new Float32Array(nn * FIELD_STRIDE) });
     }
     this.frames = [new Float32Array(nn * 3), new Float32Array(nn * 3)];
     this.velFrames = [new Float32Array(nn * 3), new Float32Array(nn * 3)];
     this.frameHasVel = new Uint8Array(2);
     this.frameTime = new Float64Array([NaN, NaN]);
     this.frameStamp = new Float64Array([-1, -1]);
-    this.pinSlot = new Int32Array(MAX_PINS);
-    this.pinJ = new Float64Array(MAX_PINS);
+    const block = Math.min(16, n);
+    this.blockShift = Math.round(Math.log2(block));
+    this.nb = n >> this.blockShift;
+    this.blockValid = [new Uint8Array(this.nb * this.nb), new Uint8Array(this.nb * this.nb)];
+    this.lazyRef = new Int32Array(4).fill(-1);
+    this.lazyCoef = new Float64Array(10);
+    this.pinSrc = new Int32Array(MAX_PINS);
+    this.pinJ = new Int32Array(MAX_PINS);
     // ~4096 cells per evolve / pack unit, ~16k butterflies per row-FFT unit, one column stage per unit.
     this.rowsEvolve = Math.max(1, Math.floor(4096 / n));
     this.rowsFft = Math.max(1, Math.floor(16384 / ((n / 2) * this.plan.log2n)));
@@ -283,38 +324,68 @@ export class CascadeSim {
     this.unitsPerSnapshot = evolveUnits + 3 * Math.ceil(n / this.rowsFft) + 3 * (1 + this.plan.log2n) + evolveUnits;
   }
 
-  /** Copy a crossfade slot's master h0 (256 layout) into this cascade's size. Setup / on regeneration. */
-  setSlot(slot: number, masterH0: Float32Array, version: number): void {
+  /**
+   * Copy a slot's master h0 (256 layout) into this cascade's size. Snapshots of sources that use
+   * the slot become invalid. Setup / on regeneration (never per tick).
+   */
+  setSlot(slot: number, masterH0: Float32Array): void {
     resampleCentred(masterH0, this.slotH0[slot], this.n, 4, true);
-    this.slotVersion[slot] = version;
-    if (this.jobSnap >= 0 && this.pool[this.jobSnap].slot === slot) this.jobSnap = -1;
-    for (let i = 0; i < this.pool.length; i++) if (this.pool[i].slot === slot) this.pool[i].valid = false;
-    this.frameStamp[0] = this.frameStamp[1] = -1;
+    for (let e = 0; e < 2; e++) {
+      const id = this.srcId[e];
+      if (id >= 0 && (this.srcFrom[e] === slot || this.srcTo[e] === slot)) this.invalidateSource(id);
+    }
   }
 
-  private find(slot: number, j: number): number {
-    const v = this.slotVersion[slot];
+  /** Define table entry e (0 active, 1 pending) as source `id` = lerp(slot from -> to), start = CALL[0], duration = CALL[1]. id -1 clears. */
+  setSource(e: number, id: number, from: number, to: number): void {
+    const old = this.srcId[e];
+    if (old >= 0 && old !== id && this.srcId[1 - e] !== old) this.invalidateSource(old);
+    this.srcId[e] = id;
+    this.srcFrom[e] = from;
+    this.srcTo[e] = to;
+    this.srcStart[e] = CALL[0];
+    this.srcDur[e] = CALL[1] > 0 ? CALL[1] : 1;
+  }
+
+  private invalidateSource(id: number): void {
+    if (this.jobSnap >= 0 && this.pool[this.jobSnap].src === id) this.jobSnap = -1;
+    for (let i = 0; i < this.pool.length; i++) if (this.pool[i].src === id) { this.pool[i].valid = false; this.pool[i].src = -1; }
+    for (let f = 0; f < 2; f++) {
+      if (this.lazyRef[2 * f] >= 0 && this.pool[this.lazyRef[2 * f]].src === -1) this.frameStamp[f] = -1;
+    }
+  }
+
+  private entryOf(id: number): number {
+    return this.srcId[0] === id ? 0 : this.srcId[1] === id ? 1 : -1;
+  }
+
+  private find(src: number, j: number): number {
     for (let i = 0; i < this.pool.length; i++) {
       const s = this.pool[i];
-      if (s.valid && s.slot === slot && s.j === j && s.version === v) return i;
+      if (s.valid && s.src === src && s.j === j) return i;
     }
     return -1;
   }
 
-  has(slot: number, j: number): boolean { return this.find(slot, j) >= 0; }
+  has(src: number, j: number): boolean { return this.find(src, j) >= 0; }
 
   private isPinned(s: Snapshot): boolean {
-    for (let p = 0; p < this.pinCount; p++) if (this.pinSlot[p] === s.slot && this.pinJ[p] === s.j) return true;
+    for (let p = 0; p < this.pinCount; p++) if (this.pinSrc[p] === s.src && this.pinJ[p] === s.j) return true;
     return false;
   }
 
-  private acquire(slot: number, j: number): number {
+  private isLazyRef(i: number): boolean {
+    const r = this.lazyRef;
+    return r[0] === i || r[1] === i || r[2] === i || r[3] === i;
+  }
+
+  private acquire(src: number, j: number): number {
     let best = -1, bestUse = Infinity;
     for (let i = 0; i < this.pool.length; i++) {
       const s = this.pool[i];
       if (i === this.jobSnap) continue;
-      if (!s.valid || s.version !== this.slotVersion[s.slot < 0 ? 0 : s.slot]) { best = i; break; }
-      if (this.isPinned(s)) continue;
+      if (!s.valid || this.entryOf(s.src) < 0) { best = i; break; }
+      if (this.isPinned(s) || this.isLazyRef(i)) continue;
       if (s.lastUse < bestUse) { bestUse = s.lastUse; best = i; }
     }
     if (best < 0) { // everything pinned: take the least recently used anyway
@@ -322,18 +393,26 @@ export class CascadeSim {
         if (i !== this.jobSnap && this.pool[i].lastUse < bestUse) { bestUse = this.pool[i].lastUse; best = i; }
       }
     }
+    // A lazy frame still reading this entry becomes invalid (recomputed on demand).
+    for (let f = 0; f < 2; f++) {
+      if (this.lazyRef[2 * f] === best || this.lazyRef[2 * f + 1] === best) {
+        this.frameStamp[f] = -1;
+        this.lazyRef[2 * f] = this.lazyRef[2 * f + 1] = -1;
+      }
+    }
     const s = this.pool[best];
-    s.slot = slot; s.version = this.slotVersion[slot]; s.j = j; s.valid = false; s.lastUse = ++this.useCounter;
+    s.src = src; s.j = j; s.valid = false; s.lastUse = ++this.useCounter;
     return best;
   }
 
-  /** Make snapshot (slot, j) available now (computes it synchronously if needed). Returns its pool index. */
-  ensure(slot: number, j: number): number {
-    let i = this.find(slot, j);
+  /** Make snapshot (src, j) available now (computes it synchronously if needed). Returns its pool index. */
+  ensure(src: number, j: number): number {
+    let i = this.find(src, j);
     if (i >= 0) { this.pool[i].lastUse = ++this.useCounter; return i; }
+    if (this.entryOf(src) < 0) throw new Error(`CascadeSim: unknown source ${src}`);
     if (this.jobSnap >= 0) {
       const js = this.pool[this.jobSnap];
-      if (js.slot === slot && js.j === j && js.version === this.slotVersion[slot]) {
+      if (js.src === src && js.j === j) {
         i = this.jobSnap;
         this.runJob(1e9);
         this.pool[i].lastUse = ++this.useCounter;
@@ -341,7 +420,7 @@ export class CascadeSim {
       }
       this.jobSnap = -1; // abandon the background job, it restarts later
     }
-    i = this.acquire(slot, j);
+    i = this.acquire(src, j);
     this.startJob(i);
     this.runJob(1e9);
     return i;
@@ -360,9 +439,11 @@ export class CascadeSim {
     const n = this.n, log2n = this.plan.log2n;
     while (this.jobSnap >= 0 && used < budget) {
       const snap = this.pool[this.jobSnap];
+      const e = this.entryOf(snap.src);
+      if (e < 0) { this.jobSnap = -1; break; } // source dropped
       if (this.jobPhase === 0) { // evolve
         const r0 = this.jobProgress, r1 = Math.min(n, r0 + this.rowsEvolve);
-        this.evolveRows(snap.slot, snap.j * this.snapshotDt, r0, r1);
+        this.evolveRows(e, snap.j, r0, r1);
         this.jobProgress = r1;
         if (r1 >= n) { this.jobPhase = 1; this.jobProgress = 0; }
       } else if (this.jobPhase === 1) { // row FFTs, 3 arrays
@@ -403,8 +484,17 @@ export class CascadeSim {
     return used;
   }
 
-  private evolveRows(slot: number, t: number, r0: number, r1: number): void {
-    const n = this.n, h0 = this.slotH0[slot];
+  /** Evolve rows [r0, r1) of source table entry e at t = j * snapshotDt into the 3 packed spectra. */
+  private evolveRows(e: number, j: number, r0: number, r1: number): void {
+    const n = this.n, t = j * this.snapshotDt;
+    const A = this.slotH0[this.srcFrom[e]], B = this.slotH0[this.srcTo[e]];
+    // Crossfade weight and its time derivative at t (w = 1 for a single-slot source).
+    let w = 1, dw = 0;
+    if (this.srcFrom[e] !== this.srcTo[e]) {
+      const dur = this.srcDur[e], x = (t - this.srcStart[e]) / dur;
+      if (x <= 0) w = 0;
+      else if (x < 1) { w = x * x * (3 - 2 * x); dw = (6 * x * (1 - x)) / dur; }
+    }
     const om = this.omegaIndex, kxn = this.kxn, kzn = this.kzn;
     const re1 = this.re1, im1 = this.im1, re2 = this.re2, im2 = this.im2, re3 = this.re3, im3 = this.im3;
     let tm = t % LOOP_PERIOD;
@@ -416,13 +506,20 @@ export class CascadeSim {
         const omega = m * OMEGA_UNIT;
         const phase = OMEGA_UNIT * ((m * tm) % LOOP_PERIOD);
         const c = Math.cos(phase), s = Math.sin(phase);
-        const hr = h0[q], hi = h0[q + 1], mr = h0[q + 2], mi = h0[q + 3];
+        // h0 = lerp(A, B, w) (as the GPU); dh0/dt = dw (B - A)
+        const Ar = A[q], Ai = A[q + 1], Amr = A[q + 2], Ami = A[q + 3];
+        const Dr = B[q] - Ar, Di = B[q + 1] - Ai, Dmr = B[q + 2] - Amr, Dmi = B[q + 3] - Ami;
+        const hr = Ar + w * Dr, hi = Ai + w * Di, mr = Amr + w * Dmr, mi = Ami + w * Dmi;
         // h0 * e^{-i w t}, h0m * e^{+i w t}
         const ar = hr * c + hi * s, ai = hi * c - hr * s;
         const br = mr * c - mi * s, bi = mi * c + mr * s;
         const htr = ar + br, hti = ai + bi;
-        // dht = w * (-i a + i b) = w * ((ai - bi), (br - ar))
-        const dtr = omega * (ai - bi), dti = omega * (br - ar);
+        // dht = omega * (-i a + i b) + dh0 e^{-i w t} + dh0m e^{+i w t}
+        let dtr = omega * (ai - bi), dti = omega * (br - ar);
+        if (dw !== 0) {
+          dtr += dw * (Dr * c + Di * s + Dmr * c - Dmi * s);
+          dti += dw * (Di * c - Dr * s + Dmi * c + Dmr * s);
+        }
         const kx = kxn[i], kz = kzn[i];
         // C1 = ht (1 + kx/k)          -> Hraw + i Da
         re1[i] = htr * (1 + kx); im1[i] = hti * (1 + kx);
@@ -452,32 +549,40 @@ export class CascadeSim {
   }
 
   /**
-   * Per-tick scheduling at tick time T: snapshots j0 = floor(T/dt) and j0+1 of the active slots are
-   * made available (synchronously if a prefetch was not finished), then the background job works
-   * towards j0+2 (and the pending slot's j0..j0+2, so a crossfade can start without a hitch).
+   * Per-tick scheduling at tick time T = CALL[0] (tick length CALL[1]): snapshots j0 = floor(T/dt)
+   * and j0+1 of the active source are made available (synchronously if a prefetch was not
+   * finished), then the background job works towards j0+2 and the pending source's snapshots
+   * around its switch time CALL[2] (spread over the ticks until then, so the switch never stalls).
    * Allocation-free.
    */
-  schedule(T: number, tickDt: number, slotA: number, slotB: number, pending: number): void {
+  schedule(active: number, pending: number): void {
+    const T = CALL[0], tickDt = Math.max(CALL[1], 1e-4), switchTime = CALL[2];
     const dt = this.snapshotDt;
-    const j0 = Math.floor(T / dt);
+    const j0 = Math.floor(T / dt) | 0;
+    // The pending source is needed from its switch time on: prepare the snapshots around it.
+    const jp = Math.floor(Math.max(T, switchTime) / dt) | 0;
     this.pinCount = 0;
-    this.pin(slotA, j0); this.pin(slotA, j0 + 1); this.pin(slotA, j0 + 2);
-    if (slotB >= 0) { this.pin(slotB, j0); this.pin(slotB, j0 + 1); this.pin(slotB, j0 + 2); }
-    if (pending >= 0) { this.pin(pending, j0); this.pin(pending, j0 + 1); this.pin(pending, j0 + 2); }
-    this.ensure(slotA, j0); this.ensure(slotA, j0 + 1);
-    if (slotB >= 0) { this.ensure(slotB, j0); this.ensure(slotB, j0 + 1); }
-    // Background budget: enough to finish one snapshot per active slot (+2 for a pending slot)
-    // per snapshot interval, with 50 % margin.
-    const perInterval = 1 + (slotB >= 0 ? 1 : 0) + (pending >= 0 ? 2 : 0);
-    let budget = Math.ceil((this.unitsPerSnapshot * perInterval * Math.max(tickDt, 1e-4) / dt) * 1.5) + 1;
+    this.pin(active, j0); this.pin(active, j0 + 1); this.pin(active, j0 + 2);
+    if (pending >= 0) { this.pin(pending, jp); this.pin(pending, jp + 1); this.pin(pending, jp + 2); }
+    this.ensure(active, j0); this.ensure(active, j0 + 1);
+    // Background budget: one active snapshot per snapshot interval, plus the pending source's three
+    // spread over the time left until its switch, each with 50 % margin.
+    let perTick = (this.unitsPerSnapshot * tickDt) / dt;
+    if (pending >= 0) {
+      let missing = 0;
+      if (!this.has(pending, jp)) missing++;
+      if (!this.has(pending, jp + 1)) missing++;
+      if (!this.has(pending, jp + 2)) missing++;
+      perTick += (this.unitsPerSnapshot * missing) / Math.max(1, (switchTime - T) / tickDt);
+    }
+    let budget = Math.ceil(perTick * 1.5) + 1;
     while (budget > 0) {
       if (this.jobSnap < 0) {
         let si = -1, sj = 0;
-        if (pending >= 0 && !this.has(pending, j0)) { si = pending; sj = j0; }
-        else if (pending >= 0 && !this.has(pending, j0 + 1)) { si = pending; sj = j0 + 1; }
-        else if (!this.has(slotA, j0 + 2)) { si = slotA; sj = j0 + 2; }
-        else if (slotB >= 0 && !this.has(slotB, j0 + 2)) { si = slotB; sj = j0 + 2; }
-        else if (pending >= 0 && !this.has(pending, j0 + 2)) { si = pending; sj = j0 + 2; }
+        if (!this.has(active, j0 + 2)) { si = active; sj = j0 + 2; }
+        else if (pending >= 0 && !this.has(pending, jp)) { si = pending; sj = jp; }
+        else if (pending >= 0 && !this.has(pending, jp + 1)) { si = pending; sj = jp + 1; }
+        else if (pending >= 0 && !this.has(pending, jp + 2)) { si = pending; sj = jp + 2; }
         if (si < 0) break;
         this.startJob(this.acquire(si, sj));
       }
@@ -485,59 +590,78 @@ export class CascadeSim {
     }
   }
 
-  private pin(slot: number, j: number): void {
-    if (this.pinCount < MAX_PINS) { this.pinSlot[this.pinCount] = slot; this.pinJ[this.pinCount] = j; this.pinCount++; }
+  private pin(src: number, j: number): void {
+    if (this.pinCount < MAX_PINS) { this.pinSrc[this.pinCount] = src; this.pinJ[this.pinCount] = j; this.pinCount++; }
+  }
+
+  /** Fill the lazy blocks covering texels x0..x1, y0..y1 (wrapped, inclusive) of frame f. */
+  fillAround(f: number, x0: number, y0: number, x1: number, y1: number): void {
+    const sh = this.blockShift, nb = this.nb, bv = this.blockValid[f];
+    const bx0 = x0 >> sh, bx1 = x1 >> sh, by0 = y0 >> sh, by1 = y1 >> sh;
+    if (bv[by0 * nb + bx0] === 0) this.fillBlock(f, bx0, by0);
+    if (bv[by0 * nb + bx1] === 0) this.fillBlock(f, bx1, by0);
+    if (bv[by1 * nb + bx0] === 0) this.fillBlock(f, bx0, by1);
+    if (bv[by1 * nb + bx1] === 0) this.fillBlock(f, bx1, by1);
+  }
+
+  private fillBlock(f: number, bx: number, by: number): void {
+    const n = this.n, B = 1 << this.blockShift, c = f * 5, k = this.lazyCoef;
+    const A0 = this.pool[this.lazyRef[2 * f]].data, B0 = this.pool[this.lazyRef[2 * f + 1]].data;
+    const out = this.frames[f];
+    const a0 = k[c], a1 = k[c + 1], b0 = k[c + 2], b1 = k[c + 3], chop = k[c + 4];
+    const ca0 = chop * a0, ca1 = chop * a1, cb0 = chop * b0, cb1 = chop * b1;
+    for (let y = by * B, yEnd = y + B; y < yEnd; y++) {
+      for (let x = bx * B, xEnd = x + B; x < xEnd; x++) {
+        const i = y * n + x, o = i * 6, q = i * 3;
+        out[q] = a0 * A0[o] + a1 * A0[o + 3] + b0 * B0[o] + b1 * B0[o + 3];
+        out[q + 1] = ca0 * A0[o + 1] + ca1 * A0[o + 4] + cb0 * B0[o + 1] + cb1 * B0[o + 4];
+        out[q + 2] = ca0 * A0[o + 2] + ca1 * A0[o + 5] + cb0 * B0[o + 2] + cb1 * B0[o + 5];
+      }
+    }
+    this.blockValid[f][by * this.nb + bx] = 1;
   }
 
   /**
-   * Materialise the field at time t into frames[frame] (H, E, N; stride 3) and, when withVel, into
-   * velFrames[frame] (dH/dt, dE/dt, dN/dt; stride 3): sum over the slots (slot1 < 0: one slot) of
-   * W_k * Hermite(slot k), horizontal channels times choppiness `chop`; the velocity channels use
-   * the Hermite derivative plus the dW_k / dchop terms. Allocation-free.
+   * Materialise the field of source `src` at time t = CALL[0] with choppiness chop = CALL[1]
+   * (d chop / dt = CALL[2]) into frames[frame] (H, E, N; stride 3) and, when withVel, into
+   * velFrames[frame] (dH/dt, dE/dt, dN/dt). Positions are filled lazily by fillBlock (or all at
+   * once for velocity frames / cubic cascades): a frame holds bit-identical heights whichever path
+   * filled it (determinism). Allocation-free.
    */
-  materialise(frame: number, t: number, stamp: number, withVel: boolean,
-    slot0: number, w0: number, dw0: number, slot1: number, w1: number, dw1: number, chop: number, dchop: number): void {
+  materialise(frame: number, stamp: number, withVel: boolean, src: number): void {
+    const t = CALL[0], chop = CALL[1], dchop = CALL[2];
     const dt = this.snapshotDt;
-    const j = Math.floor(t / dt);
+    const j = Math.floor(t / dt) | 0;
     const u = (t - j * dt) / dt;
     const u2 = u * u, u3 = u2 * u;
     const h00 = 2 * u3 - 3 * u2 + 1, h10 = (u3 - 2 * u2 + u) * dt, h01 = -2 * u3 + 3 * u2, h11 = (u3 - u2) * dt;
     const d00 = (6 * u2 - 6 * u) / dt, d10 = 3 * u2 - 4 * u + 1, d01 = (-6 * u2 + 6 * u) / dt, d11 = 3 * u2 - 2 * u;
-    const out = this.frames[frame], vel = this.velFrames[frame];
-    const nn = this.n * this.n;
-    const two = slot1 >= 0 && !(w1 === 0 && dw1 === 0);
-    // Pin the snapshots while acquiring the others (pool >= 6 entries).
-    const ia0 = this.ensure(slot0, j); const p0 = this.pool[ia0]; p0.lastUse = 1e15;
-    const ib0 = this.ensure(slot0, j + 1); const q0 = this.pool[ib0]; q0.lastUse = 1e15;
-    let A1 = p0.data, B1 = q0.data;
-    if (two) {
-      const ia1 = this.ensure(slot1, j); const p1 = this.pool[ia1]; p1.lastUse = 1e15;
-      const ib1 = this.ensure(slot1, j + 1);
-      A1 = p1.data; B1 = this.pool[ib1].data;
-      p1.lastUse = ++this.useCounter; this.pool[ib1].lastUse = ++this.useCounter;
-    }
-    const A0 = p0.data, B0 = q0.data;
-    p0.lastUse = ++this.useCounter; q0.lastUse = ++this.useCounter;
-    for (let i = 0; i < nn; i++) {
-      const o = i * FIELD_STRIDE, q = i * 3;
-      for (let c = 0; c < 3; c++) {
-        let a = A0[o + c], av = A0[o + c + 3], b = B0[o + c], bv = B0[o + c + 3];
-        let v = w0 * (h00 * a + h10 * av + h01 * b + h11 * bv);
-        let d = 0;
-        if (withVel) d = w0 * (d00 * a + d10 * av + d01 * b + d11 * bv) + dw0 * (h00 * a + h10 * av + h01 * b + h11 * bv);
-        if (two) {
-          a = A1[o + c]; av = A1[o + c + 3]; b = B1[o + c]; bv = B1[o + c + 3];
-          const v1 = h00 * a + h10 * av + h01 * b + h11 * bv;
-          v += w1 * v1;
-          if (withVel) d += w1 * (d00 * a + d10 * av + d01 * b + d11 * bv) + dw1 * v1;
-        }
-        if (c === 0) { out[q] = v; if (withVel) vel[q] = d; }
-        else { out[q + c] = chop * v; if (withVel) vel[q + c] = chop * d + dchop * v; }
-      }
-    }
+    const ia = this.ensure(src, j); const pa = this.pool[ia]; pa.lastUse = PINNED_USE;
+    const ib = this.ensure(src, j + 1); const pb = this.pool[ib];
+    pa.lastUse = ++this.useCounter; pb.lastUse = ++this.useCounter;
+    const c = frame * 5, k = this.lazyCoef;
+    k[c] = h00; k[c + 1] = h10; k[c + 2] = h01; k[c + 3] = h11; k[c + 4] = chop;
+    this.lazyRef[2 * frame] = ia; this.lazyRef[2 * frame + 1] = ib;
+    this.blockValid[frame].fill(0);
     this.frameTime[frame] = t;
     this.frameStamp[frame] = stamp;
     this.frameHasVel[frame] = withVel ? 1 : 0;
+    if (withVel || this.cubic) {
+      const nb = this.nb;
+      for (let by = 0; by < nb; by++) for (let bx = 0; bx < nb; bx++) this.fillBlock(frame, bx, by);
+    }
+    if (!withVel) return;
+    const A = pa.data, Bd = pb.data, vel = this.velFrames[frame];
+    const nn = this.n * this.n;
+    for (let i = 0; i < nn; i++) {
+      const o = i * FIELD_STRIDE, q = i * 3;
+      for (let ch = 0; ch < 3; ch++) {
+        const a = A[o + ch], av = A[o + ch + 3], b = Bd[o + ch], bv = Bd[o + ch + 3];
+        const d = d00 * a + d10 * av + d01 * b + d11 * bv;
+        if (ch === 0) vel[q] = d;
+        else vel[q + ch] = chop * d + dchop * (h00 * a + h10 * av + h01 * b + h11 * bv);
+      }
+    }
   }
 }
 
@@ -568,8 +692,8 @@ export function sampleBilinear(data: Float32Array, n: number, L: number, a: numb
   SAMPLE[2] = w00 * data[i00 + 2] + w10 * data[i10 + 2] + w01 * data[i01 + 2] + w11 * data[i11 + 2];
 }
 
-/** Horizontal-displacement gradient of the last sampleBilinearGrad: [dE/da, dE/db, dN/da, dN/db]. */
-export const GRAD = new Float64Array(4);
+/** Gradient of the last sample*Grad: [dE/da, dE/db, dN/da, dN/db, dH/da, dH/db] (H only for cubic). */
+export const GRAD = new Float64Array(6);
 
 /** sampleBilinear(ch = 0) plus the exact gradient of the bilinear E / N channels (for Newton inversion). */
 export function sampleBilinearGrad(data: Float32Array, n: number, L: number, a: number, b: number): void {
@@ -605,7 +729,7 @@ export function sampleCubicGrad(data: Float32Array, n: number, L: number, a: num
   const wx0 = -0.5 * fx3 + fx2 - 0.5 * fx, wx1 = 1.5 * fx3 - 2.5 * fx2 + 1, wx2 = -1.5 * fx3 + 2 * fx2 + 0.5 * fx, wx3 = 0.5 * fx3 - 0.5 * fx2;
   const dx0 = -1.5 * fx2 + 2 * fx - 0.5, dx1 = 4.5 * fx2 - 5 * fx, dx2 = -4.5 * fx2 + 4 * fx + 0.5, dx3 = 1.5 * fx2 - fx;
   const x0 = ((xf - 1) & mask), x1 = (xf & mask), x2 = ((xf + 1) & mask), x3 = ((xf + 2) & mask);
-  let s0 = 0, s1 = 0, s2 = 0, ea = 0, eb = 0, na = 0, nb = 0;
+  let s0 = 0, s1 = 0, s2 = 0, ea = 0, eb = 0, na = 0, nb = 0, ha = 0, hb = 0;
   for (let r = 0; r < 4; r++) {
     const yy = (yf - 1 + r) & mask;
     let wy: number, dy: number;
@@ -621,11 +745,12 @@ export function sampleCubicGrad(data: Float32Array, n: number, L: number, a: num
     const m = wx0 * data[i0 + 2] + wx1 * data[i1 + 2] + wx2 * data[i2 + 2] + wx3 * data[i3 + 2];
     const ed = dx0 * data[i0 + 1] + dx1 * data[i1 + 1] + dx2 * data[i2 + 1] + dx3 * data[i3 + 1];
     const md = dx0 * data[i0 + 2] + dx1 * data[i1 + 2] + dx2 * data[i2 + 2] + dx3 * data[i3 + 2];
+    const hd = dx0 * data[i0] + dx1 * data[i1] + dx2 * data[i2] + dx3 * data[i3];
     s0 += wy * h; s1 += wy * e; s2 += wy * m;
-    ea += wy * ed; na += wy * md; eb += dy * e; nb += dy * m;
+    ea += wy * ed; na += wy * md; eb += dy * e; nb += dy * m; ha += wy * hd; hb += dy * h;
   }
   SAMPLE[0] = s0; SAMPLE[1] = s1; SAMPLE[2] = s2;
-  GRAD[0] = ea * inv; GRAD[1] = eb * inv; GRAD[2] = na * inv; GRAD[3] = nb * inv;
+  GRAD[0] = ea * inv; GRAD[1] = eb * inv; GRAD[2] = na * inv; GRAD[3] = nb * inv; GRAD[4] = ha * inv; GRAD[5] = hb * inv;
 }
 
 /** Catmull-Rom (interpolating bicubic) sample; same contract as sampleBilinear. */

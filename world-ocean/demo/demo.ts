@@ -197,7 +197,7 @@ async function main() {
   runner.execute(ctx);
 
   let gpu: OceanGpu = createOceanGpu({
-    ocean, renderer, scene, camera, origin, tier: flags.tier, skyLight: sky.skyLight, envMap: sky.envMap,
+    ocean, renderer, scene, camera, origin, shape: world.shape, tier: flags.tier, skyLight: sky.skyLight, envMap: sky.envMap,
     envIntensity: sky.envIntensity, preExposure, perf, debug: flags.debug,
   } as any);
   for (const p of gpu.passes) runner.add(p);
