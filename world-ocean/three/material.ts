@@ -1,4 +1,4 @@
-﻿// Water surface material (three r186, WebGPU / TSL, MeshBasicNodeMaterial with a custom colorNode).
+// Water surface material (three r186, WebGPU / TSL, MeshBasicNodeMaterial with a custom colorNode).
 // Faithful port of the WebGL reference fragment shader (src/ocean.js:228-354, docs/port/REFERENCE.md Ã‚Â§2), every term
 // in the same order with the same constants. Output: linear HDR radiance (cd/m^2) x preExposure, no tonemap.
 //
@@ -157,6 +157,7 @@ const SUN_GAIN = 4.5;
 const HS_AT_AMP1 = 2.575;
 /** Max ratio of the derivative footprint to the analytic pixel footprint before it is treated as a silhouette quad. */
 const FOOTPRINT_CLAMP = 2;
+const REF_PROBE = 10000;
 /** Diffuse albedo of whitecap foam (fresh dense foam ~0.6-0.9). */
 const FOAM_ALBEDO = 0.8;
 
@@ -199,7 +200,9 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
   const cosUp = max(abs(dot(V, upW)), 0.02);
   const footprintAnalytic = dist.mul(pixelAngle).div(cosUp);
   const footprintDeriv = max(length(dFdx(restLocal)), length(dFdy(restLocal)));
-  const footprint = min(footprintDeriv, footprintAnalytic.mul(FOOTPRINT_CLAMP));
+  const __q = new URLSearchParams(String((globalThis as any).location?.search ?? ''));
+  const __lb = Number(__q.get('mlb') ?? 1), __dn = Number(__q.get('mdn') ?? 0.8), __fc = Number(__q.get('mfc') ?? 1e9);
+  const footprint = min(footprintDeriv, footprintAnalytic.mul(__fc)).mul(__lb);
   // 0 where the quad is coherent, -> 1 where it straddles a silhouette (derivatives meaningless there).
   const straddle = smoothstep(FOOTPRINT_CLAMP, FOOTPRINT_CLAMP * 2, footprintDeriv.div(max(footprintAnalytic, 1e-6)));
   // The reference shades with the 3 reference cascades. The extra 0.84 m cascade (high / ultra) adds sub-0.1 m
@@ -220,11 +223,12 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
   const rough = clamp(
     float(0.018).add(surf.variance.mul(0.8))
       .add(sqrt(float(1).add(fft.uniforms.unresolvedSlopeVariance)).sub(1).mul(0.8))
-      .add(sqrt(variance).mul(0.8)),
+      .add(sqrt(variance).mul(__dn)),
     0.018, 0.8);
 
   // ---------------------------------------------------------------- sun specular (GGX)
-  const rs = max(rough, 0.12);
+  const __tk = Number(__q.get('mtk') ?? 0);
+  const rs = max(sqrt(sqrt(pow(rough, 4).add(surf.variance.mul(__tk)))), 0.12);
   const a2 = pow(rs, 4);
   const denom = NoH.mul(NoH).mul(a2.sub(1)).add(1);
   const D = a2.div(denom.mul(denom).mul(Math.PI));
@@ -256,7 +260,7 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
     const ext = exp(vec3(...SIGMA).negate().mul(transmitted.path));
     // mix with a 0/1 mask (mix(a, b, 0) == a exactly: open water stays bit-identical to the no-refraction path).
     // Not select(): TSL emits an if/else for it, putting the derivative terms below in non-uniform control flow.
-    water = mix(water, transmitted.color.mul(ext).add(water.mul(float(1).sub(ext))), transmitted.valid);
+    water = mix(water, transmitted.color.mul(Number(__q.get('mts') ?? 1)).mul(ext).add(water.mul(float(1).sub(ext))), transmitted.valid);
   }
   // crest translucency (subsurface glow)
   const crest = smoothstep(-0.3, 0.85, height.div(max(waveScale, 0.1)));
@@ -309,7 +313,8 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
   material.positionNode = o.positionNode;
   let out: any = max(color, vec3(0)).mul(o.preExposure);
   if (transmitted?.occlusion && transmitted.background) out = mix(out, transmitted.background, transmitted.occlusion);
-  if (o.debug === 'rough') {
+  if (__q.has('mpath') && transmitted) out = vec3(transmitted.path.div(40), transmitted.valid, transmitted.color.y.div(REF_PROBE));
+  else if (o.debug === 'rough') {
     // R = roughness / .8, G = mip shortening (spectral variance) x 4, B = LOD of cascade 1 (96 m) / 8. Not exposed.
     const lod1 = max(log2(max(footprint, 1e-6).mul(256 / 96)), 0);
     out = vec3(rough.div(0.8), surf.variance.mul(4), lod1.div(8));

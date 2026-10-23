@@ -104,6 +104,8 @@ export interface LodGeometryData {
   /** levelIndexEnd[l] = index count of skirt + levels 0..l (draw range end when l+1 levels are drawn). */
   readonly levelIndexEnd: readonly number[];
   readonly levelVertexCount: readonly number[];
+  /** levelSectorEnd[l * 8 + k] = index end of (level l, sector k); levels are stored sector by sector. */
+  readonly levelSectorEnd: readonly number[];
 }
 
 /** Builds the merged clipmap (skirt, level 0 square, rings 1..L-1). Setup-time; allocates. */
@@ -118,14 +120,19 @@ export function buildLodGeometry(p: LodParams): LodGeometryData {
  * Same as buildLodGeometry, as a generator that yields after every grid row (~0.01-0.05 ms of work), so a tier
  * change can be built in time slices off the frame's critical path. The result is the generator's return value.
  */
+/** Vertex / triangle counts of a tier's geometry without building it. */
+export function lodGeometryCounts(p: LodParams): { vertexCount: number; triangleCount: number } {
+  const M = p.halfCells, R = M + p.margin, W = 2 * R + 1, L = p.levels, skirtLoop = 8 * R;
+  const vertexCount = 3 * skirtLoop + W * W + (L - 1) * (W * W - (M - 1) * (M - 1));
+  const triangleCount = 4 * skirtLoop + 2 * 4 * R * R + (L - 1) * 2 * (4 * R * R - M * M);
+  return { vertexCount, triangleCount };
+}
+
 export function* lodGeometrySteps(p: LodParams): Generator<void, LodGeometryData, void> {
   const M = p.halfCells, R = M + p.margin, H = M / 2, W = 2 * R + 1;
   const L = p.levels;
   const skirtLoop = 8 * R;
-  const fullVerts = W * W, ringVerts = W * W - (M - 1) * (M - 1);
-  const vertexCount = 3 * skirtLoop + fullVerts + (L - 1) * ringVerts;
-  const fullCells = 4 * R * R, ringCells = 4 * R * R - M * M;
-  const triangleCount = 4 * skirtLoop + 2 * fullCells + (L - 1) * 2 * ringCells;
+  const { vertexCount, triangleCount } = lodGeometryCounts(p);
   const packed = new Float32Array(vertexCount * 3);
   const index = new Uint32Array(triangleCount * 3);
   let nv = 0, ni = 0;
@@ -175,6 +182,8 @@ export function* lodGeometrySteps(p: LodParams): Generator<void, LodGeometryData
 
   // --- levels
   const map = new Int32Array(W * W);
+  const sectorCount = new Int32Array(LOD_SECTORS), sectorFill = new Int32Array(LOD_SECTORS);
+  const levelSectorEnd: number[] = [];
   for (let l = 0; l < L; l++) {
     const v0 = nv;
     map.fill(-1);
@@ -185,6 +194,18 @@ export function* lodGeometrySteps(p: LodParams): Generator<void, LodGeometryData
       }
       yield;
     }
+    // Cells are emitted sector by sector (16 x 22.5 deg wedges around the level centre, by cell-centre angle) so a
+    // frustum cull can draw only the visible (level, sector) index ranges. Pass 1 counts, pass 2 fills.
+    sectorCount.fill(0);
+    for (let j = -R; j < R; j++) {
+      for (let i = -R; i < R; i++) {
+        if (l > 0 && i >= -H && i < H && j >= -H && j < H) continue;
+        sectorCount[lodSectorOf(i + 0.5, j + 0.5)] += 6;
+      }
+      if ((j & 7) === 7) yield;
+    }
+    let acc = ni;
+    for (let k = 0; k < LOD_SECTORS; k++) { sectorFill[k] = acc; acc += sectorCount[k]; levelSectorEnd.push(acc); }
     for (let j = -R; j < R; j++) {
       for (let i = -R; i < R; i++) {
         if (l > 0 && i >= -H && i < H && j >= -H && j < H) continue;
@@ -192,16 +213,98 @@ export function* lodGeometrySteps(p: LodParams): Generator<void, LodGeometryData
         const c = map[(j + 1 + R) * W + (i + 1 + R)], d = map[(j + 1 + R) * W + (i + R)];
         // Diagonal a-c ((i,j)-(i+1,j+1)) everywhere: the geomorph (odd -> lower even neighbour) then collapses
         // 2x2 fine cells exactly onto the parent's triangulation. Winding: counter-clockwise seen from +up.
-        index[ni++] = a; index[ni++] = d; index[ni++] = c;
-        index[ni++] = a; index[ni++] = c; index[ni++] = b;
+        const sec = lodSectorOf(i + 0.5, j + 0.5);
+        let o = sectorFill[sec];
+        index[o++] = a; index[o++] = d; index[o++] = c;
+        index[o++] = a; index[o++] = c; index[o++] = b;
+        sectorFill[sec] = o;
       }
       yield;
     }
+    ni = acc;
     levelIndexEnd.push(ni);
     levelVertexCount.push(nv - v0);
   }
   if (nv !== vertexCount || ni !== index.length) throw new Error(`buildLodGeometry: count mismatch ${nv}/${vertexCount} ${ni}/${index.length}`);
-  return { packed, index, vertexCount, triangleCount, skirtIndexCount, levelIndexEnd, levelVertexCount };
+  return { packed, index, vertexCount, triangleCount, skirtIndexCount, levelIndexEnd, levelVertexCount, levelSectorEnd };
+}
+
+/** Number of angular sectors per level (22.5 degree wedges, sector k spans [k, k+1) * 22.5 deg from +east). */
+export const LOD_SECTORS = 16;
+/** Square-boundary points (max-norm 1) at k * 22.5 deg, (u, v) = (east, south). Every 45 deg corner is a sector
+ *  boundary, so each sector's slice of a square ring is a trapezoid (convex hull = its 4 corners). */
+const SECTOR_DIR: number[] = [];
+for (let k = 0; k < LOD_SECTORS; k++) {
+  const a = (k * 2 * Math.PI) / LOD_SECTORS, c = Math.cos(a), s = Math.sin(a), m = Math.max(Math.abs(c), Math.abs(s));
+  SECTOR_DIR.push(c / m, s / m);
+}
+
+/** Sector of a point (u, v) relative to the level centre (cell units ok). */
+export function lodSectorOf(u: number, v: number): number {
+  let a = Math.atan2(v, u);
+  if (a < 0) a += 2 * Math.PI;
+  const k = Math.floor(a / ((2 * Math.PI) / LOD_SECTORS));
+  return k >= LOD_SECTORS ? 0 : k;
+}
+
+/**
+ * Frustum cull of the clipmap: fills `ranges` with [start, count) index ranges (absolute in the geometry, given
+ * `indexBase`) of the visible (level, sector) wedges of the drawn levels, merging neighbours, and returns the number of
+ * ranges. Allocation-free.
+ *   planes: 4 side planes (a, b, c, d) x 4 in the space the points are expressed in (render space), a.x + d >= 0 inside.
+ *   foot render position + tangent axes east/south (unit), margin (m) = how far outside a plane a wedge may poke before
+ *   it is culled (covers displacement + one cell of triangle overhang: pass >= the max displacement).
+ */
+export function lodCullRanges(
+  st: LodState, p: LodParams, g: LodGeometryData, indexBase: number, planes: Float64Array,
+  footX: number, footY: number, footZ: number, ex: number, ey: number, ez: number, sx: number, sy: number, sz: number,
+  margin: number, ranges: Int32Array,
+): number {
+  const K = st.drawnLevels, M = p.halfCells, R = M + p.margin + 1;
+  let n = 0, openStart = -1, openEnd = -1;
+  for (let l = 0; l < K; l++) {
+    const lv = l * 4, s = st.level[lv + 2];
+    const cu = st.level[lv] - st.phiU, cv = st.level[lv + 1] - st.phiV; // level centre relative to the foot (m)
+    const rin = l === 0 ? 0 : Math.max(0, M / 2 - 1) * s, rout = R * s;
+    const mg = margin + 2 * s;
+    for (let k = 0; k < LOD_SECTORS; k++) {
+      // Wedge trapezoid corners: rin/rout along the two bounding square directions.
+      let visible = true;
+      for (let pl = 0; pl < 4 && visible; pl++) {
+        const a = planes[pl * 4], b = planes[pl * 4 + 1], c = planes[pl * 4 + 2], d = planes[pl * 4 + 3];
+        let allOut = true;
+        for (let q = 0; q < 4 && allOut; q++) {
+          const dk = (k + (q & 1)) % LOD_SECTORS, r = q < 2 ? rin : rout;
+          const u = cu + SECTOR_DIR[dk * 2] * r, v = cv + SECTOR_DIR[dk * 2 + 1] * r;
+          const x = footX + ex * u + sx * v, y = footY + ey * u + sy * v, z = footZ + ez * u + sz * v;
+          if (a * x + b * y + c * z + d >= -mg) allOut = false;
+        }
+        if (allOut) visible = false;
+      }
+      if (!visible) continue;
+      const start = indexBase + (l === 0 && k === 0 ? g.skirtIndexCount : g.levelSectorEnd[l * LOD_SECTORS + k - 1]);
+      const end = indexBase + g.levelSectorEnd[l * LOD_SECTORS + k];
+      if (start === openEnd) openEnd = end;
+      else {
+        if (openStart >= 0) { ranges[n * 2] = openStart; ranges[n * 2 + 1] = openEnd - openStart; n++; }
+        openStart = start; openEnd = end;
+      }
+    }
+  }
+  if (openStart >= 0) { ranges[n * 2] = openStart; ranges[n * 2 + 1] = openEnd - openStart; n++; }
+  return n;
+}
+
+/** Side planes (left, right, bottom, top) of a projection * view matrix (column-major, three layout), normalised. */
+export function frustumSidePlanes(m: ArrayLike<number>, out: Float64Array): Float64Array {
+  // rows of the column-major matrix: row i = (m[i], m[4+i], m[8+i], m[12+i])
+  for (let pl = 0; pl < 4; pl++) {
+    const row = pl < 2 ? 0 : 1, sign = pl % 2 === 0 ? 1 : -1;
+    const a = m[3] + sign * m[row], b = m[7] + sign * m[4 + row], c = m[11] + sign * m[8 + row], d = m[15] + sign * m[12 + row];
+    const len = Math.hypot(a, b, c) || 1;
+    out[pl * 4] = a / len; out[pl * 4 + 1] = b / len; out[pl * 4 + 2] = c / len; out[pl * 4 + 3] = d / len;
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------------------------------

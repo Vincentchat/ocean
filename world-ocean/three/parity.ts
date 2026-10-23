@@ -37,7 +37,7 @@
 // Pass (spec section 5): { id: 'ocean.parity', stage: 'compute', reads: ['ocean.displacement'], writes:
 // ['ocean.parity'] } â€” add it AFTER the ocean passes (same stage, insertion order) so it reads this frame's FFT.
 import { ReadbackBuffer, StorageBufferAttribute, Vector2 } from 'three/webgpu';
-import { Fn, If, Loop, float, instanceIndex, length, max, select, smoothstep, storage, uniform, vec2, vec3, vec4 } from 'three/tsl';
+import { Fn, If, Loop, dot, float, instanceIndex, length, max, select, smoothstep, storage, uniform, vec2, vec3, vec4 } from 'three/tsl';
 import type { FloatingOrigin, TangentFrame, Vec3, WorldShape } from '../stubs/world-core.ts';
 import { CASCADES } from '../spectrum.ts';
 import { CAPILLARY_CASCADE } from './fft-tiers.ts';
@@ -48,7 +48,7 @@ import type { Pass, PassContext } from './pass-types.ts';
 
 /** Fixed-point steps (initial guess), then Newton steps (finite-difference Jacobian). */
 export const PROBE_FIXED_STEPS = 4;
-export const PROBE_NEWTON_STEPS = 5;
+export const PROBE_NEWTON_STEPS = 10;
 /** Finite-difference step of the Newton Jacobian, m. */
 const FD_STEP = 0.05;
 /** Readback ring size. */
@@ -161,7 +161,12 @@ export function createOceanHeightProbe(opts: OceanHeightProbeOptions): OceanHeig
   // Far fade of the vertex shader at rest offset r (distance from the camera, which is uCamHeight above the foot).
   const fadeOf = (r: any) => float(1).sub(smoothstep(fadeNear, fadeFar, length(vec3(r.x, uCamHeight.negate(), r.y))));
 
-  /** Solve r + w(r) D_h(r) = q (fixed iterations); returns the final rest offset (a var). */
+  /**
+   * Solve r + w(r) D_h(r) = q with a fixed iteration count: PROBE_FIXED_STEPS fixed-point steps, then
+   * PROBE_NEWTON_STEPS safeguarded Newton steps (finite-difference Jacobian; plain fixed-point step where
+   * det J < 0.1; a step that does not reduce the residual is halved back, like the core's inversion). Returns the
+   * best iterate (a var).
+   */
   function solve(q: any, fp: any, withFade: boolean) {
     const r = vec2(q).toVar();
     const G = (x: any) => {
@@ -172,19 +177,30 @@ export function createOceanHeightProbe(opts: OceanHeightProbeOptions): OceanHeig
     Loop(PROBE_FIXED_STEPS, () => {
       r.assign(r.sub(G(r).sub(q)));
     });
+    const prevR = vec2(r).toVar(), prevRes = float(1e30).toVar();
+    const bestR = vec2(r).toVar(), bestRes = float(1e30).toVar();
     Loop(PROBE_NEWTON_STEPS, () => {
       const g0 = G(r).toVar();
-      const gx = G(r.add(vec2(FD_STEP, 0))).toVar();
-      const gy = G(r.add(vec2(0, FD_STEP))).toVar();
-      const j00 = gx.x.sub(g0.x).div(FD_STEP), j10 = gx.y.sub(g0.y).div(FD_STEP);
-      const j01 = gy.x.sub(g0.x).div(FD_STEP), j11 = gy.y.sub(g0.y).div(FD_STEP);
       const e = g0.sub(q).toVar();
-      const det = j00.mul(j11).sub(j01.mul(j10)).toVar();
-      const inv = float(1).div(max(det, 0.1));
-      const newton = vec2(j11.mul(e.x).sub(j01.mul(e.y)), j00.mul(e.y).sub(j10.mul(e.x))).mul(inv);
-      r.assign(r.sub(select(det.greaterThan(0.1), newton, e)));
+      const res = dot(e, e).toVar();
+      If(res.lessThan(bestRes), () => { bestRes.assign(res); bestR.assign(r); });
+      If(res.greaterThanEqual(prevRes), () => {
+        r.assign(prevR.add(r.sub(prevR).mul(0.5)));
+      }).Else(() => {
+        prevR.assign(r); prevRes.assign(res);
+        const gx = G(r.add(vec2(FD_STEP, 0))).toVar();
+        const gy = G(r.add(vec2(0, FD_STEP))).toVar();
+        const j00 = gx.x.sub(g0.x).div(FD_STEP), j10 = gx.y.sub(g0.y).div(FD_STEP);
+        const j01 = gy.x.sub(g0.x).div(FD_STEP), j11 = gy.y.sub(g0.y).div(FD_STEP);
+        const det = j00.mul(j11).sub(j01.mul(j10)).toVar();
+        const inv = float(1).div(max(det, 0.1));
+        const newton = vec2(j11.mul(e.x).sub(j01.mul(e.y)), j00.mul(e.y).sub(j10.mul(e.x))).mul(inv);
+        r.assign(r.sub(select(det.greaterThan(0.1), newton, e)));
+      });
     });
-    return r;
+    const el = G(r).sub(q).toVar();
+    If(dot(el, el).lessThan(bestRes), () => { bestR.assign(r); });
+    return bestR;
   }
 
   const kernel = Fn(() => {

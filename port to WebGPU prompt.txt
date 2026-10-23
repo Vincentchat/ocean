@@ -1,0 +1,15 @@
+I want you to port the existing WebGL ocean simulation to **WebGPU using Three.js r186 and TSL**, following every requirement in the attached `Ocean-WebGPU-Port-Rules.md`.
+
+The goal is to preserve and improve the current ocean's visual quality, realism, wave behavior, and performance while making it fully WebGPU-native and ready to integrate into the DreamP engine as `@dreamp/world-ocean`. The existing ocean is the visual and behavioral reference. Follow the document's architecture, API contracts, compute FFT requirements, CPU/GPU parity, floating origin support, performance constraints, and acceptance checks precisely.
+
+Break the port into the smallest pieces that can be improved and judged independently. You decide what those pieces are, not me. Fan out sub-agents and have them tackle each piece individually. Start with a fully functional low-tier WebGPU ocean, then progressively implement and optimize the higher tiers.
+
+Use `/loop` on each piece and have a separate sub-agent with fresh context inspect the **actual rendered WebGPU ocean and working implementation**, never just the builder's summary. That reviewer should be an extremely harsh critic, comparing the result directly against the original WebGL ocean for visual fidelity, wave behavior, and performance, while also checking compliance with `Ocean-WebGPU-Port-Rules.md`.
+
+If the WebGPU version is worse, has visual artifacts, fails any requirement, or introduces regressions, identify the single biggest gap and send the builder back in. No fixed number of rounds. Between major waves, spawn one fresh agent to test the entire ocean, verify CPU/GPU parity and integration readiness, and ensure everything works as one coherent system.
+
+**Do not sacrifice visual quality or simulation accuracy just to complete the port.** The final WebGPU ocean should look at least as good as the original, ideally better, while satisfying all technical requirements. Preserve the FFT-based simulation across every quality tier. Do not introduce WebGL fallbacks or shortcuts that violate the specification.
+
+Keep a simple live progress page updated as you work so I can watch it evolve, including the rendered ocean, implementation progress, performance measurements, and outstanding issues. Provide the standalone Three.js WebGPU demo, automated tests, documentation, and engine integration handoff required by the attached document.
+
+Don't stop until the port is fully functional, visually excellent, optimized, and passes every acceptance check in `Ocean-WebGPU-Port-Rules.md`. **/loop until it's utterly perfect. Fan out sub-agents and use Opus 5.5 medium.**

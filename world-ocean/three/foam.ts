@@ -8,20 +8,21 @@
 //     storage buffer + an rgba16float output texture that the material samples (R = history, G = this frame's
 //     source). Each frame, per texel at its REST position x:
 //        src = .99 smoothstep(.15, .5, compression) + 1.10 sqrt(max(dot(n.xz, wind), 0))
-//        history = mix(src, old, exp(-dt / 1.48 s))                       (exponential moving average, tau 1.48 s)
+//        history = mix(src, old, exp(-dt / 1.48 s)) - 30 ulp16(h) dt      (exponential moving average, tau 1.48 s,
+//                  minus the reference's fp16 storage loss, see FOAM_PARAMS.storageLoss and "Coverage parity" below)
 //     compression = max(sum_c (1 - normal_c.w), 0) and n = normalize(sum_c n_c.xz, 1): the FFT normal textures
 //     (fft.ts: .w = 1 - compression, compression = clamp(1 - minEig(J)) masked to DOWNWIND-facing slopes,
 //     smoothstep(0, .2, n.wind), exactly the reference blend pass), point-sampled bilinearly at LOD 0 like the
 //     reference foamSurface, NOT chained (the reference samples rest/domain + .5 for every cascade).
-//     Cascades: the 3 reference cascades always; the 4th (0.84 m, high/ultra) is drawn but NOT summed into the
-//     source by default (`fineInSource` = 0, see "Tier invariance" below; measured, not assumed).
+//     Cascades: the 3 reference cascades (fft r3 draws exactly these on every tier; the optional capillary band
+//     is not summed: see the c3 note below).
 //   * Anchor: the camera's look ray hit on sea level, offset clamped to +-152 m per tangent axis, snapped to the
 //     history cell (400 m / R) in WORLD lattice coordinates (float64 on the CPU: anchor = integer cell index x cell).
 //     A snap moves the window by an INTEGER number of texels, so re-projection is an exact texel shift (no
 //     resampling blur, no smearing); texels that enter the window take the instantaneous source (the reference
-//     used 0 there, which only shows beyond the 152 m edge fade). A jump > 200 m (teleport) or a backwards / > 2 s
-//     time step warm-starts the history at the source (steady state of the EMA; the reference cleared to 0 and
-//     faded in over ~1.5 s).
+//     used 0 there, which only shows beyond the 152 m edge fade). The first frame, a jump > 200 m (teleport) or a
+//     backwards / > 2 s time step restart the history from 0 like the reference (foam fades in over ~tau;
+//     FOAM_PARAMS.coldStart = false warm-starts at the source instead).
 //   * Time: dt = this frame's draw time - last frame's draw time (PassContext.time = FrameInfo.interpolatedTime,
 //     simulation seconds), never wall clock. Paused (dt = 0): history held, only re-projected if the anchor snaps.
 //     Deterministic for a fixed step; frame-rate independent (the EMA uses exp(-dt / tau)). The reference also
@@ -45,28 +46,43 @@
 //   * Wind: direction from fft.uniforms.windAB (core state, towards, east/south). The pattern's direction follows
 //     it with a 1 s low-pass and is re-pivoted at the camera foot when it turns (no far-field sliding).
 //
-// Tier invariance (history resolution scales, the look does not). Measured with tools/foam-check.mjs (storm scene,
-// C4 camera 0,60,8 pitch -43, t = 30 s after the 6 s fixed-step warm-up; mean of the 400 m history / share > 0.3):
-//      tier     history  FFT c2 grid  detailGain  mean    >0.3     foam pass GPU (RTX 2070, per dispatch)
-//      low      512^2    128          1.482       0.3417  57.9 %   0.045 ms
-//      medium   1024^2   256          1           0.3354  55.4 %   0.138 ms
-//      high     1024^2   256          1           0.3355  55.4 %   0.142 ms
-//      ultra    1024^2   512          0.846       0.3350  55.4 %   0.133 ms
-//   * History resolution alone does not change the statistics (low FFT tier with a 1024 vs 512 history: mean
-//     0.3047 vs 0.3044 before the gain below); it only changes the grain of the lace break-up in close-ups
-//     (0.78 m vs 0.39 m cells; docs/port/shots/foam/cmp-tiers-05.png).
-//   * The FFT tiers DO change c2's finite-difference normals (low: 128 grid, band cut at |k| < 64 dk and
-//     differences over L/128; ultra: 512 grid, differences over L/512). Uncorrected: low -9.2 %, ultra +6.1 % mean.
-//     The source rescales c2's slope and compression by detailGain = S_256 / S_n (S = c2 finite-difference slope
-//     variance on that grid, from the master spectrum on the CPU when a slot regenerates; exponent 1 measured to
-//     fit both tiers, the source is nonlinear in it). Residual: low +1.8 %, ultra -0.2 % (azure: +2.0 %, -0.2 %).
-//     Needs `ocean` in the options; without it low / ultra keep the uncorrected offsets.
-//   * c3 (0.84 m tile, lambda 1-10 cm, high/ultra only) has slope and strain variance ~= c2's. Summing it into the
-//     source (fineInSource = 1) gave mean 0.4142 / 84 % > 0.3 on high (+23 %) and 0.4504 / 94 % on ultra: a
-//     different look from medium and from the reference (3 cascades). Capillary-scale ripples do not make
-//     whitecaps, so c3 is excluded by default (`fineInSource` uniform = 0); everything the reference sums IS summed.
-//   * Frame-rate independence (same 8 s of simulation stepped at 20/30/60/144 Hz vs 240 Hz, high): identical mean
-//     (0.33656), per-texel mean |diff| 0.0058 / 0.0035 / 0.0015 / 0.0003 (O(dt) sampling of the moving source).
+// Coverage parity with the reference (round 2; scratch tools: a patched copy of the WebGL reference that writes
+// (foam, history / 2, 1) instead of its colour and exposes its history render target, vs the demo's
+// ?debug=foamcov view (inverse demo tonemap -> the same 8-bit encoding)):
+//   * World-space history, storm C4, inner 304 m, 1024^2 texels: correlation 0.9996 with the reference, but the
+//     port was +4.1 % (+0.013, uniform across percentiles). Cause: the REFERENCE stores its history in RGBA16F and
+//     the GPU rounds the per-frame write toward zero: ~ulp16/2 lost per 60 Hz frame = a steady -0.010 bias
+//     (reference re-run with a float32 target: 0.3200 -> 0.3300, then port +0.9 %). That bias is part of the
+//     reference look (-10 % storm whitecap pixels), so it is emulated: storageLoss = 30 ulp16(h) per second
+//     (deterministic, frame-rate independent). Now: port / reference history 1.0079, percentiles within 0.003.
+//     Remaining +0.8 % = the instantaneous source (+0.4 % compression, +2 % slope term on screen; the reference
+//     lerps two FFT snapshots, which slightly attenuates the fastest c2 slopes).
+//   * Screen foam coverage (mean foam / share > 0.3 of water pixels, reference -> port, canonical shots, high):
+//     01 storm 0.1251 -> 0.1296 (+3.6 %), 05 storm 0.2167 -> 0.2086 (-3.7 %), C1 storm +2.3 %, C4 storm +1.1 %,
+//     C1 / C4 azure +5.9 / +3.6 %, C1 / C4 golden +6.8 / +5.0 % (absolute coverage there < 0.015).
+//     Before the fix: +14.6 / +4.4 / +14.9 / +16.2 / +27 / +28 / +31 / +32 %.
+//   * Frame luminance: the reference PAGE darkens its canvas with a CSS overlay (src/style.css body:after:
+//     #09171f44 at the top -> transparent 20-60 % -> #05141b55 at the bottom) that the WebGPU demo does not have.
+//     With that overlay applied to the port captures, foam's share of the frame luminance matches: 01 36.8 vs
+//     37.4, C1 25.4 vs 25.4, C4 20.4 vs 20.6, 05 55.2 vs 53.8 (8-bit luma, foam on minus foam off); luminance
+//     on pixels foamy in both (coverage > 0.4) 174.2 vs 174.0. The "+11 luminance" was the overlay, not foam.
+// Tier invariance (history resolution scales, the look does not). tools/foam-check.mjs, storm C4, t = 30 s after
+// the 6 s warm-up, mean of the 400 m history (incl. the storage loss):
+//      tier     history  FFT c2 grid  detailGain  mean (storm / azure)    foam pass GPU (RTX 2070, round 1)
+//      low      512^2    64           2.509       0.3173 / 0.1856         0.045 ms
+//      medium   1024^2   256          1           0.3203 / 0.1806         0.138 ms
+//      high     1024^2   256          1           = medium                0.142 ms
+//      ultra    1024^2   256          1           = medium                0.133 ms
+//   * History resolution alone does not change the statistics (1024 vs 512 history on the same FFT: mean 0.3047 vs
+//     0.3044); it only changes the grain of the lace break-up in close-ups (0.78 m vs 0.39 m cells).
+//   * The low tier's c2 (centred 64 sub-block of the master: |k| < 32 dk, differences over L/64) has far less
+//     slope: uncorrected -17 %. The source rescales c2's slope and compression by detailGain =
+//     (S_256 / S_64)^0.86 (S = c2 finite-difference slope variance from the master spectrum, CPU, per slot
+//     version). Residual -0.9 % storm, +2.8 % azure. Needs `ocean` in the options.
+//   * c3 / capillary band (round 1 measurement with the old 0.84 m cascade: summing it gave +23 % history on
+//     high): not summed; capillary-scale ripples do not make whitecaps; everything the reference sums IS summed.
+//   * Frame-rate independence (round 1, exact EMA; same 8 s stepped at 20/30/60/144 Hz vs 240 Hz): identical mean,
+//     per-texel mean |diff| 0.0058 / 0.0035 / 0.0015 / 0.0003. The storage-loss term is linear in dt (same rate).
 //   * Re-projection: paused, camera moved by (3.3, -2.1) m -> anchor moved (8, -6) texels -> max |diff| = 0 over
 //     the 1.03 M overlapping texels (exact shift). Origin shift (1.5 km) with the camera fixed in the world: no
 //     dispatch, image identical except 0.04 % edge pixels (camera-relative rasterisation).
@@ -108,7 +124,7 @@ import {
   TextureLoader, Vector2, Vector3,
 } from 'three/webgpu';
 import {
-  Fn, If, abs, clamp, dFdx, dFdy, dot, exp, float, globalId, int, max, mix, modelWorldMatrix, normalize, pmremTexture,
+  Fn, If, abs, clamp, dFdx, dFdy, dot, exp, exp2, float, floor, globalId, int, log2, max, mix, modelWorldMatrix, normalize, pmremTexture,
   smoothstep, sqrt, storage, texture, textureStore, uint, uniform, uvec2, varying, vec2, vec3, vec4,
   cameraPosition, positionWorld, reflect, pow,
 } from 'three/tsl';
@@ -138,6 +154,13 @@ export const FOAM_PARAMS = Object.freeze({
   edgeStart: 152, edgeEnd: 200,
   /** EMA time constant, s. */
   tau: 1.48,
+  /** Reference fp16 history storage loss, in fp16 ulps of the history per second: the reference writes its
+   *  RGBA16F history every frame with round-toward-zero = ulp/2 lost per frame at its 60 Hz -> 30 ulp/s.
+   *  Part of the reference look (-3 % history, -10 % storm whitecap coverage); 0 = exact EMA. */
+  storageLoss: 30,
+  /** History (re)start (first frame, teleport > 200 m, time jump): true = from 0 like the reference (foam fades
+   *  in over ~tau; the reference's 6 s shot warm-up keeps a 1.7 % deficit), false = at the instantaneous source. */
+  coldStart: true,
   /** Source: gain * smoothstep(lo, hi, compression) + slopeGain * sqrt(downwind slope). */
   compressionGain: 0.99, compressionLo: 0.15, compressionHi: 0.5, slopeGain: 1.1,
   /** Threshold = 1 - thresholdGain * history; breaking = red * smoothstep(t, t + softness, red) * breakingGain. */
@@ -148,6 +171,9 @@ export const FOAM_PARAMS = Object.freeze({
   surfaceTile: 30, surfaceLo: 0.79, surfaceHi: 0.94, surfaceGain: 0.3,
   /** Pattern wind-direction low-pass, s. */
   windTau: 1,
+  /** c2 detail-grid gain = (S_256 / S_n)^exponent (low tier: c2 on 64). 0.86 fitted so low = medium history
+   *  mean (storm -0.9 %, azure +2.8 %); exponent 0 = 1 would give -17 %, 1 gives +4 %. */
+  detailGainExponent: 0.86,
 });
 
 export interface OceanFoamOptions {
@@ -208,6 +234,8 @@ export interface OceanFoam {
     readonly fineInSource: any;
     /** c2 gain keeping the 256-grid source statistics on the 128 / 512 detail grids (1 on medium / high). */
     readonly detailGain: any;
+    /** Multiplies the final coverage (default 1; 0 = no foam, for A/B measurements). */
+    readonly coverageScale: any;
   };
   /** Store the camera for this frame's anchor (allocation-free). */
   update(camera: any): void;
@@ -267,12 +295,15 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
   const uAnchorMod = [0, 1, 2, 3].map(() => uniform(new Vector2()));   // anchor mod tile P_c (east, south), m
   const uShift = uniform(new Vector2());        // texel shift: new texel i reads old texel i + shift
   const uRetention = uniform(0);                // exp(-dt / tau), 0 = warm reset
+  const uOldScale = uniform(1);                 // 0 on a cold (re)start: the history restarts from 0 (reference)
+  const uLoss = uniform(0);                   // storageLoss * dt (reference fp16 storage loss, in ulps)
   const uPrevBase = uniform(0, 'uint');
   const uCurBase = uniform(0, 'uint');
   const uResample = uniform(0);                 // 1 on the first frame of a new tier: old = previous tier's texture
   const uResampleOffset = uniform(new Vector2()); // new anchor - old tier's anchor (m)
   const fineInSource = uniform(0);
   const uDetailGain = uniform(1);
+  const uCoverageScale = uniform(1);            // debug / A-B: 0 removes all foam from the material
   const anchorRel = uniform(new Vector2());     // anchor - lod foot, m (material)
   const uAlong = uniform(new Vector2(0.540302306, 0.841470985)); // pattern wind (east, south)
   const uLacePhase = uniform(new Vector2());    // fract(M foot + c)
@@ -301,8 +332,8 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
       const n = fftSampling.normal(c, tc, float(0));
       let s: any = vec2(n.x, n.y.negate());                  // (n.east, n.south)
       let k: any = float(1).sub(n.w);                          // compression_c (downwind-masked)
-      // c2 on a detail grid other than the reference's 256 (low 128, ultra 512): rescaled to the 256-grid
-      // finite-difference slope variance (uDetailGain, computed from the spectrum, see detailGainFor).
+      // c2 on a detail grid other than the reference's 256 (low: 64, the centred sub-block of the master):
+      // rescaled towards the 256-grid statistics (uDetailGain, computed from the spectrum, see detailGainFor).
       if (c === 2) { s = s.mul(uDetailGain); k = k.mul(uDetailGain); }
       slope = slope === null ? s : slope.add(s);
       comp = comp === null ? k : comp.add(k);
@@ -342,7 +373,13 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
         const inside = pi.greaterThanEqual(0).and(pi.lessThan(R)).and(pj.greaterThanEqual(0)).and(pj.lessThan(R));
         If(inside, () => { old.assign(hist.element(uPrevBase.add(uint(pj.mul(R).add(pi))))); });
       });
-      const h = max(mix(src, old, uRetention), 0);
+      // Reference storage loss (see FOAM_PARAMS.storageLoss): the reference keeps its history in an RGBA16F
+      // render target, written every frame with round-toward-zero; that loses ulp_fp16(h) / 2 per 60 Hz frame
+      // on average (measured: -0.010 = -3 % history at storm vs a float32 target). Emulated as a deterministic,
+      // frame-rate independent drift: h -= storageLoss * ulp16(h) * dt.
+      const h0 = mix(src, old.mul(uOldScale), uRetention).toVar();
+      const ulp16 = exp2(floor(log2(max(h0, 6.103515625e-5)))).mul(1 / 1024);
+      const h = max(h0.sub(ulp16.mul(uLoss)), 0);
       hist.element(uCurBase.add(j.mul(uint(R)).add(i))).assign(h);
       // (history, source, compression term, sqrt downwind-slope term): the material reads .x only
       textureStore(out, uvec2(i, j), vec4(h, src, sa.compTerm, sa.slopeTerm));
@@ -431,7 +468,7 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
     const threshold = float(1).sub(history.mul(P.thresholdGain));
     const breaking = clamp(red.mul(smoothstep(threshold, threshold.add(P.breakingSoftness), red)).mul(P.breakingGain), 0, 1);
     const surface = surfaceRed.mul(smoothstep(P.surfaceLo, P.surfaceHi, surfaceRed)).mul(P.surfaceGain);
-    return { foam: clamp(breaking.add(surface), 0, 1), breaking, surface, history, red };
+    return { foam: clamp(breaking.add(surface), 0, 1).mul(uCoverageScale), breaking, surface, history, red };
   }
   const nodes: OceanFoamNodes = {
     coverage: (rest) => layers(rest).foam,
@@ -496,9 +533,9 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
   }
 
   // ---- c2 detail-grid gain: the reference's c2 normals are central differences on a 256 grid (cell L/256).
-  // The low tier's 128 grid keeps only |k| < 128 dk and differences over L/128; ultra's 512 grid (same band,
-  // zero-padded) differences over L/512. The foam source scales c2's slope / compression by
-  // g = sqrt(S_256 / S_n), S_n = sum_k E(k) [(sin(kx h_n)/h_n)^2 + (sin(ky h_n)/h_n)^2] over the band kept
+  // The low tier's 64 grid keeps only the centred sub-block |k| < 32 dk (Nyquist line zeroed) and differences over
+  // L/64. The foam source scales c2's slope / compression by
+  // g = (S_256 / S_n)^detailGainExponent, S_n = sum_k E(k) [(sin(kx h_n)/h_n)^2 + (sin(ky h_n)/h_n)^2] over the band kept
   // on that grid (E = |h0|^2 + |h0m|^2 of the master spectrum). Computed on the CPU when a slot regenerates.
   const gainVer = new Float64Array(8).fill(-1), gainN = new Float64Array(8).fill(-1), gainVal = new Float64Array(8).fill(1);
   function detailGainFor(h0: Float32Array, n: number): number {
@@ -521,9 +558,9 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
         sN += e * (dxN * dxN + dyN * dyN);
       }
     }
-    // Exponent 1 (variance ratio), not 1/2: measured, the history mean responds to c2 roughly like ln(g) x 2
-    // (the compression smoothstep and the sqrt slope term are nonlinear); see the header table.
-    return sN > 0 ? sR / sN : 1;
+    // Raised to FOAM_PARAMS.detailGainExponent (measured on the low tier's 64 grid: the compression smoothstep
+    // and the sqrt slope term are nonlinear in the c2 slope scale); see the header table.
+    return sN > 0 ? (sR / sN) ** P.detailGainExponent : 1;
   }
   function updateDetailGain(t: number) {
     const oc = opts.ocean;
@@ -604,7 +641,12 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
       } else uResample.value = 0;
       anchorIU = iu; anchorIV = iv; anchorU = newU; anchorV = newV;
       (uShift.value as Vector2).set(du, dv);
-      uRetention.value = reset ? 0 : Math.exp(-Math.max(dt, 0) / P.tau);
+      // reset: cold start from 0 like the reference (it clears the targets, then accumulates: foam fades in
+      // over ~tau), or warm start at the source when FOAM_PARAMS.coldStart is false.
+      const dtc = Math.min(Math.max(dt, 0), 2);
+      uOldScale.value = reset ? 0 : 1;
+      uRetention.value = reset ? (P.coldStart ? 1 : 0) : Math.exp(-dtc / P.tau);
+      uLoss.value = reset ? 0 : P.storageLoss * dtc;
       for (let c = 0; c < C.length; c++) {
         const Pc = C[c].domain;
         (uAnchorMod[c].value as Vector2).set(mod64(anchorU, Pc), mod64(anchorV, Pc));
@@ -638,7 +680,7 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
     ready,
     get tier() { return active ? activeLabel : requested; },
     get pendingTier() { return pendingTier; },
-    uniforms: { anchorRel, fineInSource, detailGain: uDetailGain },
+    uniforms: { anchorRel, fineInSource, detailGain: uDetailGain, coverageScale: uCoverageScale },
     update(cam: any) { camera = cam; },
     setTier(t: FoamTier) {
       if (!(t in FOAM_TIERS)) throw new Error(`ocean.foam: unknown tier ${t}`);

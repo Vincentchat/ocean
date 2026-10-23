@@ -4,10 +4,12 @@
 // ?parity[=N]   N probe points (default 256) around the camera foot, radius 1 .. 450 m (log-spaced, golden-angle
 //               azimuths). Each frame the GPU probe (three/parity.ts) solves the drawn surface at the points; the CPU
 //               reference (ocean.heightsAt) is evaluated at dispatch with the same points and simulation time; the
-//               readback lands one frame later and is compared. Bands:
-//                 gate  = rest point not faded (vertex far fade = 1, distance < 200 m): PASS if max |err| < 2 % Hs
-//                 faded = beyond (the vertex shader deliberately flattens the waves from 200 to 1200 m): reported,
-//                         plus the same points with the fade removed ("field") to separate fade from FFT error.
+//               readback lands one frame later and is compared. PASS = both gates < 2 % Hs (max |err|):
+//                 A  GPU field (full-resolution GPU surface: LOD 0 Catmull-Rom, no fade) vs CPU, all points;
+//                 B  DRAWN surface (vertex footprint mips + far fade, exactly as the vertex shader) vs CPU where the
+//                    vertex shader uses the CPU's filter for c0 + c1 (Catmull-Rom zone: footprint < 0.53 m).
+//               Further out the drawn surface is band-limited by the vertex footprint mips (25-200 m) and flattened by
+//               the far fade (> 200 m): reported per band, not gated (view-dependent by design; see the report).
 //               window.__parity: live aggregate since the last reset() (tools/parity.mjs).
 // ?buoy         5 floating test objects: height from WATER_QUERY.heightAt at the interpolated (draw) time, tilt from
 //               the heightAt slope, the last one drifts with WATER_QUERY.velocityAt (spring-anchored). A small GPU
@@ -111,17 +113,25 @@ export async function attachParityDemo(o: ParityDemoOptions) {
       renderer: o.renderer, fft: gpu.fft, lod: gpu.lod, origin, shape, capacity: N, cubic: o.cubic,
       reference: (pts, n, t, out) => { ocean.heightsAt(pts, t, out, n); },
     });
+    // Statistics. Gate A (spec check 6 "GPU heights = CPU heights"): the full-resolution GPU surface (LOD 0, no fade)
+    // vs the CPU at every point. Gate B (the floating-object view): the DRAWN surface vs the CPU where the vertex
+    // shader samples cascades 0 and 1 with the CPU's filter (Catmull-Rom: c1 texture LOD < 0.5, i.e. vertex
+    // footprint < CUBIC_FP m). Elsewhere the drawn surface is band-limited on purpose (vertex footprint mips) and
+    // flattened beyond 200 m (far fade): reported per distance band, not gated.
+    const NEAR = 25;
+    const CUBIC_FP = (Math.SQRT2 * 96) / 256; // c1: lod = log2(fp * 256 / 96) < 0.5
     const CAP = 1 << 18;
-    const gate = createAgg(CAP), near = createAgg(CAP), faded = createAgg(CAP), fieldFar = createAgg(CAP), fieldAll = createAgg(CAP);
+    const field = createAgg(CAP), dCubic = createAgg(CAP), dNear = createAgg(CAP), dMid = createAgg(CAP), dFar = createAgg(CAP), dFaded = createAgg(CAP);
     const st = {
       readbacks: 0, latencyMax: 0, latencySum: 0, residualMax: 0, timeMin: Infinity, timeMax: -Infinity,
       sumRef: 0, sumRef2: 0, nRef: 0, worst: { err: 0, x: 0, z: 0, dist: 0, fp: 0, t: 0, cpu: 0, gpu: 0 },
     };
     const reset = () => {
-      gate.reset(); near.reset(); faded.reset(); fieldFar.reset(); fieldAll.reset();
+      field.reset(); dCubic.reset(); dNear.reset(); dMid.reset(); dFar.reset(); dFaded.reset();
       st.readbacks = 0; st.latencyMax = 0; st.latencySum = 0; st.residualMax = 0; st.timeMin = Infinity; st.timeMax = -Infinity;
       st.sumRef = 0; st.sumRef2 = 0; st.nRef = 0; st.worst.err = 0;
     };
+    const cm = (x: number) => (x * 100).toFixed(2);
     probe.onResult = (r: OceanProbeResult) => {
       st.readbacks++;
       st.latencySum += r.latencyFrames;
@@ -133,27 +143,31 @@ export async function attachParityDemo(o: ParityDemoOptions) {
         if (!(cpu === cpu)) continue;
         const err = r.drawn[i] - cpu, ef = r.field[i] - cpu;
         st.sumRef += cpu; st.sumRef2 += cpu * cpu; st.nRef++;
-        fieldAll.add(ef);
-        if (r.residual[i] > st.residualMax && r.fade[i] >= 0.99999) st.residualMax = r.residual[i];
-        if (r.fade[i] >= 0.99999) {
-          gate.add(err);
-          if (radius[i] < 30) near.add(err);
-          const ae = err < 0 ? -err : err;
-          if (ae > st.worst.err) {
-            const w = st.worst;
-            w.err = ae; w.x = r.points[3 * i]; w.z = r.points[3 * i + 2]; w.dist = radius[i]; w.fp = r.footprint[i]; w.t = r.time; w.cpu = cpu; w.gpu = r.drawn[i];
-          }
-        } else { faded.add(err); fieldFar.add(ef); }
+        field.add(ef);
+        const ae = ef < 0 ? -ef : ef;
+        if (ae > st.worst.err) {
+          const w = st.worst;
+          w.err = ae; w.x = r.points[3 * i]; w.z = r.points[3 * i + 2]; w.dist = radius[i]; w.fp = r.footprint[i]; w.t = r.time; w.cpu = cpu; w.gpu = r.field[i];
+        }
+        if (r.footprint[i] < CUBIC_FP && r.fade[i] >= 0.99999) { dCubic.add(err); if (r.residual[i] > st.residualMax) st.residualMax = r.residual[i]; }
+        if (r.fade[i] < 0.99999) dFaded.add(err);
+        else if (radius[i] < NEAR) dNear.add(err);
+        else if (radius[i] < 100) dMid.add(err);
+        else dFar.add(err);
       }
       const H = hs();
-      const g = gate.summary(H);
+      const a = field.summary(H), b = dCubic.summary(H), nr = dNear.summary(H);
+      const pa = a.n > 0 && a.maxPctHs < 2, pb = b.n > 0 && b.maxPctHs < 2;
       text.parity =
-        `PARITY  ${N} pts, 1..${R1} m   ${g.n ? (g.maxPctHs < 2 ? 'PASS' : 'FAIL') : '...'}\n` +
+        `PARITY  ${N} pts, ${R0}..${R1} m   ${pa && pb ? 'PASS' : 'FAIL'}\n` +
         `Hs ${H.toFixed(2)} m  tier ${gpu.fft.tier}  readbacks ${st.readbacks}  latency ${(st.latencySum / Math.max(1, st.readbacks)).toFixed(1)} fr\n` +
-        `drawn vs CPU (<200 m)  max ${(g.max * 100).toFixed(2)} cm (${g.maxPctHs.toFixed(2)} % Hs)\n` +
-        `                       p99 ${(g.p99 * 100).toFixed(2)} cm  rms ${(g.rms * 100).toFixed(2)} cm\n` +
-        `faded (>200 m)         max ${(faded.a.max * 100).toFixed(1)} cm   field max ${(fieldFar.a.max * 100).toFixed(1)} cm\n` +
-        `inversion residual max ${(st.residualMax * 1000).toFixed(2)} mm`;
+        `GPU field vs CPU (all)   max ${cm(a.max)} cm (${a.maxPctHs.toFixed(2)} % Hs)  p99 ${cm(a.p99)}  rms ${cm(a.rms)}  ${pa ? 'PASS' : 'FAIL'}\n` +
+        `drawn vs CPU, cubic zone max ${cm(b.max)} cm (${b.maxPctHs.toFixed(2)} % Hs)  p99 ${cm(b.p99)}  rms ${cm(b.rms)}  ${pb ? 'PASS' : 'FAIL'}\n` +
+        `  <${NEAR} m              max ${cm(nr.max)} cm (${nr.maxPctHs.toFixed(2)} % Hs)  rms ${cm(nr.rms)}\n` +
+        `  ${NEAR}-100 m (mips)      max ${cm(dMid.a.max)} cm  rms ${cm(Math.sqrt(dMid.a.sumSq / Math.max(1, dMid.a.n)))}\n` +
+        `  100-200 m (mips)     max ${cm(dFar.a.max)} cm  rms ${cm(Math.sqrt(dFar.a.sumSq / Math.max(1, dFar.a.n)))}\n` +
+        `  >200 m (far fade)    max ${cm(dFaded.a.max)} cm  rms ${cm(Math.sqrt(dFaded.a.sumSq / Math.max(1, dFaded.a.n)))}\n` +
+        `inversion residual (cubic zone) max ${(st.residualMax * 1000).toFixed(2)} mm`;
       showText();
     };
     // Wrapper pass: fill the points (camera foot + offsets, float64 world) then run the probe.
@@ -181,15 +195,16 @@ export async function attachParityDemo(o: ParityDemoOptions) {
       get readbacks() { return st.readbacks; },
       summary() {
         const H = hs();
-        const g = gate.summary(H);
+        const a = field.summary(H), b = dCubic.summary(H);
         const m = st.nRef ? st.sumRef / st.nRef : 0;
         const hsMeasured = st.nRef ? 4 * Math.sqrt(Math.max(0, st.sumRef2 / st.nRef - m * m)) : 0;
         return {
-          hs: H, hsMeasured, tier: gpu.fft.tier, pendingTier: gpu.fft.pendingTier, points: N, readbacks: st.readbacks,
+          hs: H, hsMeasured, tier: gpu.fft.tier, pendingTier: gpu.fft.pendingTier, points: N, near: NEAR, cubicFootprint: CUBIC_FP, readbacks: st.readbacks,
           latencyMean: st.latencySum / Math.max(1, st.readbacks), latencyMax: st.latencyMax, timeMin: st.timeMin, timeMax: st.timeMax,
           residualMaxM: st.residualMax, stats: { ...probe.stats },
-          gate: g, near30: near.summary(H), faded: faded.summary(H), fieldFaded: fieldFar.summary(H), fieldAll: fieldAll.summary(H),
-          worst: { ...st.worst }, pass: g.n > 0 && g.maxPctHs < 2,
+          field: a, drawnCubic: b, drawnNear: dNear.summary(H), drawnMid: dMid.summary(H), drawnFar: dFar.summary(H), drawnFaded: dFaded.summary(H),
+          worstField: { ...st.worst }, passField: a.n > 0 && a.maxPctHs < 2, passDrawnCubic: b.n > 0 && b.maxPctHs < 2,
+          pass: a.n > 0 && a.maxPctHs < 2 && b.n > 0 && b.maxPctHs < 2,
         };
       },
     };
@@ -213,7 +228,7 @@ export async function attachParityDemo(o: ParityDemoOptions) {
     // Layout relative to the initial camera: ahead (fwd) and to the side (right), metres.
     const fwdE = Math.sin(o.yaw), fwdS = -Math.cos(o.yaw); // yaw 0 looks towards -Z (= north): east 0, south -1
     const rightE = Math.cos(o.yaw), rightS = Math.sin(o.yaw);
-    const LAYOUT = [[7, -2.5], [10, 2.2], [15, -4.5], [24, 3.5], [36, -1]];
+    const LAYOUT = [[4.5, -1.2], [8, 2.2], [13, -3.5], [22, 3.5], [34, -1]];
     const B = LAYOUT.length;
     const anchorW = new Float64Array(B * 3), posW = new Float64Array(B * 3);
     for (let k = 0; k < B; k++) {
