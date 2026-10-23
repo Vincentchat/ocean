@@ -44,6 +44,7 @@ import { CAPILLARY_CASCADE } from './fft-tiers.ts';
 import { createFftSampling, type OceanFft } from './fft.ts';
 import type { OceanLod } from './lod.ts';
 import { tileAnchor } from './lod-math.ts';
+import { lodFootprint } from './parity-math.ts';
 import type { Pass, PassContext } from './pass-types.ts';
 
 /** Fixed-point steps (initial guess), then Newton steps (finite-difference Jacobian). */
@@ -272,32 +273,8 @@ export function createOceanHeightProbe(opts: OceanHeightProbeOptions): OceanHeig
   const footR: Vec3 = { x: 0, y: 0, z: 0 };
   const wrappedTmp: Vec3 = { x: 0, y: 0, z: 0 };
 
-  /**
-   * Footprint (m) the LOD gives the vertices at offset (e, s) from the camera foot: level = the finest ring whose
-   * area covers the point (level l covers the hole of ring l+1, |x - C_(l+1)| <= M s_l, max-norm), morph from the
-   * max-norm distance to the foot, cellSize = s (1 + morph) like lod.ts; beyond the last ring the skirt's
-   * 0.05 * distance. Mirrors lod.ts / lod-math.ts (continuous across level boundaries: morph = 1 there).
-   */
-  function footprintAt(e: number, s: number): number {
-    const st = lod.state, prm = lod.params, lv = st.level, K = st.drawnLevels, M = prm.halfCells;
-    const bu = e + st.phiU, bv = s + st.phiV; // offset from the lattice anchor B
-    let l = 0;
-    for (; l < K - 1; l++) {
-      const du = Math.abs(bu - lv[(l + 1) * 4]), dv = Math.abs(bv - lv[(l + 1) * 4 + 1]);
-      if ((du > dv ? du : dv) <= M * lv[l * 4 + 2]) break;
-    }
-    const sp = lv[l * 4 + 2];
-    if (l === K - 1) {
-      const du = Math.abs(bu - lv[l * 4]), dv = Math.abs(bv - lv[l * 4 + 1]);
-      if ((du > dv ? du : dv) > (M + prm.margin) * sp) return 0.05 * Math.sqrt(e * e + s * s + st.height * st.height);
-    }
-    const ae = Math.abs(e), as = Math.abs(s);
-    const dmax = (ae > as ? ae : as) / sp;
-    let m = (dmax - prm.morphStart) / (prm.morphEnd - prm.morphStart);
-    m = m < 0 ? 0 : m > 1 ? 1 : m;
-    m *= lv[l * 4 + 3];
-    return sp * (1 + m);
-  }
+  /** Footprint (m) the LOD gives the vertices at offset (e, s) from the camera foot (parity-math.ts, tested). */
+  const footprintAt = (e: number, s: number): number => lodFootprint(lod.state, lod.params, e, s);
 
   /** Debug: footprint >= 0 forces that footprint (m) for every point (0 = LOD 0 = Catmull-Rom everywhere). */
   const debug = { footprint: -1 };

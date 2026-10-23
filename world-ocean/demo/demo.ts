@@ -35,7 +35,7 @@ import {
 } from 'three/webgpu';
 import { Fn, clamp, max, pow, texture, uniform, uv, vec3, vec4 } from 'three/tsl';
 import { setAssetResolver, OCEAN_ASSETS, DEMO_ASSETS } from '../assets.ts';
-import { createOceanGpu, type OceanTier, type Pass, type PassContext, type OceanGpu } from '../three/index.ts';
+import { createOceanGpu, setMaterialPreviousPosition, type OceanTier, type Pass, type PassContext, type OceanGpu } from '../three/index.ts';
 import {
   createFloatingOrigin, createStubWorld, createStubWind, createStubEnvironment, createStubTerrainGrid,
 } from '../stubs/impl.ts';
@@ -270,6 +270,8 @@ async function main() {
     waveScale: flags.scene ? REFERENCE_WAVE[flags.scene] : undefined,
   } as any);
   for (const p of gpu.passes) runner.add(p);
+  // Motion vectors, as the engine's graph.setMaterialPreviousPosition(material, previousLocalPositionNode) would.
+  setMaterialPreviousPosition(gpu.material, gpu.previousPositionNode);
 
   // Foam is part of createOceanGpu (gpu.foam, pass 'ocean.foam'). Opt-in foam debug view (?debug=foam | ?debug=foamraw):
   // a debug material with the reference foam composition. window.__foam = { foam, view } for tools/foam-check.mjs.

@@ -30,8 +30,7 @@ Read this first, then `docs/Ocean-WebGPU-Port-Rules.md` (THE SPEC — every rule
 ## Practicalities
 - Windows 10, PowerShell 5.1 (no `&&`). GPU: NVIDIA RTX 2070. Browser for captures: Edge
   (`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`) driven by playwright-core with WebGPU flags.
-- git is NOT on PATH: `C:\Users\Vincent\AppData\Local\GitHubDesktop\app-3.6.4\resources\app\git\cmd\git.exe`.
-  Agents do NOT commit; the orchestrator commits.
+- NOBODY commits, stages, resets or otherwise writes to git (user's rule). Read-only git commands only if needed.
 - Each agent uses the dev-server port it was assigned, and stops servers it started before finishing.
 - Never edit files owned by another concurrently running piece unless your brief says so.
 - Be honest in reports: what works, what does not, measured numbers, screenshots paths.

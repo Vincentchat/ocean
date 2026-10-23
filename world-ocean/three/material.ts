@@ -1,14 +1,18 @@
 // Water surface material (three r186, WebGPU / TSL, MeshBasicNodeMaterial with a custom colorNode).
-// Faithful port of the WebGL reference fragment shader (src/ocean.js:228-354, docs/port/REFERENCE.md Ã‚Â§2), every term
+// Port of the WebGL reference fragment shader (src/ocean.js:228-354, docs/port/REFERENCE.md section 2), every term
 // in the same order with the same constants. Output: linear HDR radiance (cd/m^2) x preExposure, no tonemap.
 //
 // Term by term (reference line refs = src/ocean.js):
-//   normal      FFT normal textures, chained cascades, explicit LOD from the fragment footprint
-//               max(|d rest/dx|, |d rest/dy|) (:271, spectralSurface :176-182; trilinear like normalAt). Not faded
-//               with distance (the reference does not either: the mips + roughness do the distance filtering).
+//   view        V / dist from the VIEW-space position (modelViewMatrix composed on the CPU in float64): exact at any
+//               floating-origin offset (no large f32 world positions are subtracted).
+//   normal      FFT normal textures, chained cascades, trilinear at the explicit LOD log2(footprint / texel)
+//               (:271, spectralSurface :176-182). Footprint = max(|d rest/dx|, |d rest/dy|) like the reference, but
+//               clamped to FOOTPRINT_CLAMP x the analytic pixel footprint dist x pixelAngle / |V.up|: across a crest
+//               silhouette a 2x2 quad straddles two waves and the derivatives explode (flickering speckle rows).
 //               N = facing fix N + V max(.025 - N.V, 0) (:273). R = reflect(-V, N), NoV >= .015 (:274).
 //   roughness   .018 + .8 spectralVariance (mip shortening) + .8 (sqrt(1 + slopeVar) - 1) (slopeVar = the FFT's
-//               unresolvedSlopeVariance) + .8 sqrt(max(|dN/dx|^2, |dN/dy|^2)), clamped .018..8 (:276-277).
+//               unresolvedSlopeVariance) + .8 sqrt(max(|dN/dx|^2, |dN/dy|^2)), clamped .018..8 (:276-277); the dN term
+//               is gated off on silhouette quads (derivative footprint > 2x analytic).
 //               Derivatives are taken at the top level of the shader (uniform control flow in WGSL).
 //   sun spec    GGX D, Smith-Schlick G (k = (r+1)^2/8), Schlick F0 .0180094, r floored at .12 (sun glitter path),
 //               spec = D G F / (4 NoV + .04), capped at 22 (:278-281, :298).
@@ -21,8 +25,9 @@
 //   contact     transmission.contact(color) after foam, before haze: edge fade to the raw scene + contact foam (:337-348).
 //   SSS / crest transmissionTint (.0159963,.1356333,.0908417) x smoothstep(-.3,.85, height / waveScale)
 //               x (.12 + .6 backLight) x (diffuseSky .4 + sun 2.2), backLight = max(V . -norm(L + .4 N), 0)^2 (:283, :291-293).
-//   foam        coverage from the `foamCoverage` input (foam piece; default: the FFT compression); grey foam
-//               .3 + .7 sat(surfaceNormal . L) at the foam white level, sun specular removed under foam (:333-336).
+//   foam        coverage from the `foamCoverage` input (three/foam.ts); diffuse white of albedo foamAlbedo (0.8) lit by
+//               SKY_LIGHT: (skyColor skyIlluminance (.5 + .5 N.up) + sunColor sunIlluminance sat(N.L)) / pi (the
+//               reference used an unlit grey .3 + .7 N.L in display units). Sun specular removed under foam (:333-336).
 //   haze        Gaussian 1 - exp(-(dist / D)^2), D = 1 / SkyLight.fogDensity (demo: 280 m, storm 220 m), towards
 //               the env colour just above the horizon (direction (horizontal, dist .002)) (:350-352). Input.
 //   back faces  DoubleSide with the same shader (the reference has no underwater path); the facing fix flips N.
@@ -31,11 +36,11 @@
 //   E_sun  = SkyLight.sunColor * SkyLight.sunIlluminance (lux) = the reference's sunlight() * 4.5 * sunVisibility in
 //            cd/m^2 (4.5 = the reference's sun-disc / specular gain: the sun is a 4.5 RU irradiance).
 //            Reference sun terms that use sunlight() * visibility without the 4.5 gain use E_sun / 4.5.
-//   sunSpecularScale = the reference's storm dimming of the sun specular, (4.5 - 3.5 storm) / 4.5. Default from
-//            ENVIRONMENT.cloudCover (1 - 7/9 cloudCover); the demo maps the reference storminess to cloudCover.
+//            No extra cloud dimming here: a sky module lowers sunIlluminance itself (the demo stand-in folds the
+//            reference's storm specular dimming into its sunIlluminance).
 //   env    = pmremTexture(envMap) * envIntensity (cd/m^2). Without an env map: SkyLight.skySH.
-//   foam white = envIntensity (1 reference unit: the reference foam is unlit grey .3..1 RU).
-//   With the demo (REF_NITS, preExposure = 1 / REF_NITS) the written value equals the reference's pre-tonemap colour.
+//   foam / contact rim = Lambert radiance from skyIlluminance + sunIlluminance (dark at night).
+//   With the demo (REF_NITS, preExposure = 1 / REF_NITS) the water (not foam) equals the reference's pre-tonemap colour.
 import { DoubleSide, MeshBasicNodeMaterial, Vector3 } from 'three/webgpu';
 import {
   abs, cameraWorldMatrix, clamp, dFdx, dFdy, dot, exp, exp2, float, length, log2, max, min, mix, modelWorldMatrix,
@@ -147,6 +152,24 @@ export interface OceanMaterial {
   dispose(): void;
 }
 
+/**
+ * Material of the LOD's horizon closure (lod.enableClosure): the band between the last ring and the eye-level
+ * horizon. At those distances the water is fully hazed, so it is the haze colour = the env radiance just above the
+ * horizon in the view direction (the water material's haze target). Never reads scene.color / scene.depth.
+ * Radiance x preExposure. (The closure sets positionNode / vertexNode itself.)
+ */
+export function createOceanHorizonMaterial(o: { envMap?: any; envIntensity?: number; preExposure: any; upNode?: any }): any {
+  const up = o.upNode ?? vec3(0, 1, 0);
+  const ray = normalize(cameraWorldMatrix.mul(vec4(normalize(positionView), 0)).xyz);
+  const horiz = ray.sub(up.mul(dot(ray, up)));
+  const dir = normalize(horiz.add(up.mul(length(horiz).mul(0.002))));      // = the water haze direction at distance
+  const color = o.envMap ? pmremTexture(o.envMap, dir, float(0)).rgb.mul(o.envIntensity ?? 1) : vec3(0.3, 0.45, 0.6);
+  const m = new MeshBasicNodeMaterial({ side: DoubleSide, fog: false });
+  m.name = 'ocean.horizon';
+  m.colorNode = max(color, vec3(0)).mul(o.preExposure);
+  return m;
+}
+
 // Reference constants (src/ocean.js).
 const DEEP = [0.0159963, 0.0612461, 0.0998987];
 const TINT = [0.0159963, 0.1356333, 0.0908417];
@@ -157,7 +180,6 @@ const SUN_GAIN = 4.5;
 const HS_AT_AMP1 = 2.575;
 /** Max ratio of the derivative footprint to the analytic pixel footprint before it is treated as a silhouette quad. */
 const FOOTPRINT_CLAMP = 2;
-const REF_PROBE = 10000;
 /** Diffuse albedo of whitecap foam (fresh dense foam ~0.6-0.9). */
 const FOAM_ALBEDO = 0.8;
 
@@ -200,9 +222,7 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
   const cosUp = max(abs(dot(V, upW)), 0.02);
   const footprintAnalytic = dist.mul(pixelAngle).div(cosUp);
   const footprintDeriv = max(length(dFdx(restLocal)), length(dFdy(restLocal)));
-  const __q = new URLSearchParams(String((globalThis as any).location?.search ?? ''));
-  const __lb = Number(__q.get('mlb') ?? 1), __dn = Number(__q.get('mdn') ?? 0.8), __fc = Number(__q.get('mfc') ?? 1e9);
-  const footprint = min(footprintDeriv, footprintAnalytic.mul(__fc)).mul(__lb);
+  const footprint = min(footprintDeriv, footprintAnalytic.mul(FOOTPRINT_CLAMP));
   // 0 where the quad is coherent, -> 1 where it straddles a silhouette (derivatives meaningless there).
   const straddle = smoothstep(FOOTPRINT_CLAMP, FOOTPRINT_CLAMP * 2, footprintDeriv.div(max(footprintAnalytic, 1e-6)));
   // The reference shades with the 3 reference cascades. The extra 0.84 m cascade (high / ultra) adds sub-0.1 m
@@ -223,12 +243,11 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
   const rough = clamp(
     float(0.018).add(surf.variance.mul(0.8))
       .add(sqrt(float(1).add(fft.uniforms.unresolvedSlopeVariance)).sub(1).mul(0.8))
-      .add(sqrt(variance).mul(__dn)),
+      .add(sqrt(variance).mul(0.8)),
     0.018, 0.8);
 
   // ---------------------------------------------------------------- sun specular (GGX)
-  const __tk = Number(__q.get('mtk') ?? 0);
-  const rs = max(sqrt(sqrt(pow(rough, 4).add(surf.variance.mul(__tk)))), 0.12);
+  const rs = max(rough, 0.12);
   const a2 = pow(rs, 4);
   const denom = NoH.mul(NoH).mul(a2.sub(1)).add(1);
   const D = a2.div(denom.mul(denom).mul(Math.PI));
@@ -260,7 +279,7 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
     const ext = exp(vec3(...SIGMA).negate().mul(transmitted.path));
     // mix with a 0/1 mask (mix(a, b, 0) == a exactly: open water stays bit-identical to the no-refraction path).
     // Not select(): TSL emits an if/else for it, putting the derivative terms below in non-uniform control flow.
-    water = mix(water, transmitted.color.mul(Number(__q.get('mts') ?? 1)).mul(ext).add(water.mul(float(1).sub(ext))), transmitted.valid);
+    water = mix(water, transmitted.color.mul(ext).add(water.mul(float(1).sub(ext))), transmitted.valid);
   }
   // crest translucency (subsurface glow)
   const crest = smoothstep(-0.3, 0.85, height.div(max(waveScale, 0.1)));
@@ -313,8 +332,7 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
   material.positionNode = o.positionNode;
   let out: any = max(color, vec3(0)).mul(o.preExposure);
   if (transmitted?.occlusion && transmitted.background) out = mix(out, transmitted.background, transmitted.occlusion);
-  if (__q.has('mpath') && transmitted) out = vec3(transmitted.path.div(40), transmitted.valid, transmitted.color.y.div(REF_PROBE));
-  else if (o.debug === 'rough') {
+  if (o.debug === 'rough') {
     // R = roughness / .8, G = mip shortening (spectral variance) x 4, B = LOD of cascade 1 (96 m) / 8. Not exposed.
     const lod1 = max(log2(max(footprint, 1e-6).mul(256 / 96)), 0);
     out = vec3(rough.div(0.8), surf.variance.mul(4), lod1.div(8));

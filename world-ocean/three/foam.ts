@@ -500,8 +500,10 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
     laceM00 = ca * ca * k1 + sa * sa * k2; laceM01 = ca * sa * (k1 - k2);
     laceM10 = laceM01;                    laceM11 = sa * sa * k1 + ca * ca * k2;
   }
+  const foot = { u: 0, v: 0 }; // LOD camera foot (world lattice m), preallocated
   function updatePhases() {
-    const fu = lod.state.footU, fv = lod.state.footV;
+    lod.getFoot(foot);
+    const fu = foot.u, fv = foot.v;
     (uLacePhase.value as Vector2).set(
       fract64(laceM00 * fu + laceM01 * fv + laceCU),
       fract64(laceM10 * fu + laceM11 * fv + laceCV),
@@ -520,7 +522,8 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
       next = windAngle + d * (1 - Math.exp(-Math.max(dt, 0) / P.windTau));
     }
     if (next === windAngle) return;
-    const fu = lod.state.footU, fv = lod.state.footV;
+    lod.getFoot(foot);
+    const fu = foot.u, fv = foot.v;
     if (windAngle === windAngle) {
       // re-pivot at the camera foot: uv(foot) continuous across the turn
       const u0 = laceM00 * fu + laceM01 * fv, v0 = laceM10 * fu + laceM11 * fv;
@@ -603,7 +606,7 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
       const ts = active;
       // Nothing to accumulate before the FFT has produced its first normals (empty textures would read as
       // full compression everywhere and seed the history with a white sheet).
-      if (!ts || !camera || !lod.state.hasPrev || !fftReady) { opts.perf?.end(); return; }
+      if (!ts || !camera || !lod.getFoot(foot) || !fftReady) { opts.perf?.end(); return; }
 
       // ---- time
       const t = ctx.time;
@@ -653,7 +656,7 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
       }
 
       // ---- material uniforms (relative to the LOD's foot of THIS frame)
-      (anchorRel.value as Vector2).set(anchorU - lod.state.footU, anchorV - lod.state.footV);
+      (anchorRel.value as Vector2).set(anchorU - foot.u, anchorV - foot.v);
       updateWind(dt, reset);
       updatePhases();
       updateDetailGain(t);

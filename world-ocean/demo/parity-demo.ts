@@ -7,7 +7,7 @@
 //               readback lands one frame later and is compared. PASS = both gates < 2 % Hs (max |err|):
 //                 A  GPU field (full-resolution GPU surface: LOD 0 Catmull-Rom, no fade) vs CPU, all points;
 //                 B  DRAWN surface (vertex footprint mips + far fade, exactly as the vertex shader) vs CPU where the
-//                    vertex shader uses the CPU's filter for c0 + c1 (Catmull-Rom zone: footprint < 0.53 m).
+//                    vertex shader uses the CPU's filter for c0 + c1 (pure Catmull-Rom: footprint <= 0.375 m).
 //               Further out the drawn surface is band-limited by the vertex footprint mips (25-200 m) and flattened by
 //               the far fade (> 200 m): reported per band, not gated (view-dependent by design; see the report).
 //               window.__parity: live aggregate since the last reset() (tools/parity.mjs).
@@ -115,11 +115,11 @@ export async function attachParityDemo(o: ParityDemoOptions) {
     });
     // Statistics. Gate A (spec check 6 "GPU heights = CPU heights"): the full-resolution GPU surface (LOD 0, no fade)
     // vs the CPU at every point. Gate B (the floating-object view): the DRAWN surface vs the CPU where the vertex
-    // shader samples cascades 0 and 1 with the CPU's filter (Catmull-Rom: c1 texture LOD < 0.5, i.e. vertex
-    // footprint < CUBIC_FP m). Elsewhere the drawn surface is band-limited on purpose (vertex footprint mips) and
+    // shader samples cascades 0 and 1 with the CPU's filter (Catmull-Rom at texture LOD 0 for c1, i.e. vertex
+    // footprint <= CUBIC_FP m). Elsewhere the drawn surface is band-limited on purpose (vertex footprint mips) and
     // flattened beyond 200 m (far fade): reported per distance band, not gated.
     const NEAR = 25;
-    const CUBIC_FP = (Math.SQRT2 * 96) / 256; // c1: lod = log2(fp * 256 / 96) < 0.5
+    const CUBIC_FP = 96 / 256 + 1e-6; // c1 texture LOD 0 (= one c1 texel): pure Catmull-Rom for c0 and c1
     const CAP = 1 << 18;
     const field = createAgg(CAP), dCubic = createAgg(CAP), dNear = createAgg(CAP), dMid = createAgg(CAP), dFar = createAgg(CAP), dFaded = createAgg(CAP);
     const st = {
@@ -149,7 +149,7 @@ export async function attachParityDemo(o: ParityDemoOptions) {
           const w = st.worst;
           w.err = ae; w.x = r.points[3 * i]; w.z = r.points[3 * i + 2]; w.dist = radius[i]; w.fp = r.footprint[i]; w.t = r.time; w.cpu = cpu; w.gpu = r.field[i];
         }
-        if (r.footprint[i] < CUBIC_FP && r.fade[i] >= 0.99999) { dCubic.add(err); if (r.residual[i] > st.residualMax) st.residualMax = r.residual[i]; }
+        if (r.footprint[i] <= CUBIC_FP && r.fade[i] >= 0.99999) { dCubic.add(err); if (r.residual[i] > st.residualMax) st.residualMax = r.residual[i]; }
         if (r.fade[i] < 0.99999) dFaded.add(err);
         else if (radius[i] < NEAR) dNear.add(err);
         else if (radius[i] < 100) dMid.add(err);

@@ -442,7 +442,8 @@ export interface EmulatedVertex {
 
 const f = Math.fround;
 
-/** Mirrors three/lod.ts `buildNodes` exactly (same op order, float32 rounding after each op). */
+/** Mirrors three/lod.ts's GRID vertex nodes exactly (same op order, float32 rounding after each op). The closure's
+ *  outer loops (kinds 2, 3) are only approximated (radial at skirtRadius): the shader places them per rendering camera. */
 export function emulateVertex(st: LodState, p: LodParams, gx: number, gy: number, levelKind: number, skirtRadius: number, out: EmulatedVertex): EmulatedVertex {
   const kind = levelKind % 4, levelAttr = (levelKind - kind) / 4;
   const l = kind > 0 ? st.drawnLevels - 1 : levelAttr;

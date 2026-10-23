@@ -7,7 +7,7 @@
 // readbacks (each = all points at one simulation time, the sim keeps running), print max / p99 / rms in cm and
 // % of Hs of  A: GPU field (full-resolution GPU surface: LOD 0 Catmull-Rom, no far fade) - CPU WATER_QUERY, all
 // points (1-450 m);  B: DRAWN surface (vertex footprint mips + far fade, as the vertex shader) - CPU where the vertex
-// shader uses the CPU's Catmull-Rom for cascades 0 + 1 (footprint < 0.53 m); and the drawn error per distance band\n// (< 25 m, 25-100 m, 100-200 m, > 200 m: view-dependent, not gated).
+// shader uses the CPU's filter for cascades 0 + 1 (pure Catmull-Rom: footprint <= 0.375 m); and the drawn error per distance band\n// (< 25 m, 25-100 m, 100-200 m, > 200 m: view-dependent, not gated).
 // The camera keeps the same WORLD position for every origin (?origin only moves the floating origin).
 // Exit code 1 when any case fails (A or B max >= 2 % Hs), has WebGPU errors, or produced no data.
 import { writeFileSync } from 'node:fs';
@@ -83,5 +83,5 @@ try {
 }
 if (opts.out) writeFileSync(opts.out, JSON.stringify(out, null, 2));
 const fails = out.cases.filter((c) => !(c.pass === true && !c.error && !c.webgpuErrors)).length;
-console.log(`\n${out.cases.length - fails}/${out.cases.length} cases pass (A: max |GPU field (LOD 0, no fade) - CPU| < 2 % Hs at all points; B: max |drawn - CPU| < 2 % Hs in the Catmull-Rom zone).`);
+console.log(`\n${out.cases.length - fails}/${out.cases.length} cases pass (A: max |GPU field (LOD 0, no fade) - CPU| < 2 % Hs at all points; B: max |drawn - CPU| < 2 % Hs where the vertex shader samples c0 + c1 with pure Catmull-Rom).`);
 process.exit(exit);

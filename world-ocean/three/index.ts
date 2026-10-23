@@ -28,11 +28,11 @@
 //   velocity   screen-space motion of the displaced surface (current - previous position), pixels / frame, log brightness (16 px saturates), hue = direction.
 import { DoubleSide, FrontSide, Mesh, MeshBasicNodeMaterial, Scene } from 'three/webgpu';
 import {
-  abs, cameraPosition, cameraProjectionMatrix, cameraViewMatrix, clamp, cross, dFdx, dFdy, dot, float, floor,
+  Fn, positionLocal, positionPrevious, positionView, velocity, cameraWorldMatrix, abs, clamp, cross, dFdx, dFdy, dot, float, floor,
   length, log2, max, modelWorldMatrix, normalize, pow, positionWorld, screenSize, smoothstep, uniform, varying, vec3, vec4,
 } from 'three/tsl';
 import type { EnvironmentState, FloatingOrigin, SkyLight, TerrainGpuHeight, Vec3, WorldShape } from '../stubs/world-core.ts';
-import { createOceanMaterial, type OceanMaterial, type OceanMaterialOptions } from './material.ts';
+import { createOceanMaterial, createOceanHorizonMaterial, type OceanMaterial, type OceanMaterialOptions } from './material.ts';
 import { createOceanRefraction, type OceanRefraction, type OceanRefractionOptions } from './refraction.ts';
 import { createOceanFoam, type OceanFoam } from './foam.ts';
 import type { Pass, PassContext } from './pass-types.ts';
@@ -45,7 +45,7 @@ export { createOceanLod } from './lod.ts';
 export type { OceanLod, OceanLodNodes, OceanLodOptions, OceanLodStats } from './lod.ts';
 export { createOceanFft, createFftSampling, FFT_TIERS, FFT_CASCADES, BASE_SIZE, FINE_DOMAIN } from './fft.ts';
 export type { OceanFft, FftSampling, FftSampleOptions, FftSurfaceSample, FftTierConfig } from './fft.ts';
-export { createOceanMaterial } from './material.ts';
+export { createOceanMaterial, createOceanHorizonMaterial } from './material.ts';
 export type { OceanMaterial, OceanMaterialOptions, OceanFoamContext, OceanTransmission, OceanTransmissionContext } from './material.ts';
 export { createOceanRefraction } from './refraction.ts';
 export { createOceanFoam, FOAM_TIERS, FOAM_PARAMS } from './foam.ts';
@@ -122,6 +122,23 @@ export interface OceanGpu {
   dispose(): void;
 }
 
+/**
+ * Side-repo equivalent of the engine's graph.setMaterialPreviousPosition(material, previousLocalPositionNode) on
+ * three r186: positionNode becomes a vertex Fn that assigns the material's positionPrevious varying (what r186's
+ * VelocityNode reads, the same mechanism as skinning / instancing / Line2) and returns the current position.
+ * previousPositionNode = last frame's displaced position in LAST frame's local frame (VelocityNode pairs it with the
+ * mesh's previous world matrix).
+ */
+export function setMaterialPreviousPosition(material: any, previousPositionNode: any): void {
+  if (material.userData.oceanPreviousPosition === previousPositionNode) return; // already wired (idempotent)
+  material.userData.oceanPreviousPosition = previousPositionNode;
+  const positionNode = material.positionNode ?? positionLocal;
+  material.positionNode = Fn(() => {
+    positionPrevious.assign(previousPositionNode);
+    return positionNode;
+  })();
+}
+
 /** Minimal flat shape (east +X, north -Z, up +Y, sea level 0) used only when no shape is passed. */
 function defaultFlatShape(): WorldShape {
   const set = (o: Vec3, x: number, y: number, z: number) => { o.x = x; o.y = y; o.z = z; return o; };
@@ -167,11 +184,11 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
 
   // ------------------------------------------------------------------ materials
   const upW = normalize(modelWorldMatrix.mul(vec4(0, 1, 0, 0)).xyz);
-  const toFrag = positionWorld.sub(cameraPosition);
-  const dist = toFrag.length();
-  const V = toFrag.div(max(dist, 1e-4));
+  // Debug-view facet normal from VIEW-space derivatives (exact at any floating-origin offset), rotated to world axes.
+  const toWorldDir = (v: any) => cameraWorldMatrix.mul(vec4(v, 0)).xyz;
+  const V = normalize(toWorldDir(positionView));
   const facetN = (() => {
-    const nf = normalize(cross(dFdx(positionWorld), dFdy(positionWorld)));
+    const nf = normalize(toWorldDir(cross(dFdx(positionView), dFdy(positionView))));
     return nf.mul(dot(nf, V).greaterThan(0).select(float(-1), float(1))); // face the viewer
   })();
 
@@ -230,10 +247,10 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
   } else if (dbg.has('velocity')) {
     material = new MeshBasicNodeMaterial({ side: DoubleSide });
     material.name = 'ocean.debug.velocity';
-    // NDC motion of the displaced vertex (current - previous), both with this frame's camera (object motion only).
-    const toClip = (p: any) => cameraProjectionMatrix.mul(cameraViewMatrix).mul(modelWorldMatrix).mul(vec4(p, 1));
-    const c0 = toClip(positionNode), c1 = toClip(previousPositionNode);
-    const vel = varying(c0.xy.div(c0.w).sub(c1.xy.div(c1.w)));
+    // three r186's own motion-vector node (what a velocity MRT / TAA reads): current clip position of positionLocal vs
+    // the PREVIOUS camera x the mesh's PREVIOUS world matrix x positionPrevious (= previousPositionNode, assigned in
+    // the position node below). Camera motion included, exactly what scene.velocity / TAA get.
+    const vel = velocity;
     // Readable scale: motion in PIXELS per frame; direction as hue (red/green = signed x/y, 0.5 = none),
     // brightness log2(1 + px) / log2(1 + 16): 1 px -> 0.24, 4 px -> 0.57, >= 16 px saturates. (fft r2, minimal edit)
     const px = vel.mul(screenSize).mul(0.5);
@@ -252,9 +269,22 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
     });
     material = water.material;
   }
+  // Position + motion vectors. The geometry's 'position' attribute is packed grid data, so three's default
+  // positionPrevious (= positionGeometry) is garbage on the ocean: the position node also assigns positionPrevious =
+  // last frame's displaced position (what r186's VelocityNode reads, with the mesh's previous world matrix). The same
+  // node is gpu.previousPositionNode for the engine's graph.setMaterialPreviousPosition (idempotent here).
   material.positionNode = positionNode;
-  lod.mesh.material = material;
+  setMaterialPreviousPosition(material, previousPositionNode);
+  // Camera-relative projection with the model-view product composed on the CPU in float64 (origin 1e5 / 1e7 exact).
+  material.vertexNode = n.clipPosition;
+  if (overlay) overlay.material.vertexNode = n.clipPosition;
+  lod.setMaterial(material); // mesh.material + per-sector frustum culling
   lod.mesh.visible = !dbg.has('nomesh');
+  // Horizon closure (rings -> eye-level horizon) as a background draw in the MAIN scene: haze colour only, never
+  // reads scene.color / depth, writes no depth (cannot hide terrain beyond the rings). Water view only.
+  const horizon = water ? createOceanHorizonMaterial({ envMap: opts.envMap, envIntensity: opts.envIntensity ?? 1, preExposure, upNode: upW }) : null;
+  const closure = horizon ? lod.enableClosure(horizon, { reversedDepth: !!renderer.reversedDepthBuffer }) : null;
+  if (closure) { closure.visible = !dbg.has('nomesh'); scene.add(closure); }
   // With refraction the water is a transparent-stage draw (ocean.water pass, own draw list); otherwise a scene mesh.
   const waterScene = refraction ? new Scene() : null;
   if (waterScene) waterScene.name = 'ocean.water';
@@ -291,6 +321,8 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
     setTier(t) { lod.setTier(t); fft.setTier(t); foam.setTier(t); },
     dispose() {
       lod.mesh.removeFromParent();
+      closure?.removeFromParent();
+      horizon?.dispose();
       lod.dispose();
       foam.dispose();
       fft.dispose();
