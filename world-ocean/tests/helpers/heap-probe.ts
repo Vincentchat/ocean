@@ -14,7 +14,7 @@ const shape = createFlatShape();
 const world = createStubWorld({ shape });
 const wind = createStubWind(15, -57.3, shape);
 world.provide(WIND_QUERY, wind);
-const ocean = createOcean({ preset: 'windy', windTimeConstant: 2, blendTime: 2 });
+const ocean = createOcean({ preset: 'windy', windTimeConstant: 2, blendTime: 2, worker: process.env.WORKER !== '0' });
 world.use(ocean);
 world.start();
 const q = ocean.query;
@@ -63,16 +63,24 @@ const perBatchPoint = bytesPer(200, () => { ocean.heightsAt(pts, t, hs); }) / 10
 // Ticks are driven through the stub world (as in the engine); the stub world's own step allocates a
 // boxed double (its time += fixedDt), measured separately and subtracted. Queries take world.time
 // (an already boxed number: passing it allocates nothing).
+const nap = new Int32Array(new SharedArrayBuffer(4)); // Atomics.wait = sleep without allocation
 const empty = createStubWorld({ shape });
-const perStubStep = bytesPer(600, () => empty.stepOnce());
-const perTickRaw = bytesPer(600, () => world.stepOnce());
+const perStubStep = bytesPer(600, () => { if (process.env.NAP !== '0') Atomics.wait(nap, 0, 0, 3); empty.stepOnce(); });
+// Real-time-ish pacing (3 ms sleep per tick, no allocation): an unpaced loop runs simulated time ~1000x
+// faster than real time, the snapshot workers fall behind and the main thread computes snapshots itself.
+
+const perTickRaw = bytesPer(600, () => { if (process.env.NAP !== '0') Atomics.wait(nap, 0, 0, 3); world.stepOnce(); });
 const perTickLoadRaw = bytesPer(600, () => {
+  if (process.env.NAP !== '0') Atomics.wait(nap, 0, 0, 3);
   world.stepOnce();
   ocean.heightsAt(pts, world.time, hs);
   for (let k = 0; k < 10; k++) { p.x = k * 11; p.z = k * 5; q.velocityAt(p, world.time, v); }
 });
-const perTick = perTickRaw - perStubStep, perTickLoad = perTickLoadRaw - perStubStep;
+// The stub WIND_QUERY (stubs/impl.ts, not part of the ocean) allocates in at(); measured and subtracted.
+const wp = { x: 0, y: 10, z: 0 }, wv = { x: 0, y: 0, z: 0 };
+const perWindSample = bytesPer(600, () => { wind.at(wp, wv); });
+const perTick = perTickRaw - perStubStep - perWindSample, perTickLoad = perTickLoadRaw - perStubStep - perWindSample;
 console.log(JSON.stringify({
   before, after, growth: after - before, acc: Number.isFinite(acc), version: ocean.getState().version,
-  perHeight, perVelocity, perBatchPoint, perTick, perTickLoad, perStubStep,
+  perHeight, perVelocity, perBatchPoint, perTick, perTickLoad, perStubStep, perWindSample,
 }));

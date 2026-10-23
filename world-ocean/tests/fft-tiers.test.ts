@@ -1,50 +1,36 @@
-// Pure parts of the GPU FFT tiers (three/fft-tiers.ts + spectrum.ts tier helpers): band contiguity,
-// bit-identity of the sized generator at 256, the exact field evaluator vs a naive DFT, and the CPU-query
-// parity of every tier's drawn surface (printed; asserted only for the reference tier).
+// Pure parts of the GPU FFT tiers (three/fft-tiers.ts): tier invariance (every tier draws the master components
+// bit-identically, only dropping centred sub-blocks), the exact field evaluator vs a naive DFT, and the CPU-query
+// parity of every tier's drawn surface against the tier-independent core query (cubic c0 / c1).
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { CASCADES, REFERENCE_SIZE } from '../spectrum.ts';
 import {
-  CASCADES, REFERENCE_SIZE, bandCascades, gaussianField, gaussianFieldSized, generateRawRows, generateRawRowsSized,
-  packInitialSpectrum, packInitialSpectrumSized, spectrumScalars,
-} from '../spectrum.ts';
-import { PRESETS } from '../presets/index.ts';
-import {
-  FFT_TIERS, TIER_NAMES, tierCascades, generateTierSpectrum, tierOmega, evaluateFields, sampleChained, stripMasterH0,
+  FFT_TIERS, TIER_NAMES, CAPILLARY_CASCADE, masterH0Subset, masterOmegaSubset, droppedSlopeVariance, evaluateFields,
+  sampleChained, generateCapillary,
 } from '../three/fft-tiers.ts';
 import { createOcean } from '../index.ts';
 import { createFlatShape } from '../stubs/impl.ts';
 
-const g = 9.80665;
+const shape = createFlatShape();
 
-test('bandCascades(256) is the reference layout; bands are contiguous at every tier size', () => {
-  const ref = bandCascades(256);
-  for (let c = 0; c < 3; c++) {
-    assert.equal(ref[c].upper, CASCADES[c].upper);
-    assert.equal(ref[c].lower, CASCADES[c].lower);
-    assert.equal(ref[c].offset, CASCADES[c].offset);
-  }
+test('every tier draws the master components bit-identically (centred sub-blocks only)', () => {
+  const ocean = createOcean({ shape, preset: 'windy', seed: 1 });
+  const st = ocean.getState();
+  const m = REFERENCE_SIZE;
   for (const t of TIER_NAMES) {
-    const cs = tierCascades(t);
-    for (let c = 1; c < cs.length; c++) assert.equal(cs[c].lower, cs[c - 1].upper, `${t} c${c}`);
-    // every band ends at (or below) its grid's Nyquist: nothing is cut by the grid
-    for (const c of cs) assert.ok(c.upper * 1.5 <= (Math.PI * FFT_TIERS[t].size) / c.domain + 1e-9);
+    for (let c = 0; c < 3; c++) {
+      const n = FFT_TIERS[t].sizes[c];
+      if (c === 0) assert.equal(n, 256, `${t}: c0 must stay 256 (it carries the swell)`);
+      const master = st.slots[st.toSlot].h0[c];
+      const sub = masterH0Subset(master, n), om = masterOmegaSubset(st.omegaIndex[c], n);
+      for (let y = 1; y < n; y++) for (let x = 1; x < n; x++) {
+        const i = y * n + x, j = (y - n / 2 + m / 2) * m + (x - n / 2 + m / 2);
+        assert.equal(sub[2 * i], master[4 * j]); assert.equal(sub[2 * i + 1], master[4 * j + 1]);
+        assert.equal(om[i], st.omegaIndex[c][j]);
+      }
+    }
   }
-});
-
-test('sized generator at 256 is bit-identical to the master generator', () => {
-  const p = PRESETS.storm.params;
-  const sc = spectrumScalars(p, g, { g: 0, U: 0, dirGrid: 0, wp: 0 });
-  const n = REFERENCE_SIZE;
-  for (let c = 0; c < 3; c++) {
-    const xi = gaussianField(1, c, new Float64Array(2 * n * n));
-    const xs = gaussianFieldSized(1, c, n, new Float64Array(2 * n * n), xi);
-    assert.deepEqual(xs, xi);
-    const a = new Float64Array(2 * n * n), b = new Float64Array(2 * n * n);
-    generateRawRows(p, sc, CASCADES[c], xi, a, 0, n);
-    generateRawRowsSized(p, sc, CASCADES[c], n, xi, b, 0, n);
-    assert.deepEqual(a, b);
-    assert.deepEqual(packInitialSpectrum(a, p.standing, new Float32Array(4 * n * n)), packInitialSpectrumSized(b, p.standing, n, new Float32Array(4 * n * n)));
-  }
+  assert.equal(CAPILLARY_CASCADE.lower, CASCADES[2].upper, 'capillary band starts where the master band fades out');
 });
 
 test('evaluateFields matches a naive DFT (n = 16)', () => {
@@ -52,8 +38,7 @@ test('evaluateFields matches a naive DFT (n = 16)', () => {
   let s = 7;
   const rnd = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296 - 0.5);
   const h0 = new Float32Array(2 * n * n).map(() => rnd());
-  for (let i = 0; i < n; i++) { h0[2 * i] = h0[2 * i + 1] = 0; h0[2 * i * n] = h0[2 * i * n + 1] = 0; } // Nyquist lines
-  // omega must depend on |k| only (ht(-k) = conj(ht(k)), as in the real system)
+  for (let i = 0; i < n; i++) { h0[2 * i] = h0[2 * i + 1] = 0; h0[2 * i * n] = h0[2 * i * n + 1] = 0; }
   const om = new Float32Array(n * n).map((_, i) => { const u = (i % n) - n / 2, v = Math.floor(i / n) - n / 2; return Math.round(40 * Math.hypot(u, v)); });
   const t = 1234.5678, chop = 1.3;
   const f = evaluateFields(h0, h0, 1, om, n, L, t, chop);
@@ -69,7 +54,6 @@ test('evaluateFields matches a naive DFT (n = 16)', () => {
       const hti = hi * Math.cos(ph) - hr * Math.sin(ph) + mi * Math.cos(ph) + mr * Math.sin(ph);
       const a = (2 * Math.PI * ((u - n / 2) * x + (v - n / 2) * y)) / n, c = Math.cos(a), sn = Math.sin(a);
       H += htr * c - hti * sn;
-      // Da = IFFT(-i kx/kl ht): real part of (-i kxn)(htr + i hti) e^{ia} = kxn (hti c + htr sn)
       E += (kx / kl) * (hti * c + htr * sn);
       N += (kz / kl) * (hti * c + htr * sn);
     }
@@ -80,19 +64,32 @@ test('evaluateFields matches a naive DFT (n = 16)', () => {
   }
 });
 
-/** Drawn surface of a tier vs the core's CPU query (default configuration), at displaced points. */
-function parity(tier: keyof typeof FFT_TIERS, preset: 'breeze' | 'storm', cubic: boolean, count = 1500, cpuCubic = false) {
-  const shape = createFlatShape();
-  const query = cpuCubic ? [{ size: 256, snapshotDt: 0.6, filter: 'cubic' as const }, { size: 256, snapshotDt: 0.25, filter: 'cubic' as const }, { size: 128, snapshotDt: 0.15, filter: 'bilinear' as const }] : undefined;
-  const ocean = createOcean({ shape, preset, seed: 1, query });
+test('capillary band: gravity-capillary dispersion, finite spectrum', () => {
+  const ocean = createOcean({ shape, preset: 'windy', seed: 1 });
+  const st = ocean.getState();
+  const cap = generateCapillary(st.slots[st.toSlot].params, 1, st.gravity, 64);
+  assert.ok(cap.h0.every(Number.isFinite));
+  // corner cell k = 32 sqrt(2) dk: w^2 = g k + S k^3
+  const dk = (2 * Math.PI) / CAPILLARY_CASCADE.domain, k = Math.hypot(Math.fround(-32 * dk), Math.fround(-32 * dk));
+  const w = cap.omega[0] * (2 * Math.PI / 8192);
+  assert.ok(Math.abs(w - Math.sqrt(st.gravity * (k + 1e-4) + 7.4e-5 * k ** 3)) < 1e-3);
+});
+
+const CUBIC_QUERY = [
+  { size: 256, snapshotDt: 0.6, filter: 'cubic' as const }, { size: 256, snapshotDt: 0.25, filter: 'cubic' as const },
+  { size: 128, snapshotDt: 0.15, filter: 'bilinear' as const },
+];
+
+/** Drawn surface of tier t (master subsets, Catmull-Rom c0 / c1 like the GPU near the camera) vs the core query. */
+export function tierParity(tier: keyof typeof FFT_TIERS, preset: string, count = 1500, sizes?: readonly number[]) {
+  const ocean = createOcean({ shape, preset: preset as any, seed: 1, query: CUBIC_QUERY });
   const st = ocean.getState();
   const T = 12, chop = ocean.choppinessAt(T), hs = ocean.expectedHs();
-  const spec = FFT_TIERS[tier], cs = tierCascades(tier), n = spec.size;
-  const h0 = spec.reference
-    ? [0, 1, 2].map((c) => stripMasterH0(st.slots[st.toSlot].h0[c], new Float32Array(2 * n * n)))
-    : generateTierSpectrum(spec, cs, st.slots[st.toSlot].params, 1, st.gravity).h0;
-  const om = tierOmega(spec, cs, st.gravity);
-  const fields = [0, 1, 2].map((c) => evaluateFields(h0[c], h0[c], 1, om.subarray(c * n * n, (c + 1) * n * n), n, cs[c].domain, T, chop));
+  const sz = sizes ?? FFT_TIERS[tier].sizes;
+  const fields = [0, 1, 2].map((c) => {
+    const n = sz[c], h0 = masterH0Subset(st.slots[st.toSlot].h0[c], n);
+    return evaluateFields(h0, h0, 1, masterOmegaSubset(st.omegaIndex[c], n), n, CASCADES[c].domain, T, chop);
+  });
   let s = 99;
   const rnd = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
   const out = new Float64Array(3), tmp = new Float64Array(3), errs: number[] = [];
@@ -100,26 +97,24 @@ function parity(tier: keyof typeof FFT_TIERS, preset: 'breeze' | 'storm', cubic:
   let other = 0;
   for (let i = 0; i < count; i++) {
     const e = rnd() * 2000 - 1000, nn = rnd() * 2000 - 1000;
-    sampleChained(fields, n, cs, e, nn, cubic, out, tmp);
+    sampleChained(fields, sz, CASCADES, e, nn, [true, true, false], out, tmp);
     ocean.invertLocal(e + out[1], nn + out[2], T, rs);
-    // folded crests: several rest points land on p (any is on the surface); compare only the same sheet
-    if (Math.hypot(rs.east - e, rs.north - nn) > 0.3) { other++; continue; }
+    if (Math.hypot(rs.east - e, rs.north - nn) > 0.3) { other++; continue; } // folded crest: another sheet
     errs.push((Math.abs(rs.up - out[0]) / hs) * 100);
   }
   errs.sort((a, b) => a - b);
   const rms = Math.sqrt(errs.reduce((a, b) => a + b * b, 0) / errs.length);
-  return { rms, p99: errs[Math.floor(errs.length * 0.99)], p999: errs[Math.floor(errs.length * 0.999)], max: errs[errs.length - 1], hs, other: other / count };
+  let lost = 0;
+  for (let c = 1; c < 3; c++) lost += droppedSlopeVariance(st.slots[st.toSlot].h0[c], sz[c], CASCADES[c].domain);
+  return { rms, p99: errs[Math.floor(errs.length * 0.99)], p999: errs[Math.floor(errs.length * 0.999)], max: errs[errs.length - 1], hs, other: other / count, lostSlope: lost };
 }
 
-test('CPU query (core default) vs drawn surface per tier (report)', () => {
-  for (const preset of ['breeze', 'storm'] as const) {
-    for (const tier of TIER_NAMES) {
-      const cases: [boolean, boolean][] = tier === 'medium' ? [[false, false], [true, false], [true, true]] : [[true, false]];
-      for (const [cubic, cpuCubic] of cases) {
-        const r = parity(tier, preset, cubic, tier === 'medium' ? 1500 : 600, cpuCubic);
-        console.log(`  parity ${preset} drawn ${tier} ${cubic ? 'catmull-rom' : 'bilinear'} vs CPU query ${cpuCubic ? 'cubic c0/c1' : 'default (bilinear)'}: rms ${r.rms.toFixed(3)} %Hs, p99 ${r.p99.toFixed(3)}, p99.9 ${r.p999.toFixed(3)}, max ${r.max.toFixed(3)}, other sheet ${(r.other * 100).toFixed(1)} % (Hs ${r.hs.toFixed(2)} m)`);
-        if (tier === 'medium' && cubic === cpuCubic) assert.ok(r.p999 < 2, `medium p99.9 ${r.p999}`);
-      }
+test('drawn surface vs the tier-independent CPU query (cubic c0/c1): p99.9 < 2 % Hs on every tier', () => {
+  for (const preset of ['breeze', 'windy', 'storm']) {
+    for (const tier of ['low', 'medium'] as const) { // high / ultra draw the medium master content
+      const r = tierParity(tier, preset);
+      console.log(`  parity ${preset} ${tier} ${FFT_TIERS[tier].sizes.join('/')}: rms ${r.rms.toFixed(3)} %Hs, p99 ${r.p99.toFixed(3)}, p99.9 ${r.p999.toFixed(3)}, max ${r.max.toFixed(3)}, other sheet ${(r.other * 100).toFixed(1)} %, unresolved slope var ${r.lostSlope.toExponential(2)} (Hs ${r.hs.toFixed(2)} m)`);
+      assert.ok(r.p999 < 2, `${preset} ${tier} p99.9 ${r.p999}`);
     }
   }
 });

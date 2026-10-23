@@ -8,7 +8,8 @@ import { ADAPTER_PROBE, isSoftwareAdapter, launch, parseArgs, watchPage } from '
 
 const opts = parseArgs(process.argv.slice(2));
 const base = opts.base ?? 'http://127.0.0.1:5182';
-const tiers = String(opts.tiers ?? 'low,medium,high,ultra').split(',');
+const tiers = String(opts.tiers ?? 'low,medium,high,ultra,ultra+cap').split(','); // 'ultra+cap' = ultra with the capillary band
+const q = (tier) => { const [t, cap] = tier.split('+'); return `tier=${t}${cap ? '&capillary' : ''}`; };
 const preset = opts.preset ?? 'windy';
 const benchFrames = Number(opts['bench-frames'] ?? 600);
 
@@ -22,7 +23,7 @@ try {
     if (!opts['no-check']) {
       const page = await context.newPage();
       const w = watchPage(page, { label: `fft-${tier}` });
-      await page.goto(`${base}/demo/fft-debug.html?tier=${tier}&preset=${preset}&check`, { waitUntil: 'load', timeout: 120000 });
+      await page.goto(`${base}/demo/fft-debug.html?${q(tier)}&preset=${preset}&check`, { waitUntil: 'load', timeout: 120000 });
       if (!out.adapter) {
         const a = await page.evaluate(ADAPTER_PROBE);
         if (!a.ok || isSoftwareAdapter(a)) throw new Error(`no hardware WebGPU adapter: ${JSON.stringify(a)}`);
@@ -37,7 +38,7 @@ try {
     // bench: FFT pass only
     const bp = await context.newPage();
     const bw = watchPage(bp, { label: `bench-${tier}` });
-    await bp.goto(`${base}/demo/fft-debug.html?tier=${tier}&preset=${preset}&bench`, { waitUntil: 'load', timeout: 120000 });
+    await bp.goto(`${base}/demo/fft-debug.html?${q(tier)}&preset=${preset}&bench`, { waitUntil: 'load', timeout: 120000 });
     // (optional chaining everywhere: the dev server may full-reload the page when other files change)
     await bp.waitForFunction(() => window.__perf?.snapshot?.().tier && window.__perf.count > 60, null, { timeout: 120000 });
     await bp.waitForTimeout(1500);

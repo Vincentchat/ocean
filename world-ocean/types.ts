@@ -129,7 +129,7 @@ export const DEFAULT_SIM_PARAMS: Readonly<SimParams> = Object.freeze({
 
 /**
  * CPU query cascades. Cascades 0 (1024 m, ~96 % of the height variance at 'windy') and 1 (96 m,
- * ~4 %) run at 256, i.e. the same grid + bilinear filter the GPU draws at 256 (identical numbers
+ * ~4 %) run at 256 with Catmull-Rom, i.e. the same grid + filter the GPU draws near the camera (identical numbers
  * up to float32 / Hermite-in-time rounding). Cascade 2 (9 m, ~0.03 %) runs at 128, an exact
  * spectral subset of the 256 grid (modes |k| < 64 dk). Snapshot spacing in time: 0.5 / 0.25 / 0.125 s
  * (binary fractions that divide the 8192 s loop: the snapshot grid repeats with the waves)
@@ -139,9 +139,9 @@ export const DEFAULT_SIM_PARAMS: Readonly<SimParams> = Object.freeze({
  * LITE alternative (half the CPU): [{256, .4}, {128, .25, 'cubic'}, {64, .1}] (p99 error ~1.2 % of Hs).
  */
 export const DEFAULT_QUERY_CASCADES: readonly QueryCascadeConfig[] = Object.freeze([
-  Object.freeze({ size: 256, snapshotDt: 0.5, filter: 'bilinear' as const }),
-  Object.freeze({ size: 256, snapshotDt: 0.25, filter: 'bilinear' as const }),
-  Object.freeze({ size: 128, snapshotDt: 0.125, filter: 'bilinear' as const }),
+  Object.freeze({ size: 256, snapshotDt: 0.5, filter: 'cubic' as const }),
+  Object.freeze({ size: 256, snapshotDt: 0.25, filter: 'cubic' as const }),
+  Object.freeze({ size: 128, snapshotDt: 0.125, filter: 'cubic' as const }),
 ]);
 
 /** Every tunable with min / max / unit / label / default (default = the 'windy' preset = the reference). */

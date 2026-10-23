@@ -150,7 +150,8 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
   lod.debug.footOffsetV = lodOffV;
   const n = lod.nodes;
 
-  const fft = createOceanFft({ renderer, ocean: opts.ocean as FftOceanSource, tier, perf: opts.perf });
+  // ?debug=fftcapillary: opt into ultra's capillary band (fft r3)
+  const fft = createOceanFft({ renderer, ocean: opts.ocean as FftOceanSource, tier, perf: opts.perf, capillary: dbg.has('fftcapillary') });
   const sampling = createFftSampling(fft);
 
   // ------------------------------------------------------------------ displacement (vertex)

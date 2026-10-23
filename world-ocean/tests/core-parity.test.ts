@@ -1,7 +1,7 @@
 ﻿// heightAt inversion correctness and CPU-query parity with the drawn (GPU) surface.
 //
 // "Drawn surface" model: the GPU at its 256 tier evaluates all three cascades at 256^2 and samples
-// them bilinearly with the chained lookup (spectrum.ts conventions). Here that is emulated on the
+// them with Catmull-Rom (as three/ does near the camera) with the chained lookup (spectrum.ts conventions). Here that is emulated on the
 // CPU with query sizes 256/256/256 and t exactly on a snapshot (exact spectral evaluation), and
 // compared with the DEFAULT query configuration at the same displaced points.
 import test from 'node:test';
@@ -14,9 +14,9 @@ const shape = createFlatShape();
 const T = 12;
 const rest = (): RestSample => ({ east: 0, north: 0, up: 0, vEast: 0, vNorth: 0, vUp: 0 });
 const GPU_EMULATION = [
-  { size: 256, snapshotDt: T, filter: 'bilinear' as const },
-  { size: 256, snapshotDt: T, filter: 'bilinear' as const },
-  { size: 256, snapshotDt: T, filter: 'bilinear' as const },
+  { size: 256, snapshotDt: T, filter: 'cubic' as const },
+  { size: 256, snapshotDt: T, filter: 'cubic' as const },
+  { size: 256, snapshotDt: T, filter: 'cubic' as const },
 ];
 
 function lcg(seed: number) {

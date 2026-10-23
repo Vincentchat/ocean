@@ -40,13 +40,13 @@
 // (center - origin, float64 on the CPU), the contact pattern uses the LOD's periodic tile coordinate (period 18 m).
 // No per-frame allocation (update() and the pass only copy numbers / swap texture references).
 import {
-  ClampToEdgeWrapping, DataTexture, DataUtils, DepthTexture, FloatType, HalfFloatType, LinearFilter,
-  LinearMipmapLinearFilter, NoColorSpace, NodeMaterial, QuadMesh, RedFormat, RenderTarget, RepeatWrapping, Scene,
+  ClampToEdgeWrapping, DataTexture, DoubleSide, DataUtils, DepthTexture, FloatType, HalfFloatType, LinearFilter,
+  LinearMipmapLinearFilter, Mesh, BufferAttribute, BufferGeometry, NoColorSpace, NodeMaterial, RedFormat, RenderTarget, RepeatWrapping, Scene,
   TextureLoader, Vector3,
 } from 'three/webgpu';
 import {
   abs, cameraFar, cameraNear, cameraViewMatrix, clamp, dot, float, length, max, min, mix, perspectiveDepthToViewZ,
-  positionView, positionWorld, refract, screenUV, smoothstep, texture, uniform, uv, vec2, vec3, vec4,
+  positionGeometry, positionView, positionWorld, refract, screenUV, smoothstep, texture, uniform, vec2, vec3, vec4,
 } from 'three/tsl';
 import type { FloatingOrigin, TerrainGpuHeight, Vec3, WorldShape } from '../stubs/world-core.ts';
 import { OCEAN_ASSETS, resolveAsset } from '../assets.ts';
@@ -97,6 +97,8 @@ export function createOceanRefraction(o: OceanRefractionOptions): OceanRefractio
   const disposers: (() => void)[] = [];
   /** 1 = refraction + contact on, 0 = the open-water path everywhere (runtime switch / A-B). */
   const enabled = uniform(1);
+  /** 1 while the water draws into a target without scene.depth (resolve path): shader-side occlusion test. */
+  const manualOcclusion = uniform(0);
 
   // ------------------------------------------------------------------ scene.color / scene.depth bindings
   const colorPlaceholder = new DataTexture(new Uint16Array(4), 1, 1);
@@ -245,20 +247,34 @@ export function createOceanRefraction(o: OceanRefractionOptions): OceanRefractio
       return mix(c, mixed, float(active));
     };
 
-    return { color, path, valid: bg, contact };
+    // Opaque geometry in front of the water (rocks above the surface): when the transparent target has no copy of
+    // scene.depth (the demo's MSAA target, see createPass), the water shows scene.color there instead (no frag-depth
+    // write, so early-Z / HiZ stay on for the water). 0 in the single-target path (the hardware depth test does it).
+    const occlusion = float(baseZ.lessThan(waterZ)).mul(manualOcclusion);
+    return { color, path, valid: bg, contact, occlusion, background: colorNode.sample(suv).rgb };
   }
 
   // ------------------------------------------------------------------ the transparent-stage pass
   function createPass(po: { waterScene: any; camera: any; perf?: { begin(m: string, p: string): void; end(): void } }): Pass {
     // Resolve quad: scene.color + scene.depth -> the transparent target (colour + depth), used when the host gives
     // the transparent stage its own (e.g. MSAA) target.
+    // Drawn in the SAME render pass as the water (first in the draw list, renderOrder -1e9): one MSAA pass, no
+    // multisampled load / store between a separate resolve pass and the water pass.
     const resolveMat = new NodeMaterial();
     resolveMat.name = 'ocean.water.resolve';
-    resolveMat.colorNode = colorNode.sample(uv());
-    resolveMat.depthNode = depthNode.sample(uv()).x;
-    resolveMat.depthTest = true;
-    resolveMat.depthWrite = true;
-    const resolveQuad = new QuadMesh(resolveMat);
+    resolveMat.vertexNode = vec4(positionGeometry.xy, 0.5, 1);   // full-screen triangle, clip space
+    resolveMat.colorNode = colorNode.sample(screenUV);
+    resolveMat.depthTest = false;                                // colour only: the water tests scene.depth itself
+    resolveMat.depthWrite = false;                               // (a frag-depth write would disable HiZ for the water)
+    resolveMat.side = DoubleSide;
+    const triGeo = new BufferGeometry();
+    triGeo.setAttribute('position', new BufferAttribute(new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]), 3));
+    const resolveMesh = new Mesh(triGeo, resolveMat);
+    resolveMesh.name = 'ocean.water.resolve';
+    resolveMesh.frustumCulled = false;
+    resolveMesh.renderOrder = -1e9;
+    resolveMesh.visible = false;
+    po.waterScene.add(resolveMesh);
     // Copies for the single-target path.
     let copyRT: any = null;
     let copyInit = false;
@@ -274,7 +290,7 @@ export function createOceanRefraction(o: OceanRefractionOptions): OceanRefractio
       copyRT.texture.minFilter = LinearFilter; copyRT.texture.magFilter = LinearFilter;
       copyRT.texture.wrapS = ClampToEdgeWrapping; copyRT.texture.wrapT = ClampToEdgeWrapping;
     };
-    disposers.push(() => { resolveMat.dispose(); copyRT?.dispose(); });
+    disposers.push(() => { resolveMesh.removeFromParent(); resolveMat.dispose(); triGeo.dispose(); copyRT?.dispose(); });
     return {
       desc: {
         id: 'ocean.water', module: 'world/ocean', stage: 'transparent',
@@ -290,9 +306,15 @@ export function createOceanRefraction(o: OceanRefractionOptions): OceanRefractio
         if (dst !== src) {
           bind(src.texture, depth);
           r.setRenderTarget(dst);
+          resolveMesh.visible = true;         // scene.color into dst, then the water, one pass
+          manualOcclusion.value = 1;
           r.autoClear = true;
-          resolveQuad.render(r);              // clear + scene.color / scene.depth into dst
+          r.render(po.waterScene, po.camera);
+          r.autoClear = autoClear;
+          return;
         } else {
+          resolveMesh.visible = false;
+          manualOcclusion.value = 0;
           // Same target: never sample what we render to. Copy colour + depth into ocean-owned textures first.
           ensureCopy(src.width, src.height);
           if (!copyInit) { r.initRenderTarget(copyRT); copyInit = true; }

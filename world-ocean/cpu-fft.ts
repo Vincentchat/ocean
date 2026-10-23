@@ -565,7 +565,7 @@ export class CascadeSim {
    */
   requestPrefill(src: number): void {
     const ctrl = this.ctrl;
-    if (ctrl === null || this.cubic || !this.remoteReady()) return;
+    if (ctrl === null || !this.remoteReady()) return;
     if (this.preBusy) {
       if (Atomics.load(ctrl, C_PSTATE) === S_REQUESTED) return; // still working on an older one
       this.preBusy = false; // done but not adopted (stale): drop it
@@ -1051,6 +1051,8 @@ export class CascadeSim {
 // Field sampling (allocation-free) of a materialised frame (stride 3). Results go to SAMPLE[0..2].
 // ---------------------------------------------------------------------------------------------
 export const SAMPLE = new Float64Array(3);
+/** Tile position (a, b) metres of the next sampleCubic / sampleCubicGrad call (typed-array argument: no boxed doubles). */
+export const SAMPLE_IN = new Float64Array(2);
 /** Floats per texel of a materialised frame / velocity frame. */
 export const FRAME_STRIDE = 3;
 
@@ -1060,7 +1062,8 @@ export const GRAD = new Float64Array(6);
 
 
 /** sampleCubic(ch = 0) plus the exact gradient of the Catmull-Rom E / N channels (into GRAD). */
-export function sampleCubicGrad(data: Float32Array, n: number, L: number, a: number, b: number): void {
+export function sampleCubicGrad(data: Float32Array, n: number, L: number): void {
+  const a = SAMPLE_IN[0], b = SAMPLE_IN[1];
   const inv = n / L, mask = n - 1;
   const sa = (a - L * Math.floor(a / L)) * inv;
   const sb = (b - L * Math.floor(b / L)) * inv;
@@ -1095,7 +1098,8 @@ export function sampleCubicGrad(data: Float32Array, n: number, L: number, a: num
 }
 
 /** Catmull-Rom (interpolating bicubic) sample; same contract as sampleBilinear. */
-export function sampleCubic(data: Float32Array, n: number, L: number, a: number, b: number): void {
+export function sampleCubic(data: Float32Array, n: number, L: number): void {
+  const a = SAMPLE_IN[0], b = SAMPLE_IN[1];
   const inv = n / L, mask = n - 1;
   const sa = (a - L * Math.floor(a / L)) * inv;
   const sb = (b - L * Math.floor(b / L)) * inv;
@@ -1120,3 +1124,37 @@ export function sampleCubic(data: Float32Array, n: number, L: number, a: number,
   SAMPLE[0] = s0; SAMPLE[1] = s1; SAMPLE[2] = s2;
 }
 
+
+/** Inputs of cubicTaps / cubicTapsGrad: [x0, y0, fx, fy] (integer texel of the sample, fractions). */
+export const CUBIC_IN = new Float64Array(4);
+
+/**
+ * Catmull-Rom (a = -0.5) sample of the 3 channels of a stride-3 frame at texel coordinate
+ * (x0 + fx, y0 + fy), taps x0-1 .. x0+2 (wrapped). Same weights and mapping as sampleCubic (the
+ * GPU's near-camera filter). Unrolled; result in SAMPLE[0..2]. Allocation-free.
+ */
+export function cubicTaps(data: Float32Array, n: number): void {
+  const mask = n - 1, x0 = CUBIC_IN[0], y0 = CUBIC_IN[1], fx = CUBIC_IN[2], fy = CUBIC_IN[3];
+  const fx2 = fx * fx, fx3 = fx2 * fx, fy2 = fy * fy, fy3 = fy2 * fy;
+  const wx0 = -0.5 * fx3 + fx2 - 0.5 * fx, wx1 = 1.5 * fx3 - 2.5 * fx2 + 1, wx2 = -1.5 * fx3 + 2 * fx2 + 0.5 * fx, wx3 = 0.5 * fx3 - 0.5 * fx2;
+  const wy0 = -0.5 * fy3 + fy2 - 0.5 * fy, wy1 = 1.5 * fy3 - 2.5 * fy2 + 1, wy2 = -1.5 * fy3 + 2 * fy2 + 0.5 * fy, wy3 = 0.5 * fy3 - 0.5 * fy2;
+  const c0 = ((x0 - 1) & mask) * 3, c1 = (x0 & mask) * 3, c2 = ((x0 + 1) & mask) * 3, c3 = ((x0 + 2) & mask) * 3;
+  let s0 = 0, s1 = 0, s2 = 0;
+  let r = ((y0 - 1) & mask) * n * 3;
+  s0 += wy0 * (wx0 * data[r + c0] + wx1 * data[r + c1] + wx2 * data[r + c2] + wx3 * data[r + c3]);
+  s1 += wy0 * (wx0 * data[r + c0 + 1] + wx1 * data[r + c1 + 1] + wx2 * data[r + c2 + 1] + wx3 * data[r + c3 + 1]);
+  s2 += wy0 * (wx0 * data[r + c0 + 2] + wx1 * data[r + c1 + 2] + wx2 * data[r + c2 + 2] + wx3 * data[r + c3 + 2]);
+  r = (y0 & mask) * n * 3;
+  s0 += wy1 * (wx0 * data[r + c0] + wx1 * data[r + c1] + wx2 * data[r + c2] + wx3 * data[r + c3]);
+  s1 += wy1 * (wx0 * data[r + c0 + 1] + wx1 * data[r + c1 + 1] + wx2 * data[r + c2 + 1] + wx3 * data[r + c3 + 1]);
+  s2 += wy1 * (wx0 * data[r + c0 + 2] + wx1 * data[r + c1 + 2] + wx2 * data[r + c2 + 2] + wx3 * data[r + c3 + 2]);
+  r = ((y0 + 1) & mask) * n * 3;
+  s0 += wy2 * (wx0 * data[r + c0] + wx1 * data[r + c1] + wx2 * data[r + c2] + wx3 * data[r + c3]);
+  s1 += wy2 * (wx0 * data[r + c0 + 1] + wx1 * data[r + c1 + 1] + wx2 * data[r + c2 + 1] + wx3 * data[r + c3 + 1]);
+  s2 += wy2 * (wx0 * data[r + c0 + 2] + wx1 * data[r + c1 + 2] + wx2 * data[r + c2 + 2] + wx3 * data[r + c3 + 2]);
+  r = ((y0 + 2) & mask) * n * 3;
+  s0 += wy3 * (wx0 * data[r + c0] + wx1 * data[r + c1] + wx2 * data[r + c2] + wx3 * data[r + c3]);
+  s1 += wy3 * (wx0 * data[r + c0 + 1] + wx1 * data[r + c1 + 1] + wx2 * data[r + c2 + 1] + wx3 * data[r + c3 + 1]);
+  s2 += wy3 * (wx0 * data[r + c0 + 2] + wx1 * data[r + c1 + 2] + wx2 * data[r + c2 + 2] + wx3 * data[r + c3 + 2]);
+  SAMPLE[0] = s0; SAMPLE[1] = s1; SAMPLE[2] = s2;
+}

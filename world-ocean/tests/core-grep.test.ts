@@ -1,4 +1,4 @@
-// Static checks on the render-agnostic core (spec §1 rules 3, 4; §7 checks 2, 8).
+﻿// Static checks on the render-agnostic core (spec Â§1 rules 3, 4; Â§7 checks 2, 8).
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -10,7 +10,7 @@ const CORE = ['index.ts', 'types.ts', 'spectrum.ts', 'cpu-fft.ts', ...readdirSyn
 function code(file: string): string[] {
   // strip // comments and /* */ comments (good enough for these files)
   const src = readFileSync(root + file, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
-  return src.split('\n').map((l) => l.replace(/\/\/.*$/, ''));
+  return src.split(/\r?\n/).map((l) => l.replace(/\/\/.*$/, ''));
 }
 
 test('core never imports three (or anything outside the core + stubs)', () => {

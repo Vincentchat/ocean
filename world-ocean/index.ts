@@ -53,7 +53,7 @@ import {
   packInitialSpectrum, omegaIndices, expectedHs,
 } from './spectrum.ts';
 import type { SpectrumScalars } from './spectrum.ts';
-import { CascadeSim, SAMPLE, GRAD, sampleCubic, sampleCubicGrad } from './cpu-fft.ts';
+import { CascadeSim, SAMPLE, SAMPLE_IN, CUBIC_IN, GRAD, cubicTaps, sampleCubic, sampleCubicGrad } from './cpu-fft.ts';
 import { PRESETS } from './presets/index.ts';
 
 export * from './types.ts';
@@ -79,6 +79,8 @@ const JACOBIAN_CASCADES = 2;
 const GUESS_STEPS = 2;
 /** Extra damped fixed-point steps when Newton did not converge (rare). */
 const RESCUE_ITERATIONS = 12;
+/** Newton steps on the exact Catmull-Rom surface after the bilinear solve (each ~cm -> sub-mm). */
+const CUBIC_REFINE_ITERATIONS = 3;
 /** Cost of packing one cascade's h0 in units of generated master rows (amortised regeneration budget). */
 const PACK_ROWS_EQUIVALENT = 8;
 
@@ -235,6 +237,8 @@ function emptyParams(): SpectrumParams {
 const SPECTRUM_KEYS: readonly (keyof SpectrumParams)[] = ['windSpeed', 'windDirection', 'fetch', 'gamma', 'spread', 'standing', 'choppiness', 'amplitude'];
 const SIM_KEYS: readonly (keyof SimParams)[] = ['blendTime', 'windTimeConstant', 'windSpeedTolerance', 'windDirectionToleranceDeg', 'regenRowsPerTick', 'inversionIterations', 'inversionTolerance', 'windSampleHeight', 'timeWindow', 'maxTurnPerBlendDeg'];
 
+function failTickTime(): never { throw new RangeError('world/ocean: tick time must be finite'); }
+
 function wrapAngle(a: number): number {
   a = (a + Math.PI) % (2 * Math.PI);
   if (a < 0) a += 2 * Math.PI;
@@ -320,13 +324,14 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
   // Regeneration job
   const regenRaw = new Float64Array(2 * nm * nm);
   const regenScalars: SpectrumScalars = { g: 0, U: 0, dirGrid: 0, wp: 0 };
-  let regenSlot = -1, regenCascade = 0, regenRow = 0, regenRemote = false;
+  let regenSlot = -1, regenCascade = 0, regenRow = 0, regenRemote = false, regenTicks = 0, regenDue = 1;
   /** Regeneration params handed to the workers (wind, dir, fetch, gamma, spread, standing, chop, amp). */
   const RP = new Float64Array(8);
 
   // ---- CPU query ---------------------------------------------------------------------------
   const sims: (CascadeSim | null)[] = [];
   let curFrame = 0;
+  let anyCubic = false;
   /** Lead time between the end of a regeneration and the start of its crossfade, s (CPU warm-up). */
   let pendingLead = 1.6;
   /** The CPU switches to the pending source this long before its crossfade starts, s. */
@@ -369,6 +374,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
       kCubic.push(sm.cubic ? 1 : 0);
     }
     K = kSim.length;
+    for (let k = 0; k < K; k++) if (kCubic[k] === 1) anyCubic = true;
     for (let k = 0; k < K; k++) {
       pendingLead = Math.max(pendingLead, 4 * kSim[k].snapshotDt);
       switchMargin = Math.max(switchMargin, kSim[k].snapshotDt);
@@ -427,6 +433,9 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
     spectrumScalars(slots[regenSlot].params, g, regenScalars);
     regenCascade = 0;
     regenRow = 0;
+    regenTicks = 0;
+    const rpt = sim.regenRowsPerTick >= 1 ? sim.regenRowsPerTick : 1;
+    regenDue = Math.ceil((CASCADES.length * (nm + PACK_ROWS_EQUIVALENT)) / rpt) + 1;
     // Offload to the cascade workers when every cascade has a ready one (each regenerates its own
     // cascade: master h0 for the GPU + its slot grid); the main thread then only polls.
     regenRemote = false;
@@ -462,16 +471,22 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
   }
 
   /** Advance the amortised regeneration by `rows` master rows. */
+  // The new spectrum is published on a DETERMINISTIC tick, regenDue ticks after the start, whether
+  // the main thread or the workers did the work: the crossfade schedule must not depend on thread
+  // timing (same inputs, same waves).
   function stepRegen(rows: number): void {
     if (regenSlot < 0) return;
+    regenTicks++;
     if (regenRemote) {
-      for (let k = 0; k < K; k++) if (!kSim[k].regenDone()) return;
+      if (regenTicks < regenDue) return;
+      // Due: wait for the workers if they are late (they have ~3 s for ~0.1 s of work).
+      for (let k = 0; k < K; k++) { while (!kSim[k].regenDone()) { /* spin */ } }
       for (let k = 0; k < K; k++) { kSim[k].ackRegen(); kSim[k].slotChanged(regenSlot); }
       finishRegen();
       return;
     }
     const sd = slots[regenSlot];
-    while (rows > 0 && regenSlot >= 0) {
+    while (rows > 0 && regenCascade < CASCADES.length) {
       if (regenRow < nm) {
         const r1 = Math.min(nm, regenRow + rows);
         generateRawRows(sd.params, regenScalars, CASCADES[regenCascade], xi[regenCascade], regenRaw, regenRow, r1);
@@ -484,10 +499,10 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
         regenRow = 0;
         if (regenCascade >= CASCADES.length) {
           for (let c = 0; c < sims.length; c++) sims[c]?.setSlot(regenSlot, sd.h0[c]);
-          finishRegen();
         }
       }
     }
+    if (regenCascade >= CASCADES.length && regenTicks >= regenDue) finishRegen();
   }
 
   /** Does the target differ enough from slot params b to regenerate? (no Math.* calls returning boxed doubles) */
@@ -600,7 +615,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
    * Chained forward evaluation at rest point (re, rn) (reference spectralField), fast path:
    * bilinear cascades are inlined. Uses the frames selected by the last prepare().
    */
-  function forward(f: number, wantVel: boolean, wantGrad: boolean): void {
+  function forward(f: number, wantVel: boolean, wantGrad: boolean, fast: boolean): void {
     const re = ST[S_FE], rn = ST[S_FN];
     let H = 0, E = 0, N = 0, VH = 0, VE = 0, VN = 0;
     let J00 = 1, J01 = 0, J10 = 0, J11 = 1;
@@ -611,7 +626,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
       const c = kCascade[k];
       const data = kData[k];
       const off = kOff[k];
-      if (kCubic[k] === 0) {
+      if (kCubic[k] === 0 || fast) {
         const n = kN[k], inv = kInv[k], mask = n - 1;
         // texel coords of a = e + OFF, b = -n + OFF, shifted by a whole number of tiles (kShift) so they
         // are positive (inputs are wrapped to [0, SURFACE_PERIOD) and displacements are far below 4 tiles):
@@ -664,32 +679,42 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
         }
         continue;
       }
-      const n = kN[k], L = kL[k];
+      const n = kN[k], L = kL[k], inv = kInv[k], mask = n - 1, sh = kShift[k];
       const a = re + E + off, b = -(rn + N) + off; // tile coords: a = east + OFF, b = -north + OFF
-      { // Catmull-Rom taps span texels xf-1 .. xf+2: materialise their blocks
-        const xf = Math.floor((a - L * Math.floor(a / L)) * kInv[k]), yf = Math.floor((b - L * Math.floor(b / L)) * kInv[k]);
-        kSim[k].ensurePos(f, xf - 1, yf - 1, xf + 2, yf + 2);
-        if (wantVel) kSim[k].ensureVel(f, xf - 1, yf - 1, xf + 2, yf + 2);
+      // Catmull-Rom taps span texels xi-1 .. xi+2: materialise their (at most 2 x 2) blocks.
+      const sa = a * inv + sh, sb = b * inv + sh;
+      const xi = sa | 0, yi = sb | 0;
+      {
+        const bs = kBSh[k], bn = kNb[k], bv = kBlock[k];
+        const xa = ((xi - 1) & mask) >> bs, xb = ((xi + 2) & mask) >> bs, ya = ((yi - 1) & mask) >> bs, yb = ((yi + 2) & mask) >> bs;
+        if (bv[ya * bn + xa] === 0 || bv[ya * bn + xb] === 0 || bv[yb * bn + xa] === 0 || bv[yb * bn + xb] === 0) kSim[k].ensurePos(f, xi - 1, yi - 1, xi + 2, yi + 2);
       }
+      if (!wantVel && !(wantGrad && c < JACOBIAN_CASCADES)) {
+        CUBIC_IN[0] = xi; CUBIC_IN[1] = yi; CUBIC_IN[2] = sa - xi; CUBIC_IN[3] = sb - yi;
+        cubicTaps(data, n);
+        H += SAMPLE[0]; E += SAMPLE[1]; N += SAMPLE[2];
+        continue;
+      }
+      SAMPLE_IN[0] = a; SAMPLE_IN[1] = b;
       if (wantVel) {
-        sampleCubic(kVel[k], n, L, a, b);
+        kSim[k].ensureVel(f, xi - 1, yi - 1, xi + 2, yi + 2);
+        sampleCubic(kVel[k], n, L);
         const v0 = SAMPLE[0], v1 = SAMPLE[1], v2 = SAMPLE[2];
-        sampleCubicGrad(data, n, L, a, b); // local: d/de = d/da, d/dn = -d/db
+        sampleCubicGrad(data, n, L); // local: d/de = d/da, d/dn = -d/db
         const vh = v0 + GRAD[4] * VE - GRAD[5] * VN;
         const ve = v1 + GRAD[0] * VE - GRAD[1] * VN;
         const vn = v2 + GRAD[2] * VE - GRAD[3] * VN;
         VH += vh; VE += ve; VN += vn;
       }
       if (wantGrad && c < JACOBIAN_CASCADES) {
-        sampleCubicGrad(data, n, L, a, b);
+        sampleCubicGrad(data, n, L);
         // local gradient: d/de = d/da, d/dn = -d/db
         const g00 = 1 + GRAD[0], g01 = -GRAD[1], g10 = GRAD[2], g11 = 1 - GRAD[3];
         const t00 = g00 * J00 + g01 * J10, t01 = g00 * J01 + g01 * J11;
         const t10 = g10 * J00 + g11 * J10, t11 = g10 * J01 + g11 * J11;
         J00 = t00; J01 = t01; J10 = t10; J11 = t11;
-      } else sampleCubic(data, n, L, a, b);
-      H += SAMPLE[0]; E += SAMPLE[1]; N += SAMPLE[2];
-    }
+      } else sampleCubic(data, n, L);
+      H += SAMPLE[0]; E += SAMPLE[1]; N += SAMPLE[2];    }
     ST[S_H] = H; ST[S_E] = re + E; ST[S_N] = rn + N;
     ST[S_VH] = VH; ST[S_VE] = VE; ST[S_VN] = VN;
     if (wantGrad) { ST[S_J00] = J00; ST[S_J01] = J01; ST[S_J10] = J10; ST[S_J11] = J11; }
@@ -710,9 +735,10 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
     const se = pe - wrapPeriod(pe), sn = pn - wrapPeriod(pn);
     pe -= se; pn -= sn;
     let re = pe, rn = pn;
-    if (K > 0 && kCubic[0] === 0) {
+    if (K > 0) {
       // Initial guess: GUESS_STEPS cheap fixed-point steps on the largest cascade alone
-      // (r = p - D0(r)); it carries most of the displacement.
+      // (r = p - D0(r)); it carries most of the displacement. Bilinear on the frame texels even when the
+      // cascade is sampled with Catmull-Rom: it is only a starting point.
       const data = kData[0], n = kN[0], inv = kInv[0], off = kOff[0], mask = n - 1;
       for (let step = 0; step < GUESS_STEPS; step++) {
         const sa = (re + off) * inv, sb = (off - rn) * inv;
@@ -729,21 +755,19 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
         rn = pn - (gx * gy * data[i00 + 2] + fx * gy * data[i10 + 2] + gx * fy * data[i01 + 2] + fx * fy * data[i11 + 2]);
       }
     }
+    // Phase A: Newton on the BILINEAR reading of the same frame texels (cheap; gradients exact for it).
     let pre = re, prn = rn, prevRes = Infinity; // last accepted iterate (backtracking safeguard)
     let bestE = re, bestN = rn, bestRes = Infinity;
     const iters = sim.inversionIterations;
     const tol2 = sim.inversionTolerance * sim.inversionTolerance;
+    let converged = false;
     for (let it = 0; it < iters; it++) {
       ST[S_FE] = re; ST[S_FN] = rn;
-      forward(f, false, true);
+      forward(f, false, true, true);
       const ee = ST[S_E] - pe, en = ST[S_N] - pn;
       const res = ee * ee + en * en;
-      if (res < tol2) { // converged
-        if (wantVel) forward(f, true, false);
-        ST[S_RE] = re + se; ST[S_RN] = rn + sn;
-        return;
-      }
       if (res < bestRes) { bestRes = res; bestE = re; bestN = rn; }
+      if (res < tol2) { converged = true; break; }
       if (res >= prevRes) { // step made things worse: halve it
         re = pre + 0.5 * (re - pre);
         rn = prn + 0.5 * (rn - prn);
@@ -760,11 +784,11 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
     }
     // Rescue (rare: < 0.1 % of queries, near folding crests): damped fixed-point steps from the best
     // point so far, which converge where the Newton steps oscillate between cells.
-    if (bestRes > 25 * tol2) {
+    if (!converged && bestRes > 25 * tol2) {
       re = bestE; rn = bestN;
       for (let it = 0; it < RESCUE_ITERATIONS; it++) {
         ST[S_FE] = re; ST[S_FN] = rn;
-        forward(f, false, false);
+        forward(f, false, false, true);
         const ee = ST[S_E] - pe, en = ST[S_N] - pn;
         const res = ee * ee + en * en;
         if (res < bestRes) { bestRes = res; bestE = re; bestN = rn; }
@@ -773,8 +797,27 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
       }
     }
     re = bestE; rn = bestN;
-    ST[S_FE] = re; ST[S_FN] = rn;
-    forward(f, wantVel, false);
+    // Phase B: the exact (Catmull-Rom) surface differs from the bilinear reading by ~cm: a few
+    // Newton steps with the phase-A Jacobian (still in ST) land on it. Without cubic cascades the
+    // phase-A point is already exact.
+    let exactAt = false; // the last exact forward() was at (re, rn)
+    if (anyCubic) {
+      const det = ST[S_J00] * ST[S_J11] - ST[S_J01] * ST[S_J10];
+      for (let it = 0; it < CUBIC_REFINE_ITERATIONS; it++) {
+        ST[S_FE] = re; ST[S_FN] = rn;
+        forward(f, false, false, false);
+        const ee = ST[S_E] - pe, en = ST[S_N] - pn;
+        if (ee * ee + en * en < tol2) { exactAt = true; break; }
+        if (det > 0.1) {
+          re -= (ST[S_J11] * ee - ST[S_J01] * en) / det;
+          rn -= (ST[S_J00] * en - ST[S_J10] * ee) / det;
+        } else { re -= ee; rn -= en; }
+      }
+    }
+    if (!exactAt || wantVel) {
+      ST[S_FE] = re; ST[S_FN] = rn;
+      forward(f, wantVel, false, false);
+    }
     ST[S_RE] = re + se; ST[S_RN] = rn + sn;
   }
 
@@ -812,8 +855,8 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
 
   // ---- wind --------------------------------------------------------------------------------
   function sampleWind(snap: boolean): void {
-    const dt = TS[T_DT];
     if (!wind || !useWind || !shape) return;
+    const dt = TS[T_DT];
     shape.atAltitude(focus, sim.windSampleHeight, windPoint);
     wind.at(windPoint, windVec);
     shape.tangentFrame(windPoint, frame);
@@ -921,7 +964,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
       if (perf) perf.begin(MODULE_ID, 'sim');
       if (!initialised) init();
       const T = info.time;
-      if (!(T - T === 0)) throw new RangeError('world/ocean: tick time must be finite');
+      if (!(T - T === 0)) failTickTime(); // (throw kept out of line: keeps tick small for the JIT)
       TS[T_LAST_TICK] = T;
       ticked = true;
       if (!workersStarted) startWorkers();
@@ -1041,7 +1084,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
       const f = prepare(true);
       const se = east - wrapPeriod(east), sn = north - wrapPeriod(north);
       ST[S_FE] = east - se; ST[S_FN] = north - sn;
-      forward(f, true, false);
+      forward(f, true, false, false);
       ST[S_E] += se; ST[S_N] += sn;
       out.east = ST[S_E]; out.north = ST[S_N]; out.up = ST[S_H];
       out.vEast = ST[S_VE]; out.vNorth = ST[S_VN]; out.vUp = ST[S_VH];

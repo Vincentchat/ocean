@@ -1,157 +1,112 @@
-// GPU FFT quality tiers + the pure (three-free, Node-testable) maths shared by the adapter, its worker,
-// the debug page and the tests: band layout per tier, tier spectrum generation, an independent exact CPU
-// evaluation of the drawn fields, and the CPU-side replica of the GPU displacement filter (parity analysis).
+// GPU FFT quality tiers + the pure (three-free, Node-testable) maths shared by the adapter, its worker, the debug
+// page and the tests.
 //
-// TIERS (one grid size N for every cascade; tiles 1024 / 96 / 9 m on every tier, so the tile coordinates and
-// the material's varyings never change). Band split as a function of N (spectrum.ts bandCascades):
-//     upper_c = pi N / L_c / 1.5,  lower_c = upper_{c-1}   -> contiguous bands at any N, no holes.
-//   tier    N    band top (k, rad/m / lambda)            dispersion          spectrum source
-//   low     128  29.8 (fades out by 44.7) / 0.21 m        gravity             adapter (worker), tier layout
-//   medium  256  59.6 (89.4) / 0.105 m  = THE REFERENCE   gravity             core slots (bit-identical)
-//   high    512  59.6 (89.4) / 0.105 m  (top capped)      gravity             adapter (worker), tier layout
-//   ultra   512  119  (179)  / 0.053 m                    gravity-capillary   adapter (worker), tier layout
-//   * low draws 1/4 of medium's texels; the slope variance above its band top is reported as
-//     unresolvedSlopeVariance (roughness).
-//   * high: same spectrum extent as the reference, re-cut so every cascade has 2x the resolution (c0 down to
-//     lambda 6 m on 2 m cells, c1 down to 0.56 m): sharper crests / normals near the camera, no new top band.
-//   * ultra: high + the 5-10 cm ripple octave, with the gravity-capillary dispersion w^2 = g k + S k^3
-//     (S = 7.4e-5 m^3/s^2; at k = 179 the capillary term is 24 % of w^2). It is the only tier that draws MORE
-//     than the reference spectrum.
-//   Cascade count stays 3: at N = 128 three tiles are needed to reach lambda 0.2 m from the 1024 m swell
-//   (fewer would drop the 1-12 m chop or the swell); at 512 a 4th tile only adds sub-5 cm detail.
-// The old 4th "c3" cascade (0.84 m tile, gravity dispersion) is gone (review fft-r1: wrong dispersion, speckle).
+// TIER INVARIANCE (round 3): every wave component of the reference master layout (the core's slots: 256^2 per
+// cascade, reference band edges, same k / amplitude / phase / dispersion) is drawn bit-identically on every tier.
+// A tier may only DROP short waves (a smaller grid takes the CENTRED SUB-BLOCK of the master grid of c1 / c2, like
+// spectrum.resampleCentred) or ADD a band above the master top (ultra's optional capillary cascade, its own tile,
+// draws and dispersion; the master components are untouched). So the sea is the same on every tier, a tier switch
+// only changes fine detail, and the CPU query (master layout) is tier-independent.
 //
-// CPU parity: a re-cut band moves energy between tiles (a different random realisation of those waves), so the
-// core query (reference layout) does not match low / high / ultra (measured: see tests/fft-tiers.test.ts and
-// the module report). The core must then evaluate the SAME layout: tierQueryLayout(t) describes it.
+//   tier    c0 (1024 m)  c1 (96 m)  c2 (9 m)  extra                       drops (-> unresolvedSlopeVariance)
+//   low     256          256        64        -                           c2 k > 22.3 (lambda < 0.28 m)
+//   medium  256          256        256       -                           nothing (= the reference)
+//   high    256          256        256       -                           nothing (same FFT as medium; see note)
+//   ultra   256          256        256       capillary band (opt-in)     nothing
+// c0 AND c1 stay 256 on every tier (measured against the master CPU query, cubic c0/c1, p99.9 % Hs, see
+// tests/fft-tiers.test.ts): c1 at 128 drops lambda 1.1-1.5 m waves = 2.7 % (breeze, Hs 1.46 m) by truncation alone,
+// 4.3 % with the 0.75 m-cell interpolation; windy 1.7 %, storm 0.8 %. c0 at 128: 35 / 17 / 8 %. Only c2 (heights
+// of cm) can shrink: 256/256/64 gives p99.9 1.05 / 0.76 / 0.32 % (breeze / windy / storm; medium 0.91 / 0.74 / 0.24). So low costs ~70 % of medium's texels, not 25 %:
+// that is the price of drawing the same sea on every tier. high: a finer (zero-padded) grid for c2 only
+// re-samples the same band (no new waves) and changes the finite-difference normals the reference look relies on,
+// so high spends nothing extra on the FFT (its quality comes from LOD / foam / material tiers).
+// ultra's capillary band: tile L3 = 9 / (1024 / 96) m, band from the master top (k 59.6, complementary to c2's
+// fade-out) to k 635 (lambda 1 cm), random draws gaussianField(seed, 3), gravity-capillary dispersion
+// w^2 = g k + S k^3 (S = 7.4e-5 m^3/s^2). Opt-in (createOceanFft({ capillary: true }) or setCapillary), and its
+// normals are weighted by `capillaryGain` (default 1 when enabled). With the current material (fineNormals off) it is
+// invisible (live toggle on a paused C2 shot: 0.005 % of pixels change), so it stays OFF by default.
+//
+// COST (RTX 2070, FFT pass incl. derived fields + mips, compute timestamps, best p50 of 3 x 600 frames, GPU shared
+// with other jobs 33-44 %, 2026-10-23): low 0.118 ms (75 % of medium), medium 0.158 ms, high = ultra = medium,
+// ultra + capillary 0.20 ms. Memory (textures + buffers): low 8.8 MB (69 %), medium / high / ultra 12.9 MB, + capillary
+// 17.1 MB (reference FFT ~20 MB). Texels per frame: low 135 k (69 %), medium 197 k.
 import {
-  CASCADES, REFERENCE_SIZE, OMEGA_UNIT, LOOP_PERIOD, bandCascades, gaussianField, gaussianFieldSized,
-  generateRawRowsSized, packInitialSpectrumSized, omegaIndicesGrid, spectrumScalars,
+  CASCADES, REFERENCE_SIZE, OMEGA_UNIT, LOOP_PERIOD, referenceCascades, resampleCentred, gaussianField,
+  generateRawRows, packInitialSpectrum, omegaIndicesGrid, spectrumScalars,
 } from '../spectrum.ts';
-import type { CascadeDef, SpectrumParams, SpectrumScalars } from '../spectrum.ts';
+import type { CascadeDef, SpectrumParams } from '../spectrum.ts';
 
 export type OceanTier = 'low' | 'medium' | 'high' | 'ultra';
 
 export interface FftTierSpec {
-  /** Grid size of every cascade. */
-  readonly size: number;
-  /** Upper k cap of the last cascade (rad/m), Infinity = the grid's own band top. */
-  readonly topUpper: number;
-  /** Gravity-capillary dispersion (else the core's quantised deep-water gravity dispersion). */
+  /** Grid size of cascades 0, 1, 2 (c0 / c1 are always 256: they share the base texture; c2 is the detail texture). */
+  readonly sizes: readonly [number, number, number];
+  /** The tier allows the capillary band (still opt-in). */
   readonly capillary: boolean;
-  /** True when the layout IS the reference / core layout (the adapter then uploads the core's slots as is). */
-  readonly reference: boolean;
 }
 
 export const FFT_TIERS: Readonly<Record<OceanTier, FftTierSpec>> = Object.freeze({
-  low: Object.freeze({ size: 128, topUpper: Infinity, capillary: false, reference: false }),
-  medium: Object.freeze({ size: 256, topUpper: Infinity, capillary: false, reference: true }),
-  high: Object.freeze({ size: 512, topUpper: CASCADES[2].upper, capillary: false, reference: false }),
-  ultra: Object.freeze({ size: 512, topUpper: Infinity, capillary: true, reference: false }),
+  low: Object.freeze({ sizes: [256, 256, 64] as const, capillary: false }),
+  medium: Object.freeze({ sizes: [256, 256, 256] as const, capillary: false }),
+  high: Object.freeze({ sizes: [256, 256, 256] as const, capillary: false }),
+  ultra: Object.freeze({ sizes: [256, 256, 256] as const, capillary: true }),
 });
-
 export const TIER_NAMES: readonly OceanTier[] = ['low', 'medium', 'high', 'ultra'];
 export const NUM_CASCADES = 3;
+/** The capillary cascade: tile, band (lower = the master top), offset. */
+export const CAPILLARY_CASCADE: CascadeDef = Object.freeze(referenceCascades([1024, 96, 9, 9 / (1024 / 96)])[3]);
+export const CAPILLARY_SIZE = 256;
 
-/** The tier's cascades (domains 1024 / 96 / 9 m, bands cut for its N). medium === core CASCADES. */
-export function tierCascades(t: OceanTier): CascadeDef[] {
-  const s = FFT_TIERS[t];
-  return s.reference ? CASCADES.map((c) => ({ ...c })) : bandCascades(s.size, undefined, s.topUpper);
-}
-
-/**
- * What the CPU query (core) needs to evaluate exactly what tier t draws. The core's current query uses the
- * reference layout (= medium); for other tiers it must generate its slots with these cascades and grid sizes.
- *   cascades[c]  band (domain, lower, upper, offset) to use INSTEAD of CASCADES[c] in generateRawRows
- *   size         spectral grid size N (generateRawRowsSized / gaussianFieldSized / packInitialSpectrumSized)
- *   capillary    dispersion (omegaIndicesGrid(cascade, g, N, capillary))
- *   filter       what the GPU uses for displacement near the camera ('cubic' = Catmull-Rom, the core's 'cubic')
- *   querySize    the grid the query must sample (= size: the drawn grid; a smaller query grid re-introduces
- *                the interpolation error measured in the report)
- */
-export function tierQueryLayout(t: OceanTier) {
-  const s = FFT_TIERS[t];
-  return { tier: t, size: s.size, capillary: s.capillary, cascades: tierCascades(t), filter: 'cubic' as const, querySize: s.size };
-}
+/** Cascades drawn by a tier (always the core's CASCADES; tiers only change grid sizes). */
+export function tierCascades(_t?: OceanTier): CascadeDef[] { return CASCADES.map((c) => ({ ...c })); }
 
 // ------------------------------------------------------------------------------------------------------------
-// Spectrum generation for a tier (setup / worker; allocates)
+// Master subsets (exact: same cells, same values)
 // ------------------------------------------------------------------------------------------------------------
-export interface TierSpectrum {
-  readonly size: number;
-  /** Per cascade: h0 only, 2 floats per cell [Re, Im] (h0m = conj(h0(-k)) is read at the mirrored cell). */
-  readonly h0: Float32Array[];
-  /** Time-averaged slope variance of the drawn spectrum, sum_k k^2 (|h0|^2 + |h0m|^2). */
-  readonly slopeVariance: number;
+/** h0-only (2 floats / cell) centred size-n subset of a core master slot array (4 floats / cell). Allocates. */
+export function masterH0Subset(master: Float32Array, n: number): Float32Array {
+  const packed = n === REFERENCE_SIZE ? master : resampleCentred(master, new Float32Array(4 * n * n), n, 4, true);
+  const out = new Float32Array(2 * n * n);
+  for (let i = 0; i < n * n; i++) { out[2 * i] = packed[4 * i]; out[2 * i + 1] = packed[4 * i + 1]; }
+  return out;
+}
+/** Centred size-n subset of a master omega-index table. */
+export function masterOmegaSubset(master: Float32Array, n: number): Float32Array {
+  return n === REFERENCE_SIZE ? master.slice() : resampleCentred(master, new Float32Array(n * n), n, 1, false);
 }
 
-/** Master (256) gaussian draws per cascade, cached by seed (setup-time). */
-const xiCache = new Map<string, Float64Array>();
-function masterXi(seed: number, c: number): Float64Array {
-  const key = `${seed}:${c}`;
-  let x = xiCache.get(key);
-  if (!x) { x = gaussianField(seed, c, new Float64Array(2 * REFERENCE_SIZE * REFERENCE_SIZE)); xiCache.set(key, x); }
-  return x;
-}
-
-/** Slope variance of a packed [h0, h0m] (4 floats / cell) size-n spectrum of a tile of side L. */
-function slopeVarianceOf(packed: Float32Array, n: number, L: number): number {
-  const dk = (2 * Math.PI) / L;
+/** Slope variance (sum k^2 (|h0|^2 + |h0m|^2)) of the master cells OUTSIDE the centred size-n block. */
+export function droppedSlopeVariance(master: Float32Array, n: number, domain: number): number {
+  if (n >= REFERENCE_SIZE) return 0;
+  const m = REFERENCE_SIZE, h = n / 2, dk = (2 * Math.PI) / domain;
   let s = 0;
-  for (let y = 0; y < n; y++) {
-    const ky = (y - n / 2) * dk;
-    for (let x = 0; x < n; x++) {
-      const kx = (x - n / 2) * dk, i = 4 * (y * n + x);
-      const e = packed[i] * packed[i] + packed[i + 1] * packed[i + 1] + packed[i + 2] * packed[i + 2] + packed[i + 3] * packed[i + 3];
+  for (let y = 0; y < m; y++) {
+    const ky = y - m / 2;
+    for (let x = 0; x < m; x++) {
+      const kx = x - m / 2;
+      if (kx > -h && kx < h && ky > -h && ky < h) continue; // kept (the new Nyquist line -h is dropped)
+      const i = 4 * (y * m + x);
+      const e = master[i] * master[i] + master[i + 1] * master[i + 1] + master[i + 2] * master[i + 2] + master[i + 3] * master[i + 3];
       s += e * (kx * kx + ky * ky);
     }
   }
-  return s;
+  return s * dk * dk;
 }
 
-/** Generate the tier's h0 (all cascades) for one spectrum slot. ~10-60 ms: run in the worker. */
-export function generateTierSpectrum(spec: FftTierSpec, cascades: readonly CascadeDef[], params: Readonly<SpectrumParams>, seed: number, g: number): TierSpectrum {
-  const n = spec.size;
-  const sc: SpectrumScalars = spectrumScalars(params, g, { g: 0, U: 0, dirGrid: 0, wp: 0 });
-  const xi = new Float64Array(2 * n * n), raw = new Float64Array(2 * n * n), packed = new Float32Array(4 * n * n);
-  const h0: Float32Array[] = [];
-  let slope = 0;
-  for (let c = 0; c < cascades.length; c++) {
-    gaussianFieldSized(seed, c, n, xi, masterXi(seed, c));
-    generateRawRowsSized(params, sc, cascades[c], n, xi, raw, 0, n);
-    packInitialSpectrumSized(raw, params.standing, n, packed);
-    slope += slopeVarianceOf(packed, n, cascades[c].domain);
-    const out = new Float32Array(2 * n * n);
-    for (let i = 0; i < n * n; i++) { out[2 * i] = packed[4 * i]; out[2 * i + 1] = packed[4 * i + 1]; }
-    h0.push(out);
-  }
-  return { size: n, h0, slopeVariance: slope };
-}
-
-/** h0-only layout of a core master slot (4 floats / cell -> 2). */
-export function stripMasterH0(master: Float32Array, out: Float32Array): Float32Array {
-  const nn = master.length / 4;
-  for (let i = 0; i < nn; i++) { out[2 * i] = master[4 * i]; out[2 * i + 1] = master[4 * i + 1]; }
-  return out;
-}
-
-/** Slope variance of the reference spectrum (all master cascades) from core master slots. */
-export function referenceSlopeVariance(masterH0: readonly Float32Array[]): number {
-  let s = 0;
-  for (let c = 0; c < CASCADES.length; c++) s += slopeVarianceOf(masterH0[c], REFERENCE_SIZE, CASCADES[c].domain);
-  return s;
-}
-
-/** Omega index table (n^2 per cascade, concatenated) for a tier. */
-export function tierOmega(spec: FftTierSpec, cascades: readonly CascadeDef[], g: number): Float32Array {
-  const n = spec.size, nn = n * n;
-  const out = new Float32Array(cascades.length * nn);
-  for (let c = 0; c < cascades.length; c++) omegaIndicesGrid(cascades[c], g, n, spec.capillary, out.subarray(c * nn, (c + 1) * nn));
-  return out;
+/** Capillary band spectrum (h0-only, n^2 x 2) + its omega table, for one slot's parameters. Worker / setup. */
+export function generateCapillary(params: Readonly<SpectrumParams>, seed: number, g: number, n = CAPILLARY_SIZE): { h0: Float32Array; omega: Float32Array } {
+  const m = REFERENCE_SIZE;
+  const xi = gaussianField(seed, 3, new Float64Array(2 * m * m));
+  const raw = new Float64Array(2 * m * m);
+  generateRawRows(params, spectrumScalars(params, g, { g: 0, U: 0, dirGrid: 0, wp: 0 }), CAPILLARY_CASCADE, xi, raw, 0, m);
+  const packed = packInitialSpectrum(raw, params.standing, new Float32Array(4 * m * m));
+  const h0 = masterH0Subset(packed, n);
+  const omega = omegaIndicesGrid(CAPILLARY_CASCADE, g, n, true, new Float32Array(n * n));
+  return { h0, omega };
 }
 
 // ------------------------------------------------------------------------------------------------------------
-// Exact CPU evaluation of the fields the GPU draws (independent of cpu-fft.ts; for checks / tests)
+// Exact CPU evaluation of the drawn fields (independent of cpu-fft.ts; for checks / tests)
 // ------------------------------------------------------------------------------------------------------------
 function fft1(re: Float64Array, im: Float64Array, off: number, stride: number, n: number) {
   for (let i = 1, j = 0; i < n; i++) {
@@ -164,7 +119,7 @@ function fft1(re: Float64Array, im: Float64Array, off: number, stride: number, n
     }
   }
   for (let len = 2; len <= n; len <<= 1) {
-    const ang = (2 * Math.PI) / len; // inverse transform: e^{+i}
+    const ang = (2 * Math.PI) / len;
     for (let i = 0; i < n; i += len) for (let j = 0; j < len / 2; j++) {
       const c = Math.cos(ang * j), s = Math.sin(ang * j);
       const a = off + (i + j) * stride, b = a + (len / 2) * stride;
@@ -187,7 +142,7 @@ export function evaluateFields(from: Float32Array, to: Float32Array, w: number, 
     const i = y * n + x, j = ((n - y) & (n - 1)) * n + ((n - x) & (n - 1));
     const hr = from[2 * i] + (to[2 * i] - from[2 * i]) * w, hi = from[2 * i + 1] + (to[2 * i + 1] - from[2 * i + 1]) * w;
     const jr = from[2 * j] + (to[2 * j] - from[2 * j]) * w, ji = from[2 * j + 1] + (to[2 * j + 1] - from[2 * j + 1]) * w;
-    const mr = jr, mi = -ji; // h0m = conj(h0(-k))
+    const mr = jr, mi = -ji;
     const m = omega[i];
     const ph = OMEGA_UNIT * ((m * tm) % LOOP_PERIOD);
     const c = Math.cos(ph), s = Math.sin(ph);
@@ -208,8 +163,8 @@ export function evaluateFields(from: Float32Array, to: Float32Array, w: number, 
 }
 
 // ------------------------------------------------------------------------------------------------------------
-// CPU replica of the GPU displacement lookup at LOD 0 (parity analysis). filter: 'bilinear' | 'cubic'
-// (Catmull-Rom, same weights / texel mapping as the GPU kernel and the core's sampleCubic).
+// CPU replica of the GPU displacement lookup at LOD 0 (parity analysis). cubic = Catmull-Rom (same weights /
+// texel mapping as the GPU kernel and the core's sampleCubic).
 // ------------------------------------------------------------------------------------------------------------
 export function sampleField(f: ArrayLike<number>, n: number, L: number, a: number, b: number, cubic: boolean, out: Float64Array): void {
   const sa = (a / L - Math.floor(a / L)) * n, sb = (b / L - Math.floor(b / L)) * n;
@@ -232,15 +187,12 @@ export function sampleField(f: ArrayLike<number>, n: number, L: number, a: numbe
   }
 }
 
-/**
- * Chained lookup of the drawn surface at local rest point (east e, north nn) (reference spectralField):
- * returns [up, east displacement, north displacement] in out.
- */
-export function sampleChained(fields: readonly ArrayLike<number>[], n: number, cascades: readonly CascadeDef[], e: number, nn: number, cubic: boolean, out: Float64Array, tmp: Float64Array): void {
+/** Chained lookup (reference spectralField) at local rest (e, nn): out = [up, east disp, north disp]. */
+export function sampleChained(fields: readonly ArrayLike<number>[], sizes: readonly number[], cascades: readonly CascadeDef[], e: number, nn: number, cubic: readonly boolean[], out: Float64Array, tmp: Float64Array): void {
   let U = 0, E = 0, N = 0;
-  for (let c = 0; c < cascades.length; c++) {
+  for (let c = 0; c < fields.length; c++) {
     const L = cascades[c].domain, off = cascades[c].offset;
-    sampleField(fields[c], n, L, e + E + off, -(nn + N) + off, cubic, tmp);
+    sampleField(fields[c], sizes[c], L, e + E + off, -(nn + N) + off, cubic[c], tmp);
     U += tmp[0]; E += tmp[1]; N += tmp[2];
   }
   out[0] = U; out[1] = E; out[2] = N;

@@ -91,6 +91,10 @@ export interface OceanTransmission {
   valid: any;
   /** Optional contact / shoreline composite, applied after foam and before haze (radiance in, radiance out). */
   contact?: (color: any) => any;
+  /** Optional 0/1 mask: opaque geometry in front of the water at this pixel -> output `background` instead. */
+  occlusion?: any;
+  /** Pre-exposed scene colour at the pixel (used with `occlusion`). */
+  background?: any;
 }
 
 export interface OceanMaterialOptions {
@@ -269,7 +273,9 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
   const material = new MeshBasicNodeMaterial({ side: DoubleSide });
   material.name = o.name ?? 'ocean.water';
   material.positionNode = o.positionNode;
-  material.colorNode = max(color, vec3(0)).mul(o.preExposure);
+  let out: any = max(color, vec3(0)).mul(o.preExposure);
+  if (transmitted?.occlusion && transmitted.background) out = mix(out, transmitted.background, transmitted.occlusion);
+  material.colorNode = out;
 
   // ---------------------------------------------------------------- per-frame contract copy (allocation-free)
   let shVersion = -1;

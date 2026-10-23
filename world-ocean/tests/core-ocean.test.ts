@@ -94,8 +94,11 @@ test('wind coupling: WIND_QUERY drives the spectrum, regenerates + crossfades wi
   const pts = probes(48, 11, 1500);
   const last = new Float64Array(pts.length / 2);
   const p: Vec3 = { x: 0, y: 0, z: 0 };
+  // Track fixed REST points (sampleRest: the surface point itself), so the measure is the sea's motion
+  // and the crossfade, not the (separate, documented) sheet choice of heightAt where crests fold.
+  const rs = { east: 0, north: 0, up: 0, vEast: 0, vNorth: 0, vUp: 0 };
   const sample = (out: Float64Array) => {
-    for (let i = 0; i < out.length; i++) { p.x = pts[2 * i]; p.z = pts[2 * i + 1]; out[i] = ocean.query.heightAt(p, world.time); }
+    for (let i = 0; i < out.length; i++) { out[i] = ocean.sampleRest(pts[2 * i], pts[2 * i + 1], world.time, rs).up; }
   };
   const cur = new Float64Array(last.length);
   // Natural per-tick change before the wind changes (reference for "no pop").
@@ -219,7 +222,7 @@ test('heights at arbitrary times: Hermite between snapshots matches exact evalua
   const herm = createOcean({ shape });
   // snapshotDt = t puts t exactly on a snapshot: exact spectral evaluation
   const exact = createOcean({ shape, query: [
-    { size: 256, snapshotDt: t, filter: 'bilinear' }, { size: 256, snapshotDt: t, filter: 'bilinear' }, { size: 128, snapshotDt: t, filter: 'bilinear' }] });
+    { size: 256, snapshotDt: t, filter: 'cubic' }, { size: 256, snapshotDt: t, filter: 'cubic' }, { size: 128, snapshotDt: t, filter: 'cubic' }] });
   const a = rest(), b = rest();
   const pts = probes(500, 21, 2000);
   let mx = 0;
