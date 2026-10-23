@@ -374,7 +374,33 @@ const inspectionParams = import.meta.env.DEV
     ? new URLSearchParams(location.search)
     : null,
   inspectionTime = Number(inspectionParams?.get("inspectTime"));
-let current = "storm",
+// Dev-only capture hook (WebGPU port, world-ocean/tools/capture.mjs). Look-neutral: it only places the
+// camera, fixes the simulation time and hides the HUD.
+//   ?cam=x,y,z,yawDeg,pitchDeg  camera position (m) + yaw (0 = towards -Z, + towards +X) / pitch (+ = up)
+//   ?t=seconds                  simulation time;  ?preset=golden|azure|storm  scene preset (applied instantly)
+//   ?shot                       warm up from t-warm (default 6 s) at a fixed 1/60 s step, then pause at t,
+//                               hide the UI and set window.__shotReady = true once frames are settled
+//   ?creature=0                 hide the whale (same as the shadow toggle)
+const shotHook = (() => {
+  if (!inspectionParams) return null;
+  const cam = (inspectionParams.get("cam") || "").split(",").map(Number),
+    t = Number(inspectionParams.get("t")),
+    warm = Number(inspectionParams.get("warm") ?? 6),
+    preset = inspectionParams.get("preset");
+  return {
+    shot: inspectionParams.has("shot"),
+    cam: cam.length >= 5 && cam.slice(0, 5).every(Number.isFinite) ? cam : null,
+    t: Number.isFinite(t) && t >= 0 ? t : null,
+    warm: Number.isFinite(warm) && warm >= 0 ? warm : 6,
+    preset: preset && ["golden", "azure", "storm"].includes(preset) ? preset : null,
+    creature: inspectionParams.get("creature") !== "0",
+  };
+})();
+const shotOffset = [0, 0, 0];
+let shotState = "off",
+  shotSettleFrames = 0,
+  creatureSettled = false;
+let current = shotHook?.preset ?? "storm",
   paused =
     matchMedia("(prefers-reduced-motion: reduce)").matches ||
     inspectionParams?.get("inspectPaused") === "1",
@@ -443,6 +469,26 @@ installPrefilterUniforms(THREE, uniforms);
 installRefractionUniforms(THREE, uniforms);
 installPhotoSkyUniforms(uniforms);
 installCreatureUniforms(THREE, uniforms);
+if (shotHook) {
+  const p = presets[current];
+  uniforms.uWave.value = p.wave;
+  uniforms.uWind.value = p.wind;
+  uniforms.uSun.value = uniforms.uSkySun.value = (p.light * Math.PI) / 180;
+  uniforms.uMood.value = uniforms.uSkyMood.value = p.mood;
+  if (shotHook.t != null) time = shotHook.t;
+  if (shotHook.shot) {
+    const shotTime = shotHook.t ?? time;
+    time = Math.max(0, shotTime - shotHook.warm);
+    shotHook.t = shotTime;
+    shotState = "warmup";
+    paused = false;
+    window.__shotReady = false;
+    const style = document.createElement("style");
+    style.textContent =
+      "header,footer,.hud,.intro,.panel,.fps-counter,#loading{display:none!important}";
+    document.head.appendChild(style);
+  }
+}
 let renderer,
   camera,
   scene,
@@ -489,6 +535,14 @@ const i18n = createI18n({
       else if (action === "fps") fpsCounter.toggle();
     },
   });
+if (shotHook?.cam) {
+  const [x, y, z, yawDeg, pitchDeg] = shotHook.cam;
+  shotOffset[0] = x - freeCam.x;
+  shotOffset[1] = y - freeCam.y;
+  shotOffset[2] = z - 8 - freeCam.z;
+  yaw = (yawDeg * Math.PI) / 180;
+  pitch = (pitchDeg * Math.PI) / 180;
+}
 function fail(e) {
   console.error(e);
   $("loading").hidden = true;
@@ -949,9 +1003,11 @@ try {
     seabed = createSeabed(THREE, uniforms);
     creature = createCreatureShadow(THREE, uniforms, shaderCommon, {
       onReady() {
+        creatureSettled = true;
         needsRender = true;
       },
       onError() {
+        creatureSettled = true;
         needsRender = true;
       },
     });
@@ -1070,6 +1126,16 @@ try {
     let dt = Math.min((now - last) / 1000, 0.04);
     last = now;
     if (document.hidden || !atmosphereLoadSettled || !patternSettled) return;
+    if (shotState === "warmup") {
+      const remaining = shotHook.t - time;
+      if (remaining <= 1e-9) {
+        time = shotHook.t;
+        setPause(true);
+        shotState = "settle";
+        dt = 0;
+      } else dt = Math.min(1 / 60, remaining);
+    } else if (shotState !== "off") dt = 0;
+    if (shotState !== "off") needsRender = true;
     if (!paused && dt > 0) {
       time += dt;
       needsRender = true;
@@ -1108,12 +1174,16 @@ try {
       )
     )
       needsRender = true;
-    camera.position.set(freeCam.x, freeCam.y, 8 + freeCam.z);
+    camera.position.set(
+      freeCam.x + shotOffset[0],
+      freeCam.y + shotOffset[1],
+      8 + freeCam.z + shotOffset[2],
+    );
     const horizontal = Math.cos(pitch) * 100;
     camera.lookAt(
-      freeCam.x + Math.sin(yaw) * horizontal,
+      camera.position.x + Math.sin(yaw) * horizontal,
       camera.position.y + Math.sin(pitch) * 100,
-      8 + freeCam.z - Math.cos(yaw) * horizontal,
+      camera.position.z - Math.cos(yaw) * horizontal,
     );
     if (spectral && (needsRender || !paused)) {
       try {
@@ -1219,6 +1289,14 @@ try {
       $("loading").style.opacity = "0";
       setTimeout(() => ($("loading").hidden = true), 850);
     }
+    if (
+      shotState === "settle" &&
+      (creatureSettled || !creatureEnabled || !creature) &&
+      ++shotSettleFrames >= 8
+    ) {
+      shotState = "done";
+      requestAnimationFrame(() => (window.__shotReady = true));
+    }
   }
   requestAnimationFrame(draw);
   const pointers = new Map(),
@@ -1308,6 +1386,7 @@ try {
     updateShadowLabel();
     needsRender = true;
   };
+  if (shotHook && !shotHook.creature) $("shadow").onclick();
 } catch (e) {
   fail(e);
 }

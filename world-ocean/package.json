@@ -1,0 +1,28 @@
+{
+  "name": "@dreamp/world-ocean",
+  "version": "0.1.0",
+  "private": true,
+  "description": "FFT ocean (JONSWAP spectrum, cascades, foam) for the DreamP world: render-agnostic core + three.js r186 WebGPU/TSL adapter.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.ts",
+    "./three": "./three/index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/",
+    "demo": "vite --config vite.config.mjs --host 127.0.0.1 --port 5180 --strictPort",
+    "reference": "node tools/serve.mjs --reference --port 5173",
+    "capture": "node tools/capture.mjs",
+    "perf": "node tools/perf.mjs"
+  },
+  "dependencies": {
+    "three": "0.186.1"
+  },
+  "devDependencies": {
+    "@types/three": "0.186.0",
+    "@webgpu/types": "0.1.74",
+    "playwright-core": "1.64.1",
+    "vite": "8.3.2"
+  }
+}

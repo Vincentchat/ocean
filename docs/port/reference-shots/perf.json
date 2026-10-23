@@ -1,0 +1,197 @@
+{
+  "about": "WebGL reference (src/, three 0.180) frame cost measured with world-ocean/tools/perf.mjs: headless Edge, hardware GPU (NVIDIA GeForce RTX 2070 via ANGLE D3D11), 1920x1080 viewport, DPR 1, reference quality profile \"high\" (3 spectral cascades 256^2, foam history 1024^2, 512x768 ring grid, refraction pass, atmosphere cube 1024). frameMs = rAF interval; cpuMs = time inside rAF callbacks. Uncapped runs use --disable-gpu-vsync --disable-frame-rate-limit, so frameMs approximates the GPU-bound frame cost and cpuMs includes WebGL driver back-pressure; the vsync run shows the real main-thread cost at 60 Hz. No GPU timestamps exist in the WebGL reference.",
+  "commands": [
+    "node tools/perf.mjs --url \"http://127.0.0.1:5173/?t=10&preset=storm&creature=0&cam=0,4.8,8,0,-16.04\" --frames 600 --warmup 6",
+    "node tools/perf.mjs --url \"http://127.0.0.1:5173/?t=10&preset=azure&creature=0&cam=0,60,8,0,-60\" --frames 600 --warmup 6",
+    "node tools/perf.mjs --url \"http://127.0.0.1:5173/?t=10&preset=storm&cam=0,4.8,8,0,-16.04\" --frames 600 --warmup 6",
+    "node tools/perf.mjs --url \"http://127.0.0.1:5173/?t=10&preset=storm&creature=0&cam=0,4.8,8,0,-16.04\" --frames 300 --warmup 6 --vsync"
+  ],
+  "summary": {
+    "01-default storm, uncapped": {
+      "fps": 270.7,
+      "frameMsMean": 3.694,
+      "frameMsP95": 17.1
+    },
+    "03-high-down azure, uncapped": {
+      "fps": 155.9,
+      "frameMsMean": 6.416,
+      "frameMsP95": 18.2
+    },
+    "01-default storm with whale, uncapped": {
+      "fps": 278.7,
+      "frameMsMean": 3.588,
+      "frameMsP95": 14.2
+    },
+    "01-default storm, vsync 60 Hz": {
+      "fps": 60,
+      "cpuMsMean": 0.929,
+      "cpuMsP95": 1.3
+    }
+  },
+  "runs": [
+    {
+      "label": "reference 01-default storm (uncapped)",
+      "url": "http://127.0.0.1:5173/?t=10&preset=storm&creature=0&cam=0,4.8,8,0,-16.04",
+      "date": "2026-10-23T15:54:04.397Z",
+      "adapter": {
+        "vendor": "nvidia",
+        "architecture": "turing",
+        "description": "NVIDIA GeForce RTX 2070"
+      },
+      "webglRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 (0x00001F02) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+      "viewport": [
+        1920,
+        1080
+      ],
+      "canvas": [
+        1920,
+        1080
+      ],
+      "vsync": false,
+      "framesSampled": 631,
+      "fps": 270.7,
+      "frameMs": {
+        "mean": 3.694,
+        "p50": 0.4,
+        "p95": 17.1,
+        "p99": 17.9,
+        "min": 0.1,
+        "max": 972.6,
+        "n": 631
+      },
+      "cpuMs": {
+        "mean": 3.487,
+        "p50": 0.2,
+        "p95": 16.4,
+        "p99": 19.4,
+        "min": 0.1,
+        "max": 982.6,
+        "n": 600
+      },
+      "consoleErrors": 0
+    },
+    {
+      "label": "reference 03-high-down azure (uncapped)",
+      "url": "http://127.0.0.1:5173/?t=10&preset=azure&creature=0&cam=0,60,8,0,-60",
+      "date": "2026-10-23T15:54:23.313Z",
+      "adapter": {
+        "vendor": "nvidia",
+        "architecture": "turing",
+        "description": "NVIDIA GeForce RTX 2070"
+      },
+      "webglRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 (0x00001F02) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+      "viewport": [
+        1920,
+        1080
+      ],
+      "canvas": [
+        1920,
+        1080
+      ],
+      "vsync": false,
+      "framesSampled": 627,
+      "fps": 155.9,
+      "frameMs": {
+        "mean": 6.416,
+        "p50": 0.8,
+        "p95": 18.2,
+        "p99": 18.9,
+        "min": 0.1,
+        "max": 71.1,
+        "n": 627
+      },
+      "cpuMs": {
+        "mean": 5.729,
+        "p50": 0.3,
+        "p95": 25.6,
+        "p99": 28.2,
+        "min": 0.1,
+        "max": 79.6,
+        "n": 604
+      },
+      "consoleErrors": 0
+    },
+    {
+      "label": "reference 01-default storm, whale on (uncapped)",
+      "url": "http://127.0.0.1:5173/?t=10&preset=storm&cam=0,4.8,8,0,-16.04",
+      "date": "2026-10-23T15:54:41.372Z",
+      "adapter": {
+        "vendor": "nvidia",
+        "architecture": "turing",
+        "description": "NVIDIA GeForce RTX 2070"
+      },
+      "webglRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 (0x00001F02) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+      "viewport": [
+        1920,
+        1080
+      ],
+      "canvas": [
+        1920,
+        1080
+      ],
+      "vsync": false,
+      "framesSampled": 653,
+      "fps": 278.7,
+      "frameMs": {
+        "mean": 3.588,
+        "p50": 0.4,
+        "p95": 14.2,
+        "p99": 17.5,
+        "min": 0.1,
+        "max": 18.3,
+        "n": 653
+      },
+      "cpuMs": {
+        "mean": 3.2,
+        "p50": 0.3,
+        "p95": 13.7,
+        "p99": 17,
+        "min": 0.1,
+        "max": 30.8,
+        "n": 649
+      },
+      "consoleErrors": 0
+    },
+    {
+      "label": "reference 01-default storm (vsync 60 Hz)",
+      "url": "http://127.0.0.1:5173/?t=10&preset=storm&creature=0&cam=0,4.8,8,0,-16.04",
+      "date": "2026-10-23T15:55:00.713Z",
+      "adapter": {
+        "vendor": "nvidia",
+        "architecture": "turing",
+        "description": "NVIDIA GeForce RTX 2070"
+      },
+      "webglRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 (0x00001F02) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+      "viewport": [
+        1920,
+        1080
+      ],
+      "canvas": [
+        1920,
+        1080
+      ],
+      "vsync": true,
+      "framesSampled": 307,
+      "fps": 60,
+      "frameMs": {
+        "mean": 16.666,
+        "p50": 16.7,
+        "p95": 16.8,
+        "p99": 17,
+        "min": 16.3,
+        "max": 17,
+        "n": 307
+      },
+      "cpuMs": {
+        "mean": 0.929,
+        "p50": 0.9,
+        "p95": 1.3,
+        "p99": 1.4,
+        "min": 0.5,
+        "max": 2.1,
+        "n": 307
+      },
+      "consoleErrors": 0
+    }
+  ]
+}

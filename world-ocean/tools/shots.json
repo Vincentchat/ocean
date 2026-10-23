@@ -1,0 +1,275 @@
+{
+  "about": "Canonical cameras shared by the WebGL reference (repo root dev server, ?shot hook in src/ocean.js) and the WebGPU demo (world-ocean/demo). cam = x,y,z (m, +Y up),yawDeg (0 = towards -Z, + towards +X),pitchDeg (+ up). Reference sun azimuth is yaw -53 deg. Scenes are the reference presets golden (sun 10 deg), azure (sun 50 deg), storm (sun 38 deg, windiest, reference default); the demo matches them with ?scene= (sky stand-in + core breeze preset at REFERENCE_SCENE_AMPLITUDE[scene]). Every shot warms up 6 s at a fixed 1/60 s step before t (foam history), then pauses. Whale hidden in the reference (creature=0). set \"canonical\" = the 6 infra shots (t = 10 s); set \"reference-md\" = cameras C1-C7 x 3 scenes from docs/port/REFERENCE.md §5 (t = 30 s). Capture: node tools/capture.mjs --batch tools/shots.json --target reference|demo --base <url> --outdir <dir> [--set canonical] [--only name,...].",
+  "shots": [
+    {
+      "set": "canonical",
+      "name": "01-default",
+      "note": "Reference start view (camera 0,4.8,8, pitch -0.28 rad), storm = reference default scene",
+      "scene": "storm",
+      "t": 10,
+      "cam": "0,4.8,8,0,-16.04",
+      "referenceQuery": "shot&t=10&preset=storm&creature=0&cam=0,4.8,8,0,-16.04",
+      "demoQuery": "shot&t=10&scene=storm&cam=0,4.8,8,0,-16.04"
+    },
+    {
+      "set": "canonical",
+      "name": "02-grazing-sun",
+      "note": "Low grazing view towards the sun (glitter path), azure",
+      "scene": "azure",
+      "t": 10,
+      "cam": "0,1.5,8,-53,-4",
+      "referenceQuery": "shot&t=10&preset=azure&creature=0&cam=0,1.5,8,-53,-4",
+      "demoQuery": "shot&t=10&scene=azure&cam=0,1.5,8,-53,-4"
+    },
+    {
+      "set": "canonical",
+      "name": "03-high-down",
+      "note": "High view (60 m) looking down at 60 deg, azure",
+      "scene": "azure",
+      "t": 10,
+      "cam": "0,60,8,0,-60",
+      "referenceQuery": "shot&t=10&preset=azure&creature=0&cam=0,60,8,0,-60",
+      "demoQuery": "shot&t=10&scene=azure&cam=0,60,8,0,-60"
+    },
+    {
+      "set": "canonical",
+      "name": "04-horizon",
+      "note": "Level horizon view, side-lit, azure",
+      "scene": "azure",
+      "t": 10,
+      "cam": "0,4.8,8,90,0",
+      "referenceQuery": "shot&t=10&preset=azure&creature=0&cam=0,4.8,8,90,0",
+      "demoQuery": "shot&t=10&scene=azure&cam=0,4.8,8,90,0"
+    },
+    {
+      "set": "canonical",
+      "name": "05-foam-closeup",
+      "note": "Close-up of whitecaps / foam in the windiest scene (storm)",
+      "scene": "storm",
+      "t": 10,
+      "cam": "0,3,8,30,-35",
+      "referenceQuery": "shot&t=10&preset=storm&creature=0&cam=0,3,8,30,-35",
+      "demoQuery": "shot&t=10&scene=storm&cam=0,3,8,30,-35"
+    },
+    {
+      "set": "canonical",
+      "name": "06-sunset",
+      "note": "Sunset (golden scene) looking towards the sun",
+      "scene": "golden",
+      "t": 10,
+      "cam": "0,4.8,8,-53,-4",
+      "referenceQuery": "shot&t=10&preset=golden&creature=0&cam=0,4.8,8,-53,-4",
+      "demoQuery": "shot&t=10&scene=golden&cam=0,4.8,8,-53,-4"
+    },
+    {
+      "set": "reference-md",
+      "name": "C1-golden",
+      "note": "docs/port/REFERENCE.md §5 camera C1 (default start view), golden, t = 30 s",
+      "scene": "golden",
+      "t": 30,
+      "cam": "0,4.8,8,0,-16.04",
+      "referenceQuery": "shot&t=30&preset=golden&creature=0&cam=0,4.8,8,0,-16.04",
+      "demoQuery": "shot&t=30&scene=golden&cam=0,4.8,8,0,-16.04"
+    },
+    {
+      "set": "reference-md",
+      "name": "C2-golden",
+      "note": "docs/port/REFERENCE.md §5 camera C2 (towards the sun: glitter, crest glow, Fresnel), golden, t = 30 s",
+      "scene": "golden",
+      "t": 30,
+      "cam": "0,4.8,8,-53,-6.88",
+      "referenceQuery": "shot&t=30&preset=golden&creature=0&cam=0,4.8,8,-53,-6.88",
+      "demoQuery": "shot&t=30&scene=golden&cam=0,4.8,8,-53,-6.88"
+    },
+    {
+      "set": "reference-md",
+      "name": "C3-golden",
+      "note": "docs/port/REFERENCE.md §5 camera C3 (anti-sun: sky reflection, lit foam, haze colour), golden, t = 30 s",
+      "scene": "golden",
+      "t": 30,
+      "cam": "0,4.8,8,127.02,-6.88",
+      "referenceQuery": "shot&t=30&preset=golden&creature=0&cam=0,4.8,8,127.02,-6.88",
+      "demoQuery": "shot&t=30&scene=golden&cam=0,4.8,8,127.02,-6.88"
+    },
+    {
+      "set": "reference-md",
+      "name": "C4-golden",
+      "note": "docs/port/REFERENCE.md §5 camera C4 (high: cascade tiling, foam streaks, LOD), golden, t = 30 s",
+      "scene": "golden",
+      "t": 30,
+      "cam": "0,60,8,0,-42.97",
+      "referenceQuery": "shot&t=30&preset=golden&creature=0&cam=0,60,8,0,-42.97",
+      "demoQuery": "shot&t=30&scene=golden&cam=0,60,8,0,-42.97"
+    },
+    {
+      "set": "reference-md",
+      "name": "C5-golden",
+      "note": "docs/port/REFERENCE.md §5 camera C5 (grazing: crest silhouettes, horizon, swell), golden, t = 30 s",
+      "scene": "golden",
+      "t": 30,
+      "cam": "0,1.2,8,-17.19,-1.15",
+      "referenceQuery": "shot&t=30&preset=golden&creature=0&cam=0,1.2,8,-17.19,-1.15",
+      "demoQuery": "shot&t=30&scene=golden&cam=0,1.2,8,-17.19,-1.15"
+    },
+    {
+      "set": "reference-md",
+      "name": "C6-golden",
+      "note": "docs/port/REFERENCE.md §5 camera C6 (close-down: fine cascade, normal detail, no tiling), golden, t = 30 s",
+      "scene": "golden",
+      "t": 30,
+      "cam": "20,3,-20,0,-68.75",
+      "referenceQuery": "shot&t=30&preset=golden&creature=0&cam=20,3,-20,0,-68.75",
+      "demoQuery": "shot&t=30&scene=golden&cam=20,3,-20,0,-68.75"
+    },
+    {
+      "set": "reference-md",
+      "name": "C7-golden",
+      "note": "docs/port/REFERENCE.md §5 camera C7 (underwater), golden, t = 30 s",
+      "scene": "golden",
+      "t": 30,
+      "cam": "0,-3,8,0,17.19",
+      "referenceQuery": "shot&t=30&preset=golden&creature=0&cam=0,-3,8,0,17.19",
+      "demoQuery": "shot&t=30&scene=golden&cam=0,-3,8,0,17.19"
+    },
+    {
+      "set": "reference-md",
+      "name": "C1-azure",
+      "note": "docs/port/REFERENCE.md §5 camera C1 (default start view), azure, t = 30 s",
+      "scene": "azure",
+      "t": 30,
+      "cam": "0,4.8,8,0,-16.04",
+      "referenceQuery": "shot&t=30&preset=azure&creature=0&cam=0,4.8,8,0,-16.04",
+      "demoQuery": "shot&t=30&scene=azure&cam=0,4.8,8,0,-16.04"
+    },
+    {
+      "set": "reference-md",
+      "name": "C2-azure",
+      "note": "docs/port/REFERENCE.md §5 camera C2 (towards the sun: glitter, crest glow, Fresnel), azure, t = 30 s",
+      "scene": "azure",
+      "t": 30,
+      "cam": "0,4.8,8,-53,-6.88",
+      "referenceQuery": "shot&t=30&preset=azure&creature=0&cam=0,4.8,8,-53,-6.88",
+      "demoQuery": "shot&t=30&scene=azure&cam=0,4.8,8,-53,-6.88"
+    },
+    {
+      "set": "reference-md",
+      "name": "C3-azure",
+      "note": "docs/port/REFERENCE.md §5 camera C3 (anti-sun: sky reflection, lit foam, haze colour), azure, t = 30 s",
+      "scene": "azure",
+      "t": 30,
+      "cam": "0,4.8,8,127.02,-6.88",
+      "referenceQuery": "shot&t=30&preset=azure&creature=0&cam=0,4.8,8,127.02,-6.88",
+      "demoQuery": "shot&t=30&scene=azure&cam=0,4.8,8,127.02,-6.88"
+    },
+    {
+      "set": "reference-md",
+      "name": "C4-azure",
+      "note": "docs/port/REFERENCE.md §5 camera C4 (high: cascade tiling, foam streaks, LOD), azure, t = 30 s",
+      "scene": "azure",
+      "t": 30,
+      "cam": "0,60,8,0,-42.97",
+      "referenceQuery": "shot&t=30&preset=azure&creature=0&cam=0,60,8,0,-42.97",
+      "demoQuery": "shot&t=30&scene=azure&cam=0,60,8,0,-42.97"
+    },
+    {
+      "set": "reference-md",
+      "name": "C5-azure",
+      "note": "docs/port/REFERENCE.md §5 camera C5 (grazing: crest silhouettes, horizon, swell), azure, t = 30 s",
+      "scene": "azure",
+      "t": 30,
+      "cam": "0,1.2,8,-17.19,-1.15",
+      "referenceQuery": "shot&t=30&preset=azure&creature=0&cam=0,1.2,8,-17.19,-1.15",
+      "demoQuery": "shot&t=30&scene=azure&cam=0,1.2,8,-17.19,-1.15"
+    },
+    {
+      "set": "reference-md",
+      "name": "C6-azure",
+      "note": "docs/port/REFERENCE.md §5 camera C6 (close-down: fine cascade, normal detail, no tiling), azure, t = 30 s",
+      "scene": "azure",
+      "t": 30,
+      "cam": "20,3,-20,0,-68.75",
+      "referenceQuery": "shot&t=30&preset=azure&creature=0&cam=20,3,-20,0,-68.75",
+      "demoQuery": "shot&t=30&scene=azure&cam=20,3,-20,0,-68.75"
+    },
+    {
+      "set": "reference-md",
+      "name": "C7-azure",
+      "note": "docs/port/REFERENCE.md §5 camera C7 (underwater), azure, t = 30 s",
+      "scene": "azure",
+      "t": 30,
+      "cam": "0,-3,8,0,17.19",
+      "referenceQuery": "shot&t=30&preset=azure&creature=0&cam=0,-3,8,0,17.19",
+      "demoQuery": "shot&t=30&scene=azure&cam=0,-3,8,0,17.19"
+    },
+    {
+      "set": "reference-md",
+      "name": "C1-storm",
+      "note": "docs/port/REFERENCE.md §5 camera C1 (default start view), storm, t = 30 s",
+      "scene": "storm",
+      "t": 30,
+      "cam": "0,4.8,8,0,-16.04",
+      "referenceQuery": "shot&t=30&preset=storm&creature=0&cam=0,4.8,8,0,-16.04",
+      "demoQuery": "shot&t=30&scene=storm&cam=0,4.8,8,0,-16.04"
+    },
+    {
+      "set": "reference-md",
+      "name": "C2-storm",
+      "note": "docs/port/REFERENCE.md §5 camera C2 (towards the sun: glitter, crest glow, Fresnel), storm, t = 30 s",
+      "scene": "storm",
+      "t": 30,
+      "cam": "0,4.8,8,-53,-6.88",
+      "referenceQuery": "shot&t=30&preset=storm&creature=0&cam=0,4.8,8,-53,-6.88",
+      "demoQuery": "shot&t=30&scene=storm&cam=0,4.8,8,-53,-6.88"
+    },
+    {
+      "set": "reference-md",
+      "name": "C3-storm",
+      "note": "docs/port/REFERENCE.md §5 camera C3 (anti-sun: sky reflection, lit foam, haze colour), storm, t = 30 s",
+      "scene": "storm",
+      "t": 30,
+      "cam": "0,4.8,8,127.02,-6.88",
+      "referenceQuery": "shot&t=30&preset=storm&creature=0&cam=0,4.8,8,127.02,-6.88",
+      "demoQuery": "shot&t=30&scene=storm&cam=0,4.8,8,127.02,-6.88"
+    },
+    {
+      "set": "reference-md",
+      "name": "C4-storm",
+      "note": "docs/port/REFERENCE.md §5 camera C4 (high: cascade tiling, foam streaks, LOD), storm, t = 30 s",
+      "scene": "storm",
+      "t": 30,
+      "cam": "0,60,8,0,-42.97",
+      "referenceQuery": "shot&t=30&preset=storm&creature=0&cam=0,60,8,0,-42.97",
+      "demoQuery": "shot&t=30&scene=storm&cam=0,60,8,0,-42.97"
+    },
+    {
+      "set": "reference-md",
+      "name": "C5-storm",
+      "note": "docs/port/REFERENCE.md §5 camera C5 (grazing: crest silhouettes, horizon, swell), storm, t = 30 s",
+      "scene": "storm",
+      "t": 30,
+      "cam": "0,1.2,8,-17.19,-1.15",
+      "referenceQuery": "shot&t=30&preset=storm&creature=0&cam=0,1.2,8,-17.19,-1.15",
+      "demoQuery": "shot&t=30&scene=storm&cam=0,1.2,8,-17.19,-1.15"
+    },
+    {
+      "set": "reference-md",
+      "name": "C6-storm",
+      "note": "docs/port/REFERENCE.md §5 camera C6 (close-down: fine cascade, normal detail, no tiling), storm, t = 30 s",
+      "scene": "storm",
+      "t": 30,
+      "cam": "20,3,-20,0,-68.75",
+      "referenceQuery": "shot&t=30&preset=storm&creature=0&cam=20,3,-20,0,-68.75",
+      "demoQuery": "shot&t=30&scene=storm&cam=20,3,-20,0,-68.75"
+    },
+    {
+      "set": "reference-md",
+      "name": "C7-storm",
+      "note": "docs/port/REFERENCE.md §5 camera C7 (underwater), storm, t = 30 s",
+      "scene": "storm",
+      "t": 30,
+      "cam": "0,-3,8,0,17.19",
+      "referenceQuery": "shot&t=30&preset=storm&creature=0&cam=0,-3,8,0,17.19",
+      "demoQuery": "shot&t=30&scene=storm&cam=0,-3,8,0,17.19"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  // Editor typing only: nothing is compiled with tsc. Node runs the .ts files with --experimental-strip-types
+  // and Vite strips types for the demo, so only erasable syntax is allowed.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["@webgpu/types"],
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true
+  },
+  "include": ["*.ts", "presets/**/*.ts", "three/**/*.ts", "demo/**/*.ts", "stubs/**/*.ts", "tests/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

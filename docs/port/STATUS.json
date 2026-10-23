@@ -1,0 +1,47 @@
+{
+  "updated": "2026-10-23",
+  "phase": "Wave 0 — foundations",
+  "summary": "Porting the FFT ocean from WebGL2 / three 0.180 to WebGPU / TSL on three r186 as the @dreamp/world-ocean engine module. Low tier first, then medium, high and ultra; each piece is built, then reviewed against the WebGL reference by a separate critic until it passes.",
+  "shots": [
+    { "label": "01 default view (storm scene)", "webgpu": "docs/port/shots/latest/01-default.png", "reference": "docs/port/reference-shots/01-default.png" },
+    { "label": "02 grazing view toward the sun", "webgpu": "docs/port/shots/latest/02-grazing-sun.png", "reference": "docs/port/reference-shots/02-grazing-sun.png" },
+    { "label": "03 high view looking down", "webgpu": "docs/port/shots/latest/03-high-down.png", "reference": "docs/port/reference-shots/03-high-down.png" },
+    { "label": "06 sunset", "webgpu": "docs/port/shots/latest/06-sunset.png", "reference": "docs/port/reference-shots/06-sunset.png" }
+  ],
+  "pieces": [
+    { "name": "Infra: package scaffold, contract stubs, demo shell, capture harness, reference captures", "status": "done", "rounds": 0, "verdict": "Headless Edge gets the RTX 2070 WebGPU adapter; 27 reference shots captured; demo shell renders via WebGPU" },
+    { "name": "Core: JONSWAP spectrum, CPU FFT, WATER_QUERY, presets, Node tests", "status": "building", "rounds": 0 },
+    { "name": "Reference analysis of the WebGL ocean (feature checklist)", "status": "done", "rounds": 0, "verdict": "27-item visual checklist F1–F27, 7 canonical cameras; reference Hs 2.18 / 2.58 / 4.07 m" },
+    { "name": "GPU FFT in TSL compute (low tier)", "status": "pending", "rounds": 0 },
+    { "name": "Camera-relative LOD mesh + floating origin", "status": "building", "rounds": 0 },
+    { "name": "Water material: reflection, sun, body colour, SSS", "status": "pending", "rounds": 0 },
+    { "name": "Foam from Jacobian", "status": "pending", "rounds": 0 },
+    { "name": "Refraction / depth", "status": "pending", "rounds": 0 },
+    { "name": "Motion vectors (previous position node)", "status": "pending", "rounds": 0 },
+    { "name": "GPU readback parity (?parity)", "status": "pending", "rounds": 0 },
+    { "name": "Medium / high / ultra tiers + async tier switch", "status": "pending", "rounds": 0 },
+    { "name": "Docs: README, TUNING, HANDOFF", "status": "pending", "rounds": 0 }
+  ],
+  "perf": [
+    { "name": "WebGL reference, default storm view (uncapped)", "fps": "271", "cpuMs": "3.69 mean frame", "notes": "p95 17.1 ms from wave texture rebuild spikes; no GPU timestamps in WebGL" },
+    { "name": "WebGL reference, high view looking down (uncapped)", "fps": "156", "cpuMs": "6.42 mean frame", "notes": "p95 18.2 ms" }
+  ],
+  "checks": [
+    { "id": 1, "name": "Runs on WebGPU, three r186, no WebGL/GLSL/ShaderMaterial", "status": "pending" },
+    { "id": 2, "name": "Core runs in Node; tests pass; no three import outside three/ and demo/", "status": "pending" },
+    { "id": 3, "name": "Determinism: same seed + time → identical heights", "status": "pending" },
+    { "id": 4, "name": "Presets change Hs measurably (calm → storm)", "status": "pending" },
+    { "id": 5, "name": "Wind coupling changes spectrum, blends without pops", "status": "pending" },
+    { "id": 6, "name": "CPU = GPU: ?parity max error < 2 % of Hs", "status": "pending" },
+    { "id": 7, "name": "Far from origin (100 km): identical surface, parity passes", "status": "pending" },
+    { "id": 8, "name": "Up is not hardcoded (rotated-frame test)", "status": "pending" },
+    { "id": 9, "name": "Motion vectors correct in velocity debug view", "status": "pending" },
+    { "id": 10, "name": "No per-frame allocation (heap flat)", "status": "pending" },
+    { "id": 11, "name": "Cost table per tier in TUNING.md", "status": "pending" },
+    { "id": 12, "name": "Licence files present", "status": "pending" }
+  ],
+  "issues": [],
+  "log": [
+    { "time": "Wave 0", "text": "Read the spec, surveyed the WebGL reference, started infra, core and reference-analysis agents in parallel." }
+  ]
+}

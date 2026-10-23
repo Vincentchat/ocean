@@ -1,0 +1,22 @@
+{
+  "id": "world/ocean",
+  "package": "@dreamp/world-ocean",
+  "name": "Ocean",
+  "category": "world",
+  "version": "0.1.0",
+  "status": "experimental",
+  "summary": "FFT ocean: JONSWAP spectrum, cascades, foam; CPU water query matching the GPU surface; calm to storm presets.",
+  "entry": "index.ts",
+  "three": "three/index.ts",
+  "dependsOn": ["world/core"],
+  "worksWith": ["rendering/render-graph"],
+  "provides": ["WATER_QUERY"],
+  "requires": [],
+  "optional": ["WIND_QUERY", "ENVIRONMENT", "TERRAIN_QUERY", "TERRAIN_GPU", "SKY_LIGHT"],
+  "contract": "^0.10",
+  "tickPhases": ["simulate"],
+  "targets": ["desktop"],
+  "renderer": "webgpu",
+  "platform": ["any"],
+  "devDependencies": []
+}

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>world/ocean — WebGPU demo</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #05141a; color: #d6e6e1; overflow: hidden;
+        font: 13px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; }
+      #scene { position: fixed; inset: 0; }
+      #scene canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+      #ui { position: fixed; top: 12px; left: 12px; display: flex; flex-direction: column; gap: 8px;
+        background: #071d24cc; border: 1px solid #2b4b52; border-radius: 8px; padding: 10px 12px; min-width: 240px; }
+      #ui h1 { font-size: 13px; margin: 0; letter-spacing: .06em; font-weight: 600; }
+      #ui .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+      #ui button, #ui select { background: #0d2c35; color: inherit; border: 1px solid #2b4b52; border-radius: 5px;
+        padding: 3px 8px; font: inherit; cursor: pointer; }
+      #ui button.active { background: #2c6a73; border-color: #6bb4ba; }
+      #ui .label { opacity: .65; min-width: 44px; }
+      #stats { font: 12px/1.3 ui-monospace, Consolas, monospace; white-space: pre; }
+      #help { opacity: .6; font-size: 11px; }
+      #fatal { position: fixed; inset: 0; display: grid; place-items: center; text-align: center; padding: 24px;
+        background: #05141a; }
+      #fatal h2 { font-size: 22px; margin: 0 0 8px; }
+      #fatal[hidden], body.hide-ui #ui, body.shot #ui { display: none; }
+    </style>
+  </head>
+  <body>
+    <main id="scene" aria-label="Ocean view. Drag to look, WASD/QE to move, Shift to boost, wheel for speed."></main>
+    <section id="ui">
+      <h1>WORLD/OCEAN · WebGPU</h1>
+      <div id="stats">starting…</div>
+      <div class="row"><span class="label">Ocean</span>
+        <button data-preset="calm">calm</button><button data-preset="breeze">breeze</button
+        ><button data-preset="windy">windy</button><button data-preset="storm">storm</button>
+      </div>
+      <div class="row"><span class="label">Sky</span>
+        <button data-sky="golden">golden</button><button data-sky="azure">azure</button><button data-sky="storm">storm</button>
+      </div>
+      <div class="row"><span class="label">Tier</span>
+        <select id="tier"><option>low</option><option>medium</option><option selected>high</option><option>ultra</option></select>
+        <button id="pause" type="button">pause</button>
+      </div>
+      <div id="help">drag look · WASD/QE move · Shift boost · wheel speed · Space pause · H hide UI</div>
+    </section>
+    <div id="fatal" hidden role="alert"><div><h2 id="fatal-title">WebGPU required</h2><p id="fatal-body"></p></div></div>
+    <script type="module" src="./demo.ts"></script>
+  </body>
+</html>
