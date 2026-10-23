@@ -41,11 +41,12 @@
 // Sphere: the grid is laid flat in the tangent plane at the foot (curvature not applied yet).
 import { BufferAttribute, BufferGeometry, Matrix4, Mesh, Sphere, Vector2, Vector3, Vector4 } from 'three/webgpu';
 import {
-  abs, clamp, float, floor, int, length, max, normalize, positionGeometry, select, uniform, uniformArray, vec2, vec3,
+  abs, cameraFar, clamp, float, floor, int, length, max, min, cameraViewMatrix, modelWorldMatrix, normalize, positionGeometry, select,
+  uniform, uniformArray, vec2, vec3, vec4,
 } from 'three/tsl';
 import type { FloatingOrigin, TangentFrame, Vec3, WorldShape } from '../stubs/world-core.ts';
 import {
-  MAX_LOD_LEVELS, buildLodGeometry, createLodState, lodDrawCount, lodParams, tileAnchor, updateLodState,
+  MAX_LOD_LEVELS, buildLodGeometry, createLodState, lodGeometrySteps, lodDrawCount, lodParams, tileAnchor, updateLodState,
   type LodGeometryData, type LodParams, type LodState, type LodTier,
 } from './lod-math.ts';
 
@@ -85,7 +86,8 @@ export interface OceanLodStats {
   spacing0: number;
   /** Max-norm reach of the last drawn ring, m (skirt beyond). */
   ringReach: number;
-  skirtRadius: number;
+  /** Tier being built in the background (old tier still drawn), or null. */
+  pendingTier: LodTier | null;
 }
 
 export interface OceanLod {
@@ -95,7 +97,9 @@ export interface OceanLod {
   readonly state: Readonly<LodState>;
   /** Allocation-free. Call once per frame after the camera's matrixWorld is current. */
   update(camera: any, origin?: FloatingOrigin): void;
+  /** Starts building the tier in time slices inside update(); the old tier stays drawn until the atomic swap. */
   setTier(tier: LodTier): void;
+  readonly pendingTier: LodTier | null;
   stats(out?: OceanLodStats): OceanLodStats;
   /** Debug/test hooks: offset the LOD's notion of the camera foot (m, east/south), disable snapping. */
   readonly debug: { footOffsetU: number; footOffsetV: number; noSnap: boolean };
@@ -131,7 +135,6 @@ export function createOceanLod(opts: OceanLodOptions): OceanLod {
   const uMorphA = uniform(params.morphStart);
   const uMorphB = uniform(params.morphEnd);
   const uHalfHole = uniform(params.halfCells / 2);
-  const uSkirtRadius = uniform(10000);                   // m
   const uCamHeight = uniform(0);                         // camera altitude above the foot (m)
 
   // ------------------------------------------------------------------------------------ vertex nodes
@@ -155,15 +158,36 @@ export function createOceanLod(opts: OceanLodOptions): OceanLod {
   const half = uHalfHole.mul(Pa.z);
   const q2 = select(A.w.greaterThan(0.5), clamp(q1, Pa.xy.sub(half), Pa.xy.add(half)), q1);
   const pg = q2.sub(uPhi);
+  // Horizon closure (skirt kinds 2, 3), per rendering camera, independent of the CPU: the outer loop is put ON the
+  // camera's far plane (view depth 0.999 far; 1e6 m when far is infinite / huge). Kind 3 sits at eye level, so it
+  // projects exactly onto the true horizon line (a point at infinity mapped onto the far plane, since a positionNode
+  // cannot emit w = 0); kind 2 is the flat sea-level annulus edge at 0.995 of that depth. The closure therefore only
+  // occupies the last 0.5 % of the view depth range: it hides nothing nearer than 0.995 far.
   const outer = kind.greaterThan(1.5);
-  const pOut = normalize(pg).mul(uSkirtRadius);
+  const top = kind.greaterThan(2.5);
+  const dirH = normalize(pg);
+  // (cameraViewMatrix * modelWorldMatrix inline: the shared modelViewMatrix node gets emitted as a variable assigned
+  // inside whichever branch references it first, leaving it unset for the other vertices.)
+  const vdir = cameraViewMatrix.mul(modelWorldMatrix.mul(vec4(dirH.x, 0, dirH.y, 0))).xyz;
+  const cosView = max(vdir.z.negate(), 0.2); // cos(angle to the view axis); directions > 78 deg off-axis are off-screen
+  const tFar = min(cameraFar.mul(0.999), 1e6).div(cosView);
+  const pOut = dirH.mul(select(top, tFar, tFar.mul(0.995)));
   const pl = select(outer, pOut, pg);
   const ql = select(outer, pOut.add(uPhi), q2);
-  const y = select(kind.greaterThan(2.5), uCamHeight, float(0));
+  const y = select(top, uCamHeight, float(0));
   const localPos = vec3(pl.x, y, pl.y);
-  const previousLocalPos = localPos.add(vec3(uDFoot.x, 0, uDFoot.y));
+  // Previous frame (motion vectors): the same WORLD point in last frame's local frame. Grid vertices: lattice point
+  // minus last frame's foot, with LAST frame's morph (morph depends on the camera). Horizon closure: camera-attached
+  // (at infinity), so its previous local position is its current one.
+  const phiPrev = uPhi.sub(uDFoot);
+  const p0Prev = q0.sub(phiPrev);
+  const morphPrev = clamp(max(abs(p0Prev.x), abs(p0Prev.y)).div(s).sub(uMorphA).div(uMorphB.sub(uMorphA)), 0, 1).mul(A.w);
+  const q1Prev = q0.sub(odd.mul(s).mul(morphPrev));
+  const q2Prev = select(A.w.greaterThan(0.5), clamp(q1Prev, Pa.xy.sub(half), Pa.xy.add(half)), q1Prev);
+  const pPrev = q2Prev.sub(phiPrev);
+  const previousLocalPos = select(outer, localPos, vec3(pPrev.x, 0, pPrev.y));
   const distanceToCamera = length(vec3(pl.x, y.sub(uCamHeight), pl.y));
-  const cellSize = select(skirt, uSkirtRadius.mul(0.05), s.mul(morph.add(1)));
+  const cellSize = select(skirt, distanceToCamera.mul(0.05), s.mul(morph.add(1)));
   const isSkirt = select(skirt, float(1), float(0));
   const level = select(skirt, float(-1), levelAttr);
   const cameraLocal = vec3(0, uCamHeight, 0);
@@ -227,7 +251,9 @@ export function createOceanLod(opts: OceanLodOptions): OceanLod {
     const fu = footW.x * E.x + footW.y * E.y + footW.z * E.z + debug.footOffsetU;
     const fv = footW.x * south.x + footW.y * south.y + footW.z * south.z + debug.footOffsetV;
     state.noSnap = debug.noSnap;
-    updateLodState(state, params, fu, fv, h, advance);
+    // Rings must stay well inside the far plane (the horizon closure lives at 0.995..0.999 far): limit the max-norm
+    // reach to 0.6 far (corner 0.85 far). Infinite / huge far: no limit.
+    updateLodState(state, params, fu, fv, h, advance, Number.isFinite(lastFar) ? 0.6 * lastFar : Infinity);
 
     origin.toRender(footW, footR);
     footR.x += E.x * debug.footOffsetU + south.x * debug.footOffsetV;
@@ -244,18 +270,42 @@ export function createOceanLod(opts: OceanLodOptions): OceanLod {
     (uDFoot.value as Vector2).set(state.dFootU, state.dFootV);
     uLast.value = state.drawnLevels - 1;
     uCamHeight.value = h;
-    const reach = (params.halfCells + params.margin) * state.spacing0 * 2 ** (state.drawnLevels - 1);
-    // Skirt edge inside the far plane (wall top at eye level projects onto the horizon line).
-    uSkirtRadius.value = Math.max(0.9 * lastFar, 1.5 * Math.SQRT2 * reach);
     geometry.setDrawRange(0, lodDrawCount(state, data));
     updateAnchors();
+  }
+
+  // ---------------------------------------------------------------------------------- tier change (no stall)
+  // The new tier's geometry is generated in time slices (BUILD_BUDGET_MS per update) while the old tier stays on
+  // screen, then swapped atomically (geometry + morph uniforms + params in the same update).
+  const BUILD_BUDGET_MS = 2;
+  let pending: { params: LodParams; it: Generator<void, LodGeometryData, void> } | null = null;
+  function stepPending() {
+    if (!pending) return;
+    const t0 = performance.now();
+    let r = pending.it.next();
+    while (!r.done && performance.now() - t0 < BUILD_BUDGET_MS) r = pending.it.next();
+    if (!r.done) return;
+    params = pending.params;
+    pending = null;
+    data = r.value;
+    const old = geometry;
+    geometry = makeGeometry(data);
+    mesh.geometry = geometry;
+    old.dispose();
+    uMorphA.value = params.morphStart;
+    uMorphB.value = params.morphEnd;
+    uHalfHole.value = params.halfCells / 2;
+    state.log2Spacing = NaN;
   }
 
   function update(camera: any, org?: FloatingOrigin) {
     if (org) origin = org;
     const e = camera.matrixWorld.elements;
     camR.x = e[12]; camR.y = e[13]; camR.z = e[14];
-    if (typeof camera.far === 'number' && camera.far > 0) lastFar = camera.far;
+    // camera.far only limits how many rings are drawn (they must stay inside the far plane); the horizon closure
+    // itself reads the rendering camera's far in the shader (cameraFar), so other cameras/passes stay correct.
+    lastFar = typeof camera.far === 'number' && camera.far > 0 ? camera.far : Infinity;
+    stepPending();
     updateFromRender(true);
   }
 
@@ -274,19 +324,12 @@ export function createOceanLod(opts: OceanLodOptions): OceanLod {
     update,
     debug,
     setTier(tier: LodTier) {
+      if (pending) { if (pending.params.tier === tier) return; pending = null; }
       if (tier === params.tier) return;
-      params = lodParams(tier, { coverage: opts.coverage });
-      data = buildLodGeometry(params);
-      const old = geometry;
-      geometry = makeGeometry(data);
-      mesh.geometry = geometry;
-      old.dispose();
-      uMorphA.value = params.morphStart;
-      uMorphB.value = params.morphEnd;
-      uHalfHole.value = params.halfCells / 2;
-      state.log2Spacing = NaN;
-      if (state.hasPrev) updateFromRender(false);
+      const p = lodParams(tier, { coverage: opts.coverage });
+      pending = { params: p, it: lodGeometrySteps(p) };
     },
+    get pendingTier() { return pending ? pending.params.tier : null; },
     stats(out?: OceanLodStats): OceanLodStats {
       const o = out ?? ({} as OceanLodStats);
       o.tier = params.tier;
@@ -296,7 +339,7 @@ export function createOceanLod(opts: OceanLodOptions): OceanLod {
       o.drawnLevels = state.drawnLevels;
       o.spacing0 = state.spacing0;
       o.ringReach = (params.halfCells + params.margin) * state.spacing0 * 2 ** (state.drawnLevels - 1);
-      o.skirtRadius = uSkirtRadius.value as number;
+      o.pendingTier = pending ? pending.params.tier : null;
       return o;
     },
     dispose() {

@@ -1,0 +1,70 @@
+{
+  "label": null,
+  "url": "http://127.0.0.1:5185/demo/?tier=ultra&scene=storm&cam=0,4.8,8,0,-16.04",
+  "date": "2026-10-23T18:07:11.888Z",
+  "adapter": {
+    "vendor": "nvidia",
+    "architecture": "turing",
+    "description": "NVIDIA GeForce RTX 2070"
+  },
+  "webglRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 (0x00001F02) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "viewport": [
+    1920,
+    1080
+  ],
+  "canvas": [
+    1920,
+    1080
+  ],
+  "vsync": false,
+  "framesSampled": 1598,
+  "fps": 568.8,
+  "frameMs": {
+    "mean": 1.758,
+    "p50": 1.3,
+    "p95": 4.5,
+    "p99": 7.2,
+    "min": 0.1,
+    "max": 17.7,
+    "n": 1598
+  },
+  "cpuMs": {
+    "mean": 1.156,
+    "p50": 0.8,
+    "p95": 3.5,
+    "p99": 5.3,
+    "min": 0.1,
+    "max": 10.2,
+    "n": 1598
+  },
+  "gpuMs": {
+    "mean": 1.117,
+    "p50": 1.117,
+    "p95": 1.117,
+    "p99": 1.124,
+    "min": 1.115,
+    "max": 1.124,
+    "n": 1024
+  },
+  "gpuRenderMs": {
+    "mean": 1.117,
+    "p50": 1.117,
+    "p95": 1.117,
+    "p99": 1.124,
+    "min": 1.115,
+    "max": 1.124,
+    "n": 1024
+  },
+  "gpuComputeMs": null,
+  "demoCpuMs": {
+    "mean": 1.229,
+    "p50": 0.9,
+    "p95": 3.6,
+    "p99": 5.1,
+    "min": 0.1,
+    "max": 10.2,
+    "n": 1024
+  },
+  "tier": "ultra",
+  "consoleErrors": 0
+}

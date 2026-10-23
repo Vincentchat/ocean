@@ -19,7 +19,7 @@ function probes(count: number, seed: number, span: number): Float64Array {
 }
 
 test('WorldSystem shape: id, provides WATER_QUERY, optional keys, simulate phase; install provides the query', () => {
-  const ocean = createOcean({ preset: 'breeze', seed: 1 });
+  const ocean = createOcean({ preset: 'windy', seed: 1 });
   assert.equal(ocean.id, 'world/ocean');
   assert.deepEqual(ocean.provides!.map((k) => k.id), ['WATER_QUERY']);
   assert.deepEqual(ocean.optional!.map((k) => k.id), ['WIND_QUERY', 'ENVIRONMENT', 'TERRAIN_QUERY', 'TERRAIN_GPU', 'SKY_LIGHT']);
@@ -82,7 +82,7 @@ test('wind coupling: WIND_QUERY drives the spectrum, regenerates + crossfades wi
   const world = createStubWorld({ shape });
   const wind = createStubWind(15, -57.29578, shape); // = the breeze preset's wind (-1 rad)
   world.provide(WIND_QUERY, wind);
-  const ocean = createOcean({ preset: 'breeze', blendTime: 4, windTimeConstant: 4 });
+  const ocean = createOcean({ preset: 'windy', blendTime: 4, windTimeConstant: 4 });
   world.use(ocean); world.start();
   const st = ocean.getState();
   const v0 = st.version;
@@ -147,7 +147,7 @@ test('setPreset crossfades (calm -> storm) and immediate switches at once', () =
   assert.equal(st.blend, 1, 'crossfade finished');
   assert.equal(st.slots[st.toSlot].params.windSpeed, PRESETS.storm.params.windSpeed);
   assert.ok(ocean.expectedHs() > 5 * hsCalm);
-  ocean.setPreset('breeze', true);
+  ocean.setPreset('windy', true);
   assert.equal(ocean.getState().slots[ocean.getState().toSlot].params.windSpeed, 15);
 });
 
@@ -189,7 +189,7 @@ test('far from the anchor: the surface repeats every 9216 m (lcm of the tiles), 
 });
 
 test('velocityAt = time derivative of the displaced surface point (analytic vs finite difference)', () => {
-  const ocean = createOcean({ shape, preset: 'breeze' });
+  const ocean = createOcean({ shape, preset: 'windy' });
   const a = rest(), b = rest(), c = rest();
   const pts = probes(60, 9, 1000);
   const t = 7.3, h = 1e-3;

@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  LOD_KIND_GRID, LOD_TIER_TABLE, buildLodGeometry, createLodState, emulateVertex, lodDrawCount, lodParams,
+  LOD_KIND_GRID, LOD_TIER_TABLE, buildLodGeometry, createLodState, emulateVertex, lodDrawCount, lodGeometrySteps, lodParams,
   tileAnchor, updateLodState, wrapPeriod, type EmulatedVertex, type LodGeometryData, type LodParams, type LodState,
   type LodTier,
 } from '../three/lod-math.ts';
@@ -36,6 +36,42 @@ test('geometry: counts, index range, draw ranges', () => {
     const drawnVerts = 3 * 8 * (p.halfCells + p.margin) + g.levelVertexCount.slice(0, st.drawnLevels).reduce((a, b) => a + b, 0);
     console.log(`  ${tier}: M=${p.halfCells} levels=${p.levels} vertices=${g.vertexCount} triangles=${g.triangleCount}` +
       ` | h=4.8 m: s0=${st.spacing0} m, drawn levels=${st.drawnLevels}, drawn vertices~${drawnVerts}, drawn triangles=${lodDrawCount(st, g) / 3}`);
+  }
+});
+
+test('tier change: time-sliced builder == one-shot builder, and no slice is long', () => {
+  for (const tier of TIERS) {
+    const p = lodParams(tier);
+    const ref = geom(tier).g;
+    const it = lodGeometrySteps(p);
+    let r = it.next(), slices = 0, worst = 0;
+    while (!r.done) {
+      const t0 = performance.now();
+      r = it.next();
+      worst = Math.max(worst, performance.now() - t0);
+      slices++;
+    }
+    const g = r.value;
+    assert.deepEqual(Array.from(g.levelIndexEnd), Array.from(ref.levelIndexEnd));
+    assert.ok(Buffer.compare(Buffer.from(g.index.buffer), Buffer.from(ref.index.buffer)) === 0, 'index differs');
+    assert.ok(Buffer.compare(Buffer.from(g.packed.buffer), Buffer.from(ref.packed.buffer)) === 0, 'packed differs');
+    console.log(`  ${tier}: ${slices} slices, longest single step ${worst.toFixed(3)} ms (budget per frame: 2 ms)`);
+    assert.ok(worst < 4, `a single build step took ${worst} ms`);
+  }
+});
+
+test('finite far plane: drawn rings never reach past maxReach (rings dropped, coverage yields)', () => {
+  for (const tier of TIERS) {
+    const { p } = geom(tier);
+    for (const far of [3000, 5000, 20000]) {
+      for (const h of [1.2, 4.8, 60, 400]) {
+        const st = createLodState();
+        updateLodState(st, p, 123.4, -567.8, h, true, 0.6 * far);
+        const reach = (p.halfCells + p.margin) * st.spacing0 * 2 ** (st.drawnLevels - 1);
+        assert.ok(st.drawnLevels === 1 || reach <= 0.6 * far, `${tier} far=${far} h=${h}: reach ${reach}`);
+        assert.ok(reach * Math.SQRT2 < 0.995 * 0.999 * far, `${tier} far=${far} h=${h}: ring corner ${reach * Math.SQRT2} beyond the horizon closure`);
+      }
+    }
   }
 });
 
@@ -191,8 +227,12 @@ test('update is allocation-free (heap stays flat)', () => {
   const { p } = geom('ultra');
   const st = createLodState();
   for (let i = 0; i < 1000; i++) updateLodState(st, p, i * 0.37, -i * 0.11, 4.8 + (i % 50));
-  const before = process.memoryUsage().heapUsed;
-  for (let i = 0; i < 300000; i++) updateLodState(st, p, 1e7 + i * 0.37, -i * 0.11, 4.8 + (i % 500));
-  const grown = process.memoryUsage().heapUsed - before;
-  assert.ok(grown < 2e6, `heap grew ${grown} bytes`);
+  // Background GC of earlier tests' big arrays makes single windows noisy: take the best of 3 windows.
+  let grown = Infinity;
+  for (let w = 0; w < 3; w++) {
+    const before = process.memoryUsage().heapUsed;
+    for (let i = 0; i < 300000; i++) updateLodState(st, p, 1e7 + i * 0.37, -i * 0.11, 4.8 + (i % 500), true, 0.6 * 5000);
+    grown = Math.min(grown, process.memoryUsage().heapUsed - before);
+  }
+  assert.ok(grown < 2e5, `heap grew ${grown} bytes over 300k updates`);
 });

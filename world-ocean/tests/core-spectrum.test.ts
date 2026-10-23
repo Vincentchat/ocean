@@ -22,8 +22,8 @@ function referenceParams(g: number, amplitude = 1): SpectrumParams {
   };
 }
 
-test('breeze preset = reference parameters (U 15 m/s, peak 47 m, gamma 3.3, spread 1.57, standing .13, chop 1.5, amp 1.578)', () => {
-  const p = PRESETS.breeze.params;
+test('windy preset = reference parameters (U 15 m/s, peak 47 m, gamma 3.3, spread 1.57, standing .13, chop 1.5, amp 1.578)', () => {
+  const p = PRESETS.windy.params;
   assert.equal(p.windSpeed, 15);
   assert.equal(p.windDirection, -1);
   assert.ok(Math.abs(peakWavelength(p.windSpeed, p.fetch, 9.80665) - 47) < 1e-3);

@@ -7,10 +7,9 @@
 // the world origin (createOcean anchor 0), which is what tileCoord measures from.
 // Motion vectors: previousPositionNode = lod.nodes.previousLocalPos + the PREVIOUS frame's displacement (the FFT
 // keeps last frame's displacement layers = the field at time - frameDt), same lookup.
-// Shading (TEMPORARY simple lit material; the real material builder replaces it): per-fragment normal from the
-// FFT normal textures (reference spectralSurface: chained, footprint LOD from d(rest)/d(screen)), roughness from
-// the mip shortening, Fresnel env reflection, deep-water body colour, grey whitecaps from the Jacobian
-// compression, Gaussian distance haze (reference §2.11). Radiance x preExposure, no tonemap.
+// Shading: three/material.ts (createOceanMaterial), the full port of the reference water fragment shader, lit only
+// through SKY_LIGHT / ENVIRONMENT (+ env map). Hooks: foamCoverage, transmission (refraction), haze, waveScale.
+// Radiance x preExposure, no tonemap.
 //
 // Debug views (opts.debug, comma separated; demo ?debug=...):
 //   lod        level colours (hue per level, darker = geomorph), lit by facet normals, wireframe overlay,
@@ -22,11 +21,11 @@
 //   velocity   screen-space motion of the displaced surface (current - previous position), |NDC v| x 200 per frame.
 import { DoubleSide, FrontSide, Mesh, MeshBasicNodeMaterial } from 'three/webgpu';
 import {
-  abs, cameraPosition, cameraProjectionMatrix, cameraViewMatrix, clamp, cross, dFdx, dFdy, dot, exp, float, floor,
-  max, mix, modelWorldMatrix, normalize, pmremTexture, pow, positionWorld, reflect, smoothstep, sqrt, uniform,
-  varying, vec3, vec4,
+  abs, cameraPosition, cameraProjectionMatrix, cameraViewMatrix, clamp, cross, dFdx, dFdy, dot, float, floor,
+  max, modelWorldMatrix, normalize, pow, positionWorld, smoothstep, uniform, varying, vec3, vec4,
 } from 'three/tsl';
-import type { FloatingOrigin, SkyLight, Vec3, WorldShape } from '../stubs/world-core.ts';
+import type { EnvironmentState, FloatingOrigin, SkyLight, Vec3, WorldShape } from '../stubs/world-core.ts';
+import { createOceanMaterial, type OceanMaterial, type OceanMaterialOptions } from './material.ts';
 import type { Pass, PassContext } from './pass-types.ts';
 import { createOceanLod, type OceanLod } from './lod.ts';
 import { createOceanFft, createFftSampling, FFT_CASCADES, type OceanFft, type FftOceanSource } from './fft.ts';
@@ -37,6 +36,8 @@ export { createOceanLod } from './lod.ts';
 export type { OceanLod, OceanLodNodes, OceanLodOptions, OceanLodStats } from './lod.ts';
 export { createOceanFft, createFftSampling, FFT_TIERS, FFT_CASCADES, BASE_SIZE, FINE_DOMAIN } from './fft.ts';
 export type { OceanFft, FftSampling, FftSampleOptions, FftSurfaceSample, FftTierConfig } from './fft.ts';
+export { createOceanMaterial } from './material.ts';
+export type { OceanMaterial, OceanMaterialOptions, OceanFoamContext } from './material.ts';
 
 export type OceanTier = 'low' | 'medium' | 'high' | 'ultra';
 
@@ -57,12 +58,19 @@ export interface OceanGpuOptions {
   shape?: WorldShape;
   tier?: OceanTier;
   skyLight?: SkyLight;
+  /** ENVIRONMENT state (sunDir, cloudCover). */
+  environment?: EnvironmentState;
   /** PMREM (CubeUV) env texture, linear HDR. */
   envMap?: any;
   /** Multiply env samples by this to get cd/m^2 (demo: REF_NITS). Default 1. */
   envIntensity?: number;
   /** TSL uniform node (or number) multiplied into the written radiance. Default 1. */
   preExposure?: any;
+  /** Material hooks (three/material.ts): foam coverage, refraction transmission, distance haze, crest normaliser. */
+  foamCoverage?: OceanMaterialOptions['foamCoverage'];
+  transmission?: OceanMaterialOptions['transmission'];
+  haze?: OceanMaterialOptions['haze'];
+  waveScale?: number;
   perf?: PerfSink;
   /** Demo debug view name (?debug=). */
   debug?: string;
@@ -131,13 +139,13 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
   const toFrag = positionWorld.sub(cameraPosition);
   const dist = toFrag.length();
   const V = toFrag.div(max(dist, 1e-4));
-  const envAt = (dir: any, rough: any) => (opts.envMap ? pmremTexture(opts.envMap, dir, rough).rgb : vec3(0.3, 0.45, 0.6));
   const facetN = (() => {
     const nf = normalize(cross(dFdx(positionWorld), dFdy(positionWorld)));
     return nf.mul(dot(nf, V).greaterThan(0).select(float(-1), float(1))); // face the viewer
   })();
 
   let material: any;
+  let water: OceanMaterial | null = null;
   let overlay: any = null;
   let savedBackground: any;
   const isLod = dbg.has('lod'), isFacets = dbg.has('facets');
@@ -183,33 +191,14 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
     const vel = varying(c0.xy.div(c0.w).sub(c1.xy.div(c1.w)));
     material.colorNode = vec3(abs(vel.x).mul(200), abs(vel.y).mul(200), 0.05).mul(envIntensity).mul(preExposure);
   } else {
-    material = new MeshBasicNodeMaterial({ side: DoubleSide });
-    material.name = 'ocean.fft.simple';
-    // Fragment surface from the FFT normal textures at the (world-periodic) rest tile coordinates.
-    const restLocal = varying(n.localPos.xz);
-    const footprint = max(max(abs(dFdx(restLocal.x)), abs(dFdx(restLocal.y))), max(abs(dFdy(restLocal.x)), abs(dFdy(restLocal.y))));
-    const tileV = new Map<number, any>(FFT_CASCADES.map((c) => [c.domain, varying(n.tileCoord(c.domain))] as [number, any]));
-    const tileF = (P: number) => tileV.get(P);
-    const surf = sampling.sampleSurface(tileF, { footprint });
-    let N: any = normalize(modelWorldMatrix.mul(vec4(surf.normal, 0)).xyz);
-    N = normalize(N.add(V.negate().mul(max(float(0.025).sub(dot(N, V.negate())), 0)))); // keep N facing the viewer
-    const NoV = clamp(dot(N, V.negate()), 0.015, 1);
-    const fresnel = float(0.018).add(float(0.982).mul(pow(float(1).sub(NoV), 5)));
-    const rough = clamp(float(0.018).add(surf.variance.mul(0.8))
-      .add(sqrt(float(1).add(fft.uniforms.unresolvedSlopeVariance)).sub(1).mul(0.8)), 0.018, 0.8);
-    const deep = vec3(0.0159963, 0.0612461, 0.0998987);
-    const sky = envAt(reflect(V, N), clamp(rough.add(0.22), 0, 1));
-    const diffuse = envAt(upW, float(1));
-    let color: any = mix(deep.mul(diffuse).mul(0.8), sky, fresnel);
-    // Whitecaps (simple): grey foam where the surface compresses (reference foam source smoothstep(.15,.5,c)).
-    const foam = smoothstep(0.4, 1.0, surf.compression).mul(0.5);
-    color = mix(color, diffuse.mul(0.6), foam);
-    // Gaussian distance haze towards the env colour just above the horizon (reference §2.11).
-    const horiz = toFrag.sub(upW.mul(dot(toFrag, upW)));
-    const hazeDir = normalize(horiz.add(upW.mul(dist.mul(0.002))));
-    const haze = float(1).sub(exp(dist.div(280).pow(2).negate()));
-    color = mix(color, envAt(hazeDir, float(0)), haze);
-    material.colorNode = color.mul(envIntensity).mul(preExposure);
+    // The water material (three/material.ts): every shading term of the reference fragment shader.
+    water = createOceanMaterial({
+      fft, sampling, nodes: n, positionNode, displacement: disp,
+      skyLight: opts.skyLight, environment: opts.environment, envMap: opts.envMap, envIntensity: opts.envIntensity ?? 1,
+      preExposure, foamCoverage: opts.foamCoverage, transmission: opts.transmission, haze: opts.haze,
+      waveScale: opts.waveScale, ocean: opts.ocean as any,
+    });
+    material = water.material;
   }
   material.positionNode = positionNode;
   lod.mesh.material = material;
@@ -224,6 +213,7 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
       opts.perf?.begin('world/ocean', 'ocean.lod');
       lod.update(camera);
       if (overlay && overlay.geometry !== lod.mesh.geometry) overlay.geometry = lod.mesh.geometry;
+      water?.update();
       opts.perf?.end();
       fft.pass.execute(ctx);
     },

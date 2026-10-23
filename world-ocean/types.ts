@@ -51,6 +51,13 @@ export interface SimParams {
   inversionTolerance: number;
   /** Wind sampling height above sea level, m (spec: 10 m). */
   windSampleHeight: number;
+  /**
+   * Query time window, s: once ticking, query times are clamped to [lastTick - w, lastTick + w]
+   * (the cached snapshots, bounded cost). Infinity = exact at any time (a cold time costs ~50-70 ms).
+   */
+  timeWindow: number;
+  /** Largest change of the spectrum's wind direction per crossfade, degrees (avoids mid-blend energy loss). */
+  maxTurnPerBlendDeg: number;
 }
 
 /** CPU query configuration (per cascade). Setup-time; see cpu-fft.ts. */
@@ -69,7 +76,7 @@ export interface PerfSink {
 }
 
 export interface OceanOptions extends Partial<SpectrumParams>, Partial<SimParams> {
-  /** Preset name (default 'breeze' = the reference's default scene). */
+  /** Preset name (default 'windy' = the reference's load-time scene). */
   preset?: PresetName;
   /** Random realisation, integer. 1 = the reference's waves. Default 1. */
   seed?: number;
@@ -107,30 +114,33 @@ export const DEFAULT_SIM_PARAMS: Readonly<SimParams> = Object.freeze({
   inversionIterations: 6,
   inversionTolerance: 0.004,
   windSampleHeight: 10,
+  timeWindow: 0.1,
+  maxTurnPerBlendDeg: 15,
 });
 
 /**
  * CPU query cascades. Cascades 0 (1024 m, ~96 % of the height variance at 'breeze') and 1 (96 m,
  * ~4 %) run at 256, i.e. the same grid + bilinear filter the GPU draws at 256 (identical numbers
  * up to float32 / Hermite-in-time rounding). Cascade 2 (9 m, ~0.03 %) runs at 128, an exact
- * spectral subset of the 256 grid (modes |k| < 64 dk). Snapshot spacing in time: 0.4 / 0.25 / 0.1 s.
+ * spectral subset of the 256 grid (modes |k| < 64 dk). Snapshot spacing in time: 0.6 / 0.25 / 0.15 s
+ * (Hermite-in-time error <= 0.45 % of Hs for every preset; snapshot CPU cost per 60 Hz tick ~1.5 ms).
  * Cost and measured parity vs a full 256^3 evaluation: see tests/core-parity.test.ts and the report.
  * LITE alternative (half the CPU): [{256, .4}, {128, .25, 'cubic'}, {64, .1}] (p99 error ~1.2 % of Hs).
  */
 export const DEFAULT_QUERY_CASCADES: readonly QueryCascadeConfig[] = Object.freeze([
-  Object.freeze({ size: 256, snapshotDt: 0.4, filter: 'bilinear' as const }),
+  Object.freeze({ size: 256, snapshotDt: 0.6, filter: 'bilinear' as const }),
   Object.freeze({ size: 256, snapshotDt: 0.25, filter: 'bilinear' as const }),
-  Object.freeze({ size: 128, snapshotDt: 0.1, filter: 'bilinear' as const }),
+  Object.freeze({ size: 128, snapshotDt: 0.15, filter: 'bilinear' as const }),
 ]);
 
 /** Every tunable with min / max / unit / label / default (default = the 'breeze' preset). */
 export const PARAM_DEFS: readonly ParamDef[] = Object.freeze([
-  { key: 'windSpeed', label: 'Wind speed (10 m)', unit: 'm/s', min: 0.5, max: 35, default: 15, step: 0.5,
+  { key: 'windSpeed', label: 'Wind speed (10 m)', unit: 'm/s', min: 0.5, max: 35, default: 15, step: 0.5, // hard cap MAX_WIND_SPEED
     description: 'U10 for the JONSWAP spectrum. From WIND_QUERY when installed (useWind).' },
   { key: 'windDirection', label: 'Wind direction', unit: 'rad', min: -Math.PI, max: Math.PI, default: -1, step: 0.01,
     description: 'Direction the wind blows towards, CCW from local east to north. Reference: 1 rad towards +X..+Z = -1 rad here.' },
-  { key: 'fetch', label: 'Fetch', unit: 'm', min: 1000, max: 500000, default: 45479, step: 1000,
-    description: 'Distance the wind has blown over water. Sets the peak: wp = max(22 (g^2/(U F))^(1/3), 0.855 g/U).' },
+  { key: 'fetch', label: 'Fetch', unit: 'm', min: 1000, max: 200000, default: 45479, step: 1000,
+    description: 'Distance the wind has blown over water. Sets the peak: wp = max(22 (g^2/(U F))^(1/3), 0.855 g/U, peak <= 160 m). Hard caps (spectrum.ts): fetch <= 200 km, U <= 35 m/s, peak wavelength <= 160 m, so Hs <= ~14.9 m.' },
   { key: 'gamma', label: 'Peak enhancement', unit: '', min: 1, max: 7, default: 3.3, step: 0.1,
     description: 'JONSWAP gamma. 1 = Pierson-Moskowitz, 3.3 = standard JONSWAP.' },
   { key: 'spread', label: 'Directional spread', unit: '', min: 0.1, max: 4, default: 1.57, step: 0.01,
@@ -140,11 +150,11 @@ export const PARAM_DEFS: readonly ParamDef[] = Object.freeze([
   { key: 'choppiness', label: 'Choppiness', unit: '', min: 0, max: 2.5, default: 1.5, step: 0.05,
     description: 'Horizontal displacement multiplier (sharp crests). Above ~2 crests fold over.' },
   { key: 'amplitude', label: 'Amplitude', unit: 'x', min: 0, max: 3, default: 1.578, step: 0.01,
-    description: 'Height multiplier on the physical spectrum (also scales the horizontal displacement). 1.578 = the reference default scene.' },
+    description: 'Height multiplier on the physical spectrum (also scales the horizontal displacement). 1.578 = the reference calibration used by every preset (Hs ~2x open-ocean JONSWAP).' },
   { key: 'blendTime', label: 'Spectrum crossfade', unit: 's', min: 0.5, max: 30, default: 4, step: 0.5,
     description: 'Crossfade duration when the spectrum is regenerated (wind / preset change).' },
   { key: 'windTimeConstant', label: 'Wind smoothing', unit: 's', min: 0, max: 120, default: 8, step: 1,
-    description: 'EMA time constant on the sampled wind vector (gusts do not reshape the sea instantly).' },
+    description: 'EMA time constant on the sampled wind speed and (separately, shortest arc) direction: gusts do not reshape the sea instantly and a reversal never passes through 0 m/s.' },
   { key: 'windSpeedTolerance', label: 'Wind speed tolerance', unit: 'fraction', min: 0.005, max: 0.5, default: 0.03, step: 0.005,
     description: 'Relative drift of the smoothed wind speed that triggers a regeneration + crossfade.' },
   { key: 'windDirectionToleranceDeg', label: 'Wind direction tolerance', unit: 'deg', min: 0.5, max: 45, default: 3, step: 0.5,
@@ -155,6 +165,10 @@ export const PARAM_DEFS: readonly ParamDef[] = Object.freeze([
     description: 'Max Newton iterations to find the rest point that is displaced onto the query point (reference: 3 plain fixed-point steps).' },
   { key: 'inversionTolerance', label: 'Inversion tolerance', unit: 'm', min: 0.0001, max: 0.05, default: 0.004, step: 0.0005,
     description: 'Horizontal residual at which the inversion stops. Height error is about slope x residual.' },
+  { key: 'timeWindow', label: 'Query time window', unit: 's', min: 0.02, max: Infinity, default: 0.1, step: 0.01,
+    description: 'Queries are exact within +-w of the last tick (cached snapshots, no stall); further times are clamped. Infinity = always exact (synchronous snapshot cost ~50-70 ms per new time).' },
+  { key: 'maxTurnPerBlendDeg', label: 'Max sea turn per crossfade', unit: 'deg', min: 1, max: 180, default: 15, step: 1,
+    description: 'The spectrum direction follows the wind by at most this per crossfade (complex-amplitude crossfades between distant directions lose energy mid-blend).' },
   { key: 'windSampleHeight', label: 'Wind sample height', unit: 'm', min: 0, max: 100, default: 10, step: 1,
     description: 'Height above sea level at which WIND_QUERY is sampled near the focus point.' },
 ] as ParamDef[]);

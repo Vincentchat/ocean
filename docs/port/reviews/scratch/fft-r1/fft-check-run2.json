@@ -1,0 +1,18 @@
+{
+  "date": "2026-10-23T17:43:39.873Z",
+  "preset": "breeze",
+  "adapter": {
+    "ok": true,
+    "vendor": "nvidia",
+    "architecture": "turing",
+    "device": "0x1f02",
+    "description": "NVIDIA GeForce RTX 2070",
+    "isFallbackAdapter": false,
+    "features": [
+      "float32-filterable",
+      "timestamp-query",
+      "shader-f16"
+    ]
+  },
+  "tiers": {}
+}

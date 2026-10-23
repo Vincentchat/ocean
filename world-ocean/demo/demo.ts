@@ -1,4 +1,4 @@
-// world/ocean standalone demo (WebGPU only).
+﻿// world/ocean standalone demo (WebGPU only).
 //
 // URL flags
 //   ?cam=x,y,z,yawDeg,pitchDeg   camera world position (m, flat +Y up) and orientation. yaw 0 looks towards -Z,
@@ -10,12 +10,13 @@
 //   ?t=seconds                   simulation time (also without ?shot: start time).
 //   ?paused                      start paused.
 //   ?tier=low|medium|high|ultra  ocean quality tier (default high).
-//   ?preset=calm|breeze|windy|storm  ocean preset (core).
+//   ?preset=calm|breeze|windy|storm  ocean preset (core; default windy = the reference's load-time sea).
 //   ?sky=golden|azure|storm      photo-sky stand-in preset (reference scenes; default storm = reference default).
-//   ?scene=golden|azure|storm    match a WebGL reference scene: sky=<scene> + ocean preset 'breeze' with
+//   ?scene=golden|azure|storm    match a WebGL reference scene: sky=<scene> + ocean preset 'windy' with
 //                                amplitude REFERENCE_SCENE_AMPLITUDE[scene] (core). Used by tools/shots.json.
-//   ?origin=x,y,z                initial floating origin (m). The camera is placed at origin + cam, so the
-//                                view must look the same at (100000,0,100000) (acceptance check 7).
+//   ?origin=x,y,z                initial floating origin (m). Only the origin moves: the camera keeps its WORLD
+//                                position (?cam), so the view must be identical at (100000,0,100000) (acceptance
+//                                check 7). Disables the 2 km auto-rebase unless ?rebase=1.  ?rebase=0|1 forces it.
 //   ?wind=speed,dirDeg           provide a stub WIND_QUERY (m/s, direction blown towards, CCW from east).
 //   ?debug=name                  debug view name handed to createOceanGpu (e.g. velocity).
 //   ?exposure=x                  extra tonemap exposure (default 1).  ?dpr=x pixel ratio cap (default 1.75).
@@ -36,6 +37,8 @@ import { createFreeCamera } from './free-camera.ts';
 import { createPhotoSky, REF_NITS, SKY_PRESETS, type SkyPresetName } from './photo-sky.ts';
 
 const $ = (id: string) => document.getElementById(id)!;
+/** Reference Wave slider per scene (src/ocean.js presets). */
+const REFERENCE_WAVE: Record<string, number> = { golden: 0.9, azure: 1.0, storm: 1.5 };
 const params = new URLSearchParams(location.search);
 const flags = {
   shot: params.has('shot'),
@@ -44,7 +47,7 @@ const flags = {
   warm: params.has('warm') ? Math.max(0, Number(params.get('warm')) || 0) : 6,
   paused: params.has('paused'),
   tier: (params.get('tier') ?? 'high') as OceanTier,
-  preset: params.get('preset') ?? 'breeze',
+  preset: params.get('preset') ?? 'windy',
   scene: params.get('scene') as SkyPresetName | null,
   sky: (params.get('sky') ?? params.get('scene') ?? 'storm') as SkyPresetName,
   debug: params.get('debug') ?? '',
@@ -147,6 +150,13 @@ async function main() {
   scene.backgroundNode = sky.backgroundNode;
 
   const env = createStubEnvironment();
+  // ENVIRONMENT follows the photo-sky stand-in: same sun direction; cloud cover = the reference storminess.
+  const syncEnv = () => {
+    const s = sky.skyLight.sunDir;
+    env.sunDir.x = s.x; env.sunDir.y = s.y; env.sunDir.z = s.z;
+    env.cloudCover = sky.skyLight.reference.storminess;
+  };
+  syncEnv();
   world.provide(SKY_LIGHT, sky.skyLight);
   world.provide(ENVIRONMENT, env);
   if (flags.wind) world.provide(WIND_QUERY, createStubWind(flags.wind[0], flags.wind[1], world.shape));
@@ -160,7 +170,7 @@ async function main() {
     core = await import(/* @vite-ignore */ new URL('../index.ts', import.meta.url).href);
     if (typeof core.createOcean === 'function') {
       const amp = flags.scene ? core.REFERENCE_SCENE_AMPLITUDE?.[flags.scene] : undefined;
-      ocean = core.createOcean(amp !== undefined ? { preset: 'breeze', seed: 1, amplitude: amp } : { preset: flags.preset, seed: 1 });
+      ocean = core.createOcean(amp !== undefined ? { preset: 'windy', seed: 1, amplitude: amp } : { preset: flags.preset, seed: 1 });
       world.use(ocean);
     } else console.info('[demo] ../index.ts has no createOcean yet; running without the core');
   } catch (e) {
@@ -198,9 +208,29 @@ async function main() {
 
   let gpu: OceanGpu = createOceanGpu({
     ocean, renderer, scene, camera, origin, shape: world.shape, tier: flags.tier, skyLight: sky.skyLight, envMap: sky.envMap,
-    envIntensity: sky.envIntensity, preExposure, perf, debug: flags.debug,
+    environment: env, envIntensity: sky.envIntensity, preExposure, perf, debug: flags.debug,
+    // Reference scenes: the crest glow is normalised by the reference Wave slider (golden .9, azure 1, storm 1.5).
+    waveScale: flags.scene ? REFERENCE_WAVE[flags.scene] : undefined,
   } as any);
   for (const p of gpu.passes) runner.add(p);
+
+  // [foam builder] opt-in foam debug view (?debug=foam | ?debug=foamraw): three/foam.ts history pass + a debug
+  // material with the reference foam composition. Only active with the debug flag; remove once the material
+  // integrates foam.nodes. window.__foam = { foam, view } for tools/foam-check.mjs.
+  const foamMode = flags.debug.split(',').includes('foamraw') ? 'foamraw' : flags.debug.split(',').includes('foam') ? 'foam' : null;
+  if (foamMode && ocean) {
+    const { createOceanFoam, attachFoamDebugView } = await import('../three/foam.ts');
+    const foam = createOceanFoam({ renderer, fft: gpu.fft, lod: gpu.lod, origin, shape: world.shape, tier: flags.tier, camera, ocean });
+    runner.add(foam.pass);
+    if (flags.debug.split(',').includes('foamfine')) foam.uniforms.fineInSource.value = 1; // c3 in the source (A/B)
+    const view = attachFoamDebugView({
+      foam, gpu, envMap: sky.envMap, envIntensity: sky.envIntensity, preExposure, mode: foamMode,
+      sunDir: () => (sky.skyLight as any).sunDir,
+    });
+    $('tier').addEventListener('change', () => foam.setTier(($('tier') as HTMLSelectElement).value as OceanTier));
+    (window as any).__foam = { foam, view };
+    await foam.ready;
+  }
 
   const scenePass: Pass = {
     desc: { id: 'demo.scene', module: 'demo', stage: 'scene', reads: ['ocean.displacement', 'demo.env'], writes: ['scene.color', 'scene.depth'] },
@@ -234,15 +264,18 @@ async function main() {
     freeCam.x = flags.cam[0]; freeCam.y = flags.cam[1]; freeCam.z = flags.cam[2];
     freeCam.yaw = flags.cam[3] * Math.PI / 180; freeCam.pitch = flags.cam[4] * Math.PI / 180;
   }
-  freeCam.x += originStart[0]; freeCam.y += originStart[1]; freeCam.z += originStart[2];
+  // ?origin moves ONLY the floating origin: the camera keeps its WORLD position (?cam), so the view must be identical
+  // (acceptance check 7). The automatic rebase is off while an explicit ?origin is given (?rebase=1 forces it on,
+  // ?rebase=0 forces it off), otherwise it would move the origin back next to the camera on the first frame.
   freeCam.attach(renderer.domElement);
   freeCam.enabled = !flags.shot;
   const fwd = { x: 0, y: 0, z: 0 };
   const lookTarget = new Vector3();
   const REBASE_DISTANCE = 2000; // m: shift the floating origin when the camera gets this far from it
+  const autoRebase = params.has('rebase') ? params.get('rebase') !== '0' : !flags.origin;
   function updateCamera() {
     let rx = freeCam.x - origin.origin.x, rz = freeCam.z - origin.origin.z;
-    if (Math.abs(rx) > REBASE_DISTANCE || Math.abs(rz) > REBASE_DISTANCE) {
+    if (autoRebase && (Math.abs(rx) > REBASE_DISTANCE || Math.abs(rz) > REBASE_DISTANCE)) {
       origin.setOrigin(Math.round(freeCam.x), origin.origin.y, Math.round(freeCam.z));
       rx = freeCam.x - origin.origin.x; rz = freeCam.z - origin.origin.z;
     }
@@ -268,6 +301,7 @@ async function main() {
   document.querySelectorAll<HTMLElement>('[data-sky]').forEach((b) => (b.onclick = () => {
     const name = b.dataset.sky as SkyPresetName;
     sky.setPreset(name);
+    syncEnv();
     markActive('sky', name);
   }));
   markActive('preset', flags.preset);

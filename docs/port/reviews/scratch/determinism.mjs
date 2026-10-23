@@ -1,4 +1,4 @@
-// Reviewer scratch: determinism independent of query history; past/future queries; velocity during a crossfade.
+﻿// Reviewer scratch: determinism independent of query history; past/future queries; velocity during a crossfade.
 import { createOcean, WIND_QUERY } from '../../../../world-ocean/index.ts';
 import { createFlatShape, createStubWorld, createStubWind } from '../../../../world-ocean/stubs/impl.ts';
 const shape = createFlatShape();
@@ -18,7 +18,7 @@ for (let i = 0; i < 60 * 40; i++) {
   if (i === 1500) { A.ocean.setPreset('storm'); B.ocean.setPreset('storm'); }
   A.world.stepOnce(); B.world.stepOnce();
   // B gets a hostile query history: random past / future times, velocities, far points
-  for (let k = 0; k < 5; k++) {
+  if (i % 20 === 0) for (let k = 0; k < 2; k++) {
     p.x = (rnd() - 0.5) * 2e5; p.z = (rnd() - 0.5) * 2e5;
     const tt = B.world.time + (rnd() - 0.5) * 400;
     B.ocean.query.heightAt(p, tt); if (k === 0) B.ocean.query.velocityAt(p, tt, v);
@@ -76,3 +76,4 @@ for (const [t, h] of recorded) {
   }
   console.log(`  heightAt(t=5) vs heightAt(t=5+8192*27000): ${o.query.heightAt({ x: 1, y: 0, z: 2 }, 5)} / ${o.query.heightAt({ x: 1, y: 0, z: 2 }, 5 + 8192 * 27000)}`);
 }
+

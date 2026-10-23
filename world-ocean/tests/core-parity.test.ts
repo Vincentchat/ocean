@@ -1,4 +1,4 @@
-// heightAt inversion correctness and CPU-query parity with the drawn (GPU) surface.
+﻿// heightAt inversion correctness and CPU-query parity with the drawn (GPU) surface.
 //
 // "Drawn surface" model: the GPU at its 256 tier evaluates all three cascades at 256^2 and samples
 // them bilinearly with the chained lookup (spectrum.ts conventions). Here that is emulated on the
@@ -54,7 +54,7 @@ function errors(ocean: ReturnType<typeof createOcean>, tr: ReturnType<typeof tru
 }
 
 test('heightAt inversion: height of the surface point that ends up AT p (same grid, < 0.1 % Hs rms)', () => {
-  const tr = truth('breeze', 6000);
+  const tr = truth('windy', 6000);
   const e = errors(tr.drawn, tr);
   console.log(`  inversion (same grid, breeze): rms ${e.rms.toFixed(4)} %Hs, p99 ${e.p99.toFixed(3)}, max ${e.max.toFixed(3)}, other sheet ${(e.otherSheet * 100).toFixed(2)} %`);
   assert.ok(e.rms < 0.1, `rms ${e.rms}`);

@@ -82,8 +82,9 @@ export function lodParams(tier: LodTier, opts: LodParamOptions = {}): LodParams 
     targetRatio: opts.targetRatio ?? 1.5,
     // Ring l's hole edge is at most (M/2 + 1) s_l from the foot: morph must be 0 there (matches level l-1).
     // Everything that the parent's hole can uncover / clamp is >= (M - 6) s_l away: morph must be 1 there.
-    // The band is kept to ~M/3 cells: morphing vertices slide (continuously) at camera speed / band width.
-    morphStart: Math.max(M / 2 + 2, M - 6 - Math.ceil(M / 3)),
+    // Widest band the constraints allow (M/2 - 8 cells): morphing vertices slide (continuously) at
+    // camera speed / band width, so the widest band slides slowest.
+    morphStart: M / 2 + 2,
     morphEnd: M - 6,
     margin: 2,
   };
@@ -107,6 +108,17 @@ export interface LodGeometryData {
 
 /** Builds the merged clipmap (skirt, level 0 square, rings 1..L-1). Setup-time; allocates. */
 export function buildLodGeometry(p: LodParams): LodGeometryData {
+  const it = lodGeometrySteps(p);
+  let r = it.next();
+  while (!r.done) r = it.next();
+  return r.value;
+}
+
+/**
+ * Same as buildLodGeometry, as a generator that yields after every grid row (~0.01-0.05 ms of work), so a tier
+ * change can be built in time slices off the frame's critical path. The result is the generator's return value.
+ */
+export function* lodGeometrySteps(p: LodParams): Generator<void, LodGeometryData, void> {
   const M = p.halfCells, R = M + p.margin, H = M / 2, W = 2 * R + 1;
   const L = p.levels;
   const skirtLoop = 8 * R;
@@ -171,6 +183,7 @@ export function buildLodGeometry(p: LodParams): LodGeometryData {
         if (l > 0 && Math.abs(gx) < H && Math.abs(gy) < H) continue; // strictly inside the hole
         map[(gy + R) * W + (gx + R)] = vert(gx, gy, l * 4 + LOD_KIND_GRID);
       }
+      yield;
     }
     for (let j = -R; j < R; j++) {
       for (let i = -R; i < R; i++) {
@@ -182,6 +195,7 @@ export function buildLodGeometry(p: LodParams): LodGeometryData {
         index[ni++] = a; index[ni++] = d; index[ni++] = c;
         index[ni++] = a; index[ni++] = c; index[ni++] = b;
       }
+      yield;
     }
     levelIndexEnd.push(ni);
     levelVertexCount.push(nv - v0);
@@ -231,9 +245,10 @@ export function snap(x: number, step: number): number {
 /**
  * Per-frame LOD update (allocation-free). footU/footV: camera foot in lattice coordinates (float64 world),
  * height: camera altitude above sea level (m). advance = true for the once-per-frame update (tracks the
- * previous foot for motion vectors), false for re-evaluations (origin shift).
+ * previous foot for motion vectors), false for re-evaluations (origin shift). maxReach: max-norm reach (m) the
+ * drawn rings may not exceed (keeps them inside a finite far plane); coverage yields to it.
  */
-export function updateLodState(st: LodState, p: LodParams, footU: number, footV: number, height: number, advance = true): void {
+export function updateLodState(st: LodState, p: LodParams, footU: number, footV: number, height: number, advance = true, maxReach = Infinity): void {
   const M = p.halfCells;
   const hEff = Math.max(Math.abs(height), (M * p.minSpacing) / p.targetRatio);
   const t = Math.log2((p.targetRatio * hEff) / M);
@@ -245,6 +260,8 @@ export function updateLodState(st: LodState, p: LodParams, footU: number, footV:
   st.spacing0 = s0;
   let K = 1;
   while (K < p.levels && (M + 1) * s0 * 2 ** (K - 1) < p.coverage) K++;
+  // maxReach (m, max-norm, e.g. 0.6 * camera far): drop outer rings that would cross the far plane.
+  while (K > 1 && (M + p.margin) * s0 * 2 ** (K - 1) > maxReach) K--;
   st.drawnLevels = K;
   const sTop = s0 * 2 ** (K - 1);
   if (advance) {
@@ -345,8 +362,10 @@ export function emulateVertex(st: LodState, p: LodParams, gx: number, gy: number
   let pu = f(q1u - phiU), pv = f(q1v - phiV);
   let qu = q1u, qv = q1v;
   if (kind >= LOD_KIND_SKIRT_OUTER) {
+    // skirtRadius = distance along the axis of view (the shader divides the far depth by cos(angle to the view axis)).
     const len = Math.hypot(pu, pv) || 1;
-    pu = f((pu / len) * skirtRadius); pv = f((pv / len) * skirtRadius);
+    const t = kind === LOD_KIND_SKIRT_TOP ? skirtRadius : skirtRadius * 0.995;
+    pu = f((pu / len) * t); pv = f((pv / len) * t);
     qu = f(pu + phiU); qv = f(pv + phiV);
   }
   out.qu = qu; out.qv = qv; out.pu = pu; out.pv = pv; out.morph = m;

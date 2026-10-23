@@ -86,7 +86,7 @@
 // =====================================================================================
 //  FFT_SIZE 256 .............. REFERENCE_SIZE: the master grid; all band limits are fixed at it.
 //  DOMAINS [1024, 96, 9] ..... cascade tile sizes, m.
-//  gravity 9.81 .............. replaced by shape.surfaceGravity (spec §3: 9.80665 default).
+//  gravity 9.81 .............. replaced by shape.surfaceGravity (spec ??3: 9.80665 default).
 //  windSpeed 15 m/s, windDirection 1 rad (towards +X..+Z = towards east..south), peakWavelength 47 m,
 //  gamma 3.3, spread 1.57, standing 0.13, choppiness 1.5 (createSpectralOcean `chop`), period 8192 s.
 //  alpha = 0.076 * (U * wp / (22 g))^0.66  (JONSWAP alpha with fetch eliminated through wp).
@@ -188,12 +188,28 @@ function smooth(a: number, b: number, x: number): number {
   return t * t * (3 - 2 * t);
 }
 
-/** Peak angular frequency, rad/s, from wind speed (m/s) and fetch (m). */
+/**
+ * Hard caps (sea-state sanity + tile resolution): wind speed <= 35 m/s, fetch <= 200 km and peak
+ * wavelength <= 160 m (>= 6.4 peak waves per 1024 m tile; also keeps the peak well resolved by
+ * cascade 0). With the reference calibration (amplitude 1.578) the highest reachable Hs is ~14.9 m
+ * (35 m/s, peak capped at 160 m); without the caps 35 m/s over 2000 km gave Hs 68 m, lambda_p 1 km.
+ */
+export const MAX_WIND_SPEED = 35;      // m/s
+export const MAX_FETCH = 200000;       // m
+export const MAX_PEAK_WAVELENGTH = 160; // m
+
+/** Wind speed actually used by the spectrum (clamped to [0.1, MAX_WIND_SPEED]), m/s. */
+export function effectiveWindSpeed(windSpeed: number): number {
+  return windSpeed < 0.1 ? 0.1 : windSpeed > MAX_WIND_SPEED ? MAX_WIND_SPEED : windSpeed;
+}
+
+/** Peak angular frequency, rad/s, from wind speed (m/s) and fetch (m), with the caps above. */
 export function peakOmega(windSpeed: number, fetch: number, g: number): number {
-  const U = Math.max(windSpeed, 0.1);
-  const F = Math.max(fetch, 1);
+  const U = effectiveWindSpeed(windSpeed);
+  const F = Math.min(Math.max(fetch, 1), MAX_FETCH);
   const fetchLimited = JONSWAP_FETCH_CONSTANT * Math.cbrt((g * g) / (U * F));
-  return Math.max(fetchLimited, (PM_PEAK * g) / U);
+  const minOmega = Math.sqrt((2 * Math.PI * g) / MAX_PEAK_WAVELENGTH);
+  return Math.max(fetchLimited, (PM_PEAK * g) / U, minOmega);
 }
 
 /** Peak wavelength, m (deep water: lambda = 2 pi g / wp^2). */
@@ -298,7 +314,7 @@ export interface SpectrumScalars { g: number; U: number; dirGrid: number; wp: nu
 
 export function spectrumScalars(p: Readonly<SpectrumParams>, g: number, out: SpectrumScalars): SpectrumScalars {
   out.g = g;
-  out.U = p.windSpeed;
+  out.U = effectiveWindSpeed(p.windSpeed);
   out.dirGrid = -p.windDirection; // local (east->north) to grid (east->south)
   out.wp = peakOmega(p.windSpeed, p.fetch, g);
   return out;
@@ -482,7 +498,7 @@ export function cascadePower(p: Readonly<SpectrumParams>, cascade: Readonly<Casc
       const kx = Math.fround((x - half) * dk);
       if (Math.hypot(kx, kz) >= kMax) continue;
       sum += spectralDensity(kx, kz, cascade.domain, cascade.lower, cascade.upper,
-        g, p.windSpeed, -p.windDirection, wp, p.gamma, p.spread, p.standing);
+        g, effectiveWindSpeed(p.windSpeed), -p.windDirection, wp, p.gamma, p.spread, p.standing);
     }
   }
   return sum * p.amplitude * p.amplitude;

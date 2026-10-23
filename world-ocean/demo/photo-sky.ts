@@ -296,8 +296,10 @@ export async function createPhotoSky(renderer: WebGPURenderer, opts: { preExposu
     const visibility = 1 - storm * 0.97;
     const lumS = 0.2126 * solar.r + 0.7152 * solar.g + 0.0722 * solar.b;
     skyLight.sunColor.r = solar.r / lumS; skyLight.sunColor.g = solar.g / lumS; skyLight.sunColor.b = solar.b / lumS;
-    // Reference sun term: sunlight() * BRDF * (4.5 - 3.5 storm) * visibility  ->  E_sun in lux (x REF_NITS).
-    skyLight.sunIlluminance = (4.5 - 3.5 * storm) * visibility * lumS * REF_NITS;
+    // Reference sun: a 4.5 RU irradiance (sun disc / specular gain 4.5) x visibility -> E_sun in lux (x REF_NITS).
+    // The reference's extra storm dimming of the specular ((4.5 - 3.5 storm) / 4.5) is not light: the water
+    // material derives it from ENVIRONMENT.cloudCover (the demo sets cloudCover = storminess).
+    skyLight.sunIlluminance = 4.5 * visibility * lumS * REF_NITS;
     const lumE = 0.2126 * upE[0] + 0.7152 * upE[1] + 0.0722 * upE[2];
     skyLight.skyIlluminance = lumE;
     skyLight.skyColor.r = upE[0] / lumE; skyLight.skyColor.g = upE[1] / lumE; skyLight.skyColor.b = upE[2] / lumE;

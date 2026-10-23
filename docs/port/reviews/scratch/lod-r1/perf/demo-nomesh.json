@@ -1,0 +1,78 @@
+{
+  "label": "demo-nomesh",
+  "url": "http://127.0.0.1:5184/demo/?scene=storm&cam=0,4.8,8,0,-16.04&paused&tier=high&debug=nomesh",
+  "date": "2026-10-23T17:41:39.701Z",
+  "adapter": {
+    "vendor": "nvidia",
+    "architecture": "turing",
+    "description": "NVIDIA GeForce RTX 2070"
+  },
+  "webglRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 (0x00001F02) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "viewport": [
+    1920,
+    1080
+  ],
+  "canvas": [
+    1920,
+    1080
+  ],
+  "vsync": false,
+  "framesSampled": 698,
+  "fps": 888.9,
+  "frameMs": {
+    "mean": 1.125,
+    "p50": 1,
+    "p95": 1.8,
+    "p99": 2.7,
+    "min": 0.1,
+    "max": 10.4,
+    "n": 698
+  },
+  "cpuMs": {
+    "mean": 0.646,
+    "p50": 0.6,
+    "p95": 1,
+    "p99": 1.5,
+    "min": 0.2,
+    "max": 2.4,
+    "n": 698
+  },
+  "gpuMs": {
+    "mean": 0.481,
+    "p50": 0.48,
+    "p95": 0.487,
+    "p99": 0.487,
+    "min": 0.479,
+    "max": 0.487,
+    "n": 699
+  },
+  "gpuRenderMs": {
+    "mean": 0.183,
+    "p50": 0.181,
+    "p95": 0.188,
+    "p99": 0.188,
+    "min": 0.181,
+    "max": 0.188,
+    "n": 699
+  },
+  "gpuComputeMs": {
+    "mean": 0.298,
+    "p50": 0.298,
+    "p95": 0.299,
+    "p99": 0.299,
+    "min": 0.295,
+    "max": 0.299,
+    "n": 699
+  },
+  "demoCpuMs": {
+    "mean": 0.629,
+    "p50": 0.6,
+    "p95": 1,
+    "p99": 1.5,
+    "min": 0.2,
+    "max": 2.3,
+    "n": 699
+  },
+  "tier": "high",
+  "consoleErrors": 0
+}

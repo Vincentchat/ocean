@@ -11,10 +11,10 @@
   ],
   "pieces": [
     { "name": "Infra: package scaffold, contract stubs, demo shell, capture harness, reference captures", "status": "done", "rounds": 0, "verdict": "Headless Edge gets the RTX 2070 WebGPU adapter; 27 reference shots captured; demo shell renders via WebGPU" },
-    { "name": "Core: JONSWAP spectrum, CPU FFT, WATER_QUERY, presets, Node tests", "status": "reviewing", "rounds": 1, "verdict": "Builder: 35/35 tests pass, 1.6–1.9 M heightAt/s, CPU vs drawn surface p99.9 < 1 % Hs. Concern: 2–4.5 ms CPU per tick." },
+    { "name": "Core: JONSWAP spectrum, CPU FFT, WATER_QUERY, presets, Node tests", "status": "building", "rounds": 1, "verdict": "Round 1 FAIL: fidelity and determinism verified, but tick + gameplay queries average 10.4 ms (p99 20 ms) because velocityAt fills whole frames; small per-tick allocations. Builder sent back." },
     { "name": "Reference analysis of the WebGL ocean (feature checklist)", "status": "done", "rounds": 0, "verdict": "27-item visual checklist F1–F27, 7 canonical cameras; reference Hs 2.18 / 2.58 / 4.07 m" },
     { "name": "GPU FFT in TSL compute, all four tiers", "status": "reviewing", "rounds": 1, "verdict": "Builder: GPU = CPU fields to 4e-7 Hs; 0.24–0.88 ms GPU per tier; async tier switch ~1.2 s, old tier stays on screen" },
-    { "name": "Camera-relative LOD mesh + floating origin", "status": "reviewing", "rounds": 1, "verdict": "Builder: geometry clipmap, 1 draw call, 0 cracks in 160 random poses, pixel-identical at 1e7 m origin, 0.4–0.8 ms GPU" },
+    { "name": "Camera-relative LOD mesh + floating origin", "status": "building", "rounds": 1, "verdict": "Round 1 FAIL: watertight and origin-exact, but the horizon skirt depends on camera.far (gap at far=5000, vanishes at far=Infinity); tier change stalls 21–68 ms. Builder sent back." },
     { "name": "Water material: reflection, sun, body colour, SSS", "status": "building", "rounds": 0 },
     { "name": "Foam: persistent history + pattern", "status": "building", "rounds": 0 },
     { "name": "Refraction / depth", "status": "pending", "rounds": 0 },

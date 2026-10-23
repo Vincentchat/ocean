@@ -1,6 +1,6 @@
 // @dreamp/world-ocean - public entry. Render-agnostic core: NEVER import three here.
 //
-//   const ocean = createOcean({ preset: 'breeze', seed: 1 });   // WorldSystem, provides WATER_QUERY
+//   const ocean = createOcean({ preset: 'windy', seed: 1 });    // WorldSystem, provides WATER_QUERY
 //   world.use(ocean); world.start();
 //   const h = world.require(WATER_QUERY).heightAt({ x: 10, y: 0, z: 5 }, world.time);
 //
@@ -33,7 +33,7 @@ import {
   packInitialSpectrum, omegaIndices, expectedHs,
 } from './spectrum.ts';
 import type { SpectrumScalars } from './spectrum.ts';
-import { CascadeSim, SAMPLE, GRAD, CALL, sampleCubic, sampleCubicGrad } from './cpu-fft.ts';
+import { CascadeSim, SAMPLE, GRAD, sampleCubic, sampleCubicGrad } from './cpu-fft.ts';
 import { PRESETS } from './presets/index.ts';
 
 export * from './types.ts';
@@ -59,6 +59,8 @@ const JACOBIAN_CASCADES = 2;
 const GUESS_STEPS = 2;
 /** Extra damped fixed-point steps when Newton did not converge (rare). */
 const RESCUE_ITERATIONS = 12;
+/** Cost of packing one cascade's h0 in units of generated master rows (amortised regeneration budget). */
+const PACK_ROWS_EQUIVALENT = 8;
 
 /** One crossfade slot as the GPU adapter sees it. */
 export interface OceanSlot {
@@ -143,6 +145,12 @@ export interface Ocean extends WorldSystem {
    * out.east / out.north, the height and velocity to out.up / out.v*; returns the residual |P(r) - p| (m).
    */
   invertLocal(east: number, north: number, time: number, out: RestSample): number;
+  /**
+   * Allocation-free batch heightAt: points = [x0, y0, z0, x1, ...] world metres, out[i] = height of
+   * point i (m above sea level) at 	ime. Same results as heightAt; use it on hot paths (heightAt
+   * returns a JS number, which V8 boxes (16 B) when the call is not inlined into the caller).
+   */
+  heightsAt(points: Float64Array, time: number, out: Float64Array, count?: number): Float64Array;
   /** Surface point that rests at local (east, north): displaced position, height, velocity. */
   sampleRest(east: number, north: number, time: number, out: RestSample): RestSample;
   /** Diagnostics: CPU snapshots computed per cascade so far. */
@@ -165,7 +173,7 @@ function emptyParams(): SpectrumParams {
   return { windSpeed: 0, windDirection: 0, fetch: 0, gamma: 0, spread: 0, standing: 0, choppiness: 0, amplitude: 0 };
 }
 const SPECTRUM_KEYS: readonly (keyof SpectrumParams)[] = ['windSpeed', 'windDirection', 'fetch', 'gamma', 'spread', 'standing', 'choppiness', 'amplitude'];
-const SIM_KEYS: readonly (keyof SimParams)[] = ['blendTime', 'windTimeConstant', 'windSpeedTolerance', 'windDirectionToleranceDeg', 'regenRowsPerTick', 'inversionIterations', 'inversionTolerance', 'windSampleHeight'];
+const SIM_KEYS: readonly (keyof SimParams)[] = ['blendTime', 'windTimeConstant', 'windSpeedTolerance', 'windDirectionToleranceDeg', 'regenRowsPerTick', 'inversionIterations', 'inversionTolerance', 'windSampleHeight', 'timeWindow', 'maxTurnPerBlendDeg'];
 
 function wrapAngle(a: number): number {
   a = (a + Math.PI) % (2 * Math.PI);
@@ -174,7 +182,7 @@ function wrapAngle(a: number): number {
 }
 
 export function createOcean(opts: OceanOptions = {}): Ocean {
-  const presetName: PresetName = opts.preset ?? 'breeze';
+  const presetName: PresetName = opts.preset ?? 'windy';
   if (!PRESETS[presetName]) throw new Error(`Unknown ocean preset '${presetName}'`);
   const seed = opts.seed ?? 1;
   const useWind = opts.useWind ?? true;
@@ -202,6 +210,9 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
   const windPoint: Vec3 = { x: 0, y: 0, z: 0 };
   const windVec: Vec3 = { x: 0, y: 0, z: 0 };
   let windInit = false;
+  /** True once tick() ran: queries are then limited to the time window around the last tick. */
+  let ticked = false;
+  let disposed = false;
 
   // ---- spectrum slots -----------------------------------------------------------------------
   const nm = REFERENCE_SIZE;
@@ -223,7 +234,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
   let pendingId = -1, pendingFrom = 0, pendingSlot = -1;
   // Per-tick doubles live in a typed array (closure-captured mutable doubles would be boxed = allocated per write).
   const TS = new Float64Array(9);
-  const T_WIND_E = 0, T_WIND_N = 1, T_BLEND_START = 2, T_BLEND_DURATION = 3, T_LAST_TICK = 4, T_DT = 5;
+  const T_WIND_SPEED = 0, T_WIND_DIR = 1, T_BLEND_START = 2, T_BLEND_DURATION = 3, T_LAST_TICK = 4, T_DT = 5;
   const T_PEND_START = 6, T_PEND_DURATION = 7, T_PEND_SWITCH = 8;
   TS[T_BLEND_DURATION] = 1;
 
@@ -240,16 +251,17 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
   let pendingLead = 1.6;
   /** The CPU switches to the pending source this long before its crossfade starts, s. */
   let switchMargin = 0.4;
-  /** Ticks counter: the regeneration check (differs) runs every 8th tick (~0.13 s at 60 Hz). */
-  let checkCounter = 0;
   // Compact list of the cascades the CPU evaluates (hot path of the queries).
   let K = 0;
   const kSim: CascadeSim[] = [], kCascade: number[] = [], kData: Float32Array[] = [], kVel: Float32Array[] = [];
-  const kBlock: Uint8Array[] = [], kBSh: number[] = [], kNb: number[] = [];
+  const kBlock: Uint8Array[] = [], kVelBlock: Uint8Array[] = [], kBSh: number[] = [], kNb: number[] = [];
   const kN: number[] = [], kShift: number[] = [], kInv: number[] = [], kL: number[] = [], kOff: number[] = [], kCubic: number[] = [];
   function selectFrame(f: number): void {
     curFrame = f;
-    for (let k = 0; k < K; k++) { kData[k] = kSim[k].frames[f]; kVel[k] = kSim[k].velFrames[f]; kBlock[k] = kSim[k].blockValid[f]; }
+    for (let k = 0; k < K; k++) {
+      const sm = kSim[k];
+      kData[k] = sm.frames[f]; kVel[k] = sm.velFrames[f]; kBlock[k] = sm.blockValid[f]; kVelBlock[k] = sm.velValid[f];
+    }
   }
 
   function init(): void {
@@ -270,7 +282,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
       const sm = sims[c];
       if (!sm) continue;
       kSim.push(sm); kCascade.push(c); kData.push(sm.frames[0]); kVel.push(sm.velFrames[0]);
-      kBlock.push(sm.blockValid[0]); kBSh.push(sm.blockShift); kNb.push(sm.nb);
+      kBlock.push(sm.blockValid[0]); kVelBlock.push(sm.velValid[0]); kBSh.push(sm.blockShift); kNb.push(sm.nb);
       kN.push(sm.n); kInv.push(sm.n / sm.domain);
       kShift.push(sm.n * (Math.ceil(SURFACE_PERIOD / sm.domain) + 4)); kL.push(sm.domain); kOff.push(sm.offset);
       kCubic.push(sm.cubic ? 1 : 0);
@@ -290,8 +302,11 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
     activeId = id; fromSlot = from; toSlot = to;
     TS[T_BLEND_START] = start; TS[T_BLEND_DURATION] = duration;
     pendingId = -1; pendingSlot = -1;
-    CALL[0] = start; CALL[1] = duration;
-    for (let k = 0; k < K; k++) { kSim[k].setSource(0, id, from, to); kSim[k].setSource(1, -1, 0, 0); }
+    for (let k = 0; k < K; k++) {
+      const sm = kSim[k];
+      sm.args[0] = start; sm.args[1] = duration;
+      sm.setSource(0, id, from, to); sm.setSource(1, -1, 0, 0);
+    }
     blendVersion++;
     stamp++;
   }
@@ -318,7 +333,16 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
 
   function startRegen(): void {
     regenSlot = spareSlot();
-    copyParams(target, slots[regenSlot].params);
+    const p = slots[regenSlot].params;
+    copyParams(target, p);
+    // Turn the sea by at most maxTurnPerBlendDeg per crossfade: the crossfade lerps complex
+    // amplitudes, and two spectra far apart in direction would partly cancel mid-blend (Hs dip).
+    const cur = slots[toSlot].params.windDirection;
+    let dd = p.windDirection - cur;
+    while (dd > Math.PI) dd -= 2 * Math.PI;
+    while (dd < -Math.PI) dd += 2 * Math.PI;
+    const maxTurn = (sim.maxTurnPerBlendDeg * Math.PI) / 180;
+    if (dd > maxTurn) p.windDirection = cur + maxTurn; else if (dd < -maxTurn) p.windDirection = cur - maxTurn;
     spectrumScalars(slots[regenSlot].params, g, regenScalars);
     regenCascade = 0;
     regenRow = 0;
@@ -336,7 +360,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
         regenRow = r1;
       } else {
         packInitialSpectrum(regenRaw, sd.params.standing, sd.h0[regenCascade]);
-        rows -= 8; // packing costs about as much as 8 rows
+        rows -= PACK_ROWS_EQUIVALENT;
         regenCascade++;
         regenRow = 0;
         if (regenCascade >= CASCADES.length) {
@@ -347,20 +371,33 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
           pendingId = ++srcCounter; pendingFrom = toSlot; pendingSlot = regenSlot;
           TS[T_PEND_START] = TS[T_LAST_TICK] + pendingLead; TS[T_PEND_DURATION] = sim.blendTime;
           TS[T_PEND_SWITCH] = TS[T_PEND_START] - switchMargin;
-          CALL[0] = TS[T_PEND_START]; CALL[1] = TS[T_PEND_DURATION];
-          for (let k = 0; k < K; k++) kSim[k].setSource(1, pendingId, pendingFrom, pendingSlot);
+          for (let k = 0; k < K; k++) {
+            const sm = kSim[k];
+            sm.args[0] = TS[T_PEND_START]; sm.args[1] = TS[T_PEND_DURATION];
+            sm.setSource(1, pendingId, pendingFrom, pendingSlot);
+          }
           regenSlot = -1;
         }
       }
     }
   }
 
+  /** Does the target differ enough from slot params b to regenerate? (no Math.* calls returning boxed doubles) */
   function differs(a: Readonly<SpectrumParams>, b: Readonly<SpectrumParams>): boolean {
-    const du = Math.abs(a.windSpeed - b.windSpeed);
-    if (du > sim.windSpeedTolerance * Math.max(b.windSpeed, 1)) return true;
-    if (Math.min(a.windSpeed, b.windSpeed) > 0.5 &&
-      Math.abs(wrapAngle(a.windDirection - b.windDirection)) > (sim.windDirectionToleranceDeg * Math.PI) / 180) return true;
-    if (Math.abs(a.fetch - b.fetch) > 1e-6 * (1 + b.fetch)) return true;
+    let du = a.windSpeed - b.windSpeed;
+    if (du < 0) du = -du;
+    const ref = b.windSpeed > 1 ? b.windSpeed : 1;
+    if (du > sim.windSpeedTolerance * ref) return true;
+    if (a.windSpeed > 0.5 && b.windSpeed > 0.5) {
+      let dd = a.windDirection - b.windDirection;
+      while (dd > Math.PI) dd -= 2 * Math.PI;
+      while (dd < -Math.PI) dd += 2 * Math.PI;
+      if (dd < 0) dd = -dd;
+      if (dd > (sim.windDirectionToleranceDeg * Math.PI) / 180) return true;
+    }
+    let df = a.fetch - b.fetch;
+    if (df < 0) df = -df;
+    if (df > 1e-6 * (1 + b.fetch)) return true;
     if (a.gamma !== b.gamma || a.spread !== b.spread || a.standing !== b.standing) return true;
     if (a.choppiness !== b.choppiness || a.amplitude !== b.amplitude) return true;
     return false;
@@ -389,30 +426,48 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
   function choppinessAt(t: number): number { ST[S_T] = t; blendInto(); return ST[S_CHOP]; }
 
   /**
-   * Make the CPU frames hold the field at time t (positions; velocities too when withVel) and
-   * select them for forward(). Two frames are cached (keyed by time + state stamp). Allocation-free.
+   * Make the (lazy) CPU frames describe the field at query time ST[S_T] and select them for
+   * forward(). Two frames are cached (keyed by time + state stamp). The query time is first
+   * validated and limited to the query window (see clampQueryTime). Allocation-free.
    */
-  function prepare(withVel: boolean): number {
+  function prepare(): number {
+    if (disposed) throw new Error('world/ocean: disposed');
     if (!initialised) init();
+    clampQueryTime();
     const t = ST[S_T];
     if (K === 0) return 0;
     const s0 = kSim[0];
-    if (s0.frameTime[curFrame] === t && s0.frameStamp[curFrame] === stamp && (!withVel || s0.frameHasVel[curFrame] === 1)) return curFrame;
+    if (s0.frameTime[curFrame] === t && s0.frameStamp[curFrame] === stamp) return curFrame;
     const other = 1 - curFrame;
-    if (s0.frameTime[other] === t && s0.frameStamp[other] === stamp && (!withVel || s0.frameHasVel[other] === 1)) {
+    if (s0.frameTime[other] === t && s0.frameStamp[other] === stamp) {
       selectFrame(other);
       return curFrame;
     }
-    // Recompute into the current frame if it already holds t (adding velocities), else the other one.
-    const f = s0.frameTime[curFrame] === t && s0.frameStamp[curFrame] === stamp ? curFrame : other;
     blendInto();
     const chop = ST[S_CHOP], dchop = ST[S_DCHOP];
     for (let k = 0; k < K; k++) {
-      CALL[0] = t; CALL[1] = chop; CALL[2] = dchop;
-      kSim[k].materialise(f, stamp, withVel, activeId);
+      const sm = kSim[k];
+      sm.args[0] = t; sm.args[1] = chop; sm.args[2] = dchop;
+      sm.materialise(other, stamp, activeId);
     }
-    selectFrame(f);
-    return f;
+    selectFrame(other);
+    return other;
+  }
+
+  /**
+   * Query time policy. Non-finite times throw. Once the system ticks, queries are exact within
+   * [lastTick - timeWindow, lastTick + timeWindow] (the cached snapshots: no stall); times outside
+   * are clamped to that window, which keeps every query bounded in cost (an arbitrary time would
+   * otherwise need six fresh 256^2 snapshots, ~50-70 ms). timeWindow = Infinity disables the clamp
+   * (exact at any time, synchronous snapshot cost). Before the first tick (standalone use) every
+   * time is exact. Deterministic: depends on the time and the last tick time only.
+   */
+  function clampQueryTime(): void {
+    const t = ST[S_T];
+    if (!(t - t === 0)) throw new RangeError('world/ocean: query time must be a finite number of seconds');
+    if (!ticked) return;
+    const lo = TS[T_LAST_TICK] - sim.timeWindow, hi = TS[T_LAST_TICK] + sim.timeWindow;
+    if (t < lo) ST[S_T] = lo; else if (t > hi) ST[S_T] = hi;
   }
 
   // ---- surface evaluation (local tangent-plane coordinates) --------------------------------
@@ -457,10 +512,14 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
         const fx = sa - x0, fy = sb - y0;
         x0 &= mask; y0 &= mask;
         const x1 = (x0 + 1) & mask, y1 = (y0 + 1) & mask;
-        { // lazy blocks: make sure the 4 texels are materialised
-          const bv = kBlock[k], bs = kBSh[k], bn = kNb[k];
-          const r0 = (y0 >> bs) * bn, r1 = (y1 >> bs) * bn, c0 = x0 >> bs, c1 = x1 >> bs;
-          if (bv[r0 + c0] === 0 || bv[r0 + c1] === 0 || bv[r1 + c0] === 0 || bv[r1 + c1] === 0) kSim[k].fillAround(f, x0, y0, x1, y1);
+        // Lazy blocks: make sure the 4 texels (and, for velocity, their velocities) are materialised.
+        const bs = kBSh[k], bn = kNb[k];
+        const r0 = (y0 >> bs) * bn, r1 = (y1 >> bs) * bn, c0 = x0 >> bs, c1 = x1 >> bs;
+        let bv = kBlock[k];
+        if (bv[r0 + c0] === 0 || bv[r0 + c1] === 0 || bv[r1 + c0] === 0 || bv[r1 + c1] === 0) kSim[k].ensurePos(f, x0, y0, x1, y1);
+        if (wantVel) {
+          bv = kVelBlock[k];
+          if (bv[r0 + c0] === 0 || bv[r0 + c1] === 0 || bv[r1 + c0] === 0 || bv[r1 + c1] === 0) kSim[k].ensureVel(f, x0, y0, x1, y1);
         }
         const i00 = (y0 * n + x0) * 3, i10 = (y0 * n + x1) * 3, i01 = (y1 * n + x0) * 3, i11 = (y1 * n + x1) * 3;
         const gx = 1 - fx, gy = 1 - fy;
@@ -497,6 +556,11 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
       }
       const n = kN[k], L = kL[k];
       const a = re + E + off, b = -(rn + N) + off; // tile coords: a = east + OFF, b = -north + OFF
+      { // Catmull-Rom taps span texels xf-1 .. xf+2: materialise their blocks
+        const xf = Math.floor((a - L * Math.floor(a / L)) * kInv[k]), yf = Math.floor((b - L * Math.floor(b / L)) * kInv[k]);
+        kSim[k].ensurePos(f, xf - 1, yf - 1, xf + 2, yf + 2);
+        if (wantVel) kSim[k].ensureVel(f, xf - 1, yf - 1, xf + 2, yf + 2);
+      }
       if (wantVel) {
         sampleCubic(kVel[k], n, L, a, b);
         const v0 = SAMPLE[0], v1 = SAMPLE[1], v2 = SAMPLE[2];
@@ -540,17 +604,15 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
       // Initial guess: GUESS_STEPS cheap fixed-point steps on the largest cascade alone
       // (r = p - D0(r)); it carries most of the displacement.
       const data = kData[0], n = kN[0], inv = kInv[0], off = kOff[0], mask = n - 1;
-      for (let g = 0; g < GUESS_STEPS; g++) {
+      for (let step = 0; step < GUESS_STEPS; step++) {
         const sa = (re + off) * inv, sb = (off - rn) * inv;
         let x0 = Math.floor(sa), y0 = Math.floor(sb);
         const fx = sa - x0, fy = sb - y0;
         x0 &= mask; y0 &= mask;
         const x1 = (x0 + 1) & mask, y1 = (y0 + 1) & mask;
-          { // lazy blocks: make sure the 4 texels are materialised
-            const bv = kBlock[0], bs = kBSh[0], bn = kNb[0];
-            const r0 = (y0 >> bs) * bn, r1 = (y1 >> bs) * bn, c0 = x0 >> bs, c1 = x1 >> bs;
-            if (bv[r0 + c0] === 0 || bv[r0 + c1] === 0 || bv[r1 + c0] === 0 || bv[r1 + c1] === 0) kSim[0].fillAround(f, x0, y0, x1, y1);
-          }
+        const bv = kBlock[0], bs = kBSh[0], bn = kNb[0];
+        const r0 = (y0 >> bs) * bn, r1 = (y1 >> bs) * bn, c0 = x0 >> bs, c1 = x1 >> bs;
+        if (bv[r0 + c0] === 0 || bv[r0 + c1] === 0 || bv[r1 + c0] === 0 || bv[r1 + c1] === 0) kSim[0].ensurePos(f, x0, y0, x1, y1);
         const i00 = (y0 * n + x0) * 3, i10 = (y0 * n + x1) * 3, i01 = (y1 * n + x0) * 3, i11 = (y1 * n + x1) * 3;
         const gx = 1 - fx, gy = 1 - fy;
         re = pe - (gx * gy * data[i00 + 1] + fx * gy * data[i10 + 1] + gx * fy * data[i01 + 1] + fx * fy * data[i11 + 1]);
@@ -607,6 +669,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
   }
 
 
+  const P3: Vec3 = { x: 0, y: 0, z: 0 };
   function toLocal(p: Readonly<Vec3>): void {
     (shape as WorldShape).tangentFrame(p, frame);
     const dx = p.x - anchor.x, dy = p.y - anchor.y, dz = p.z - anchor.z;
@@ -617,7 +680,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
   const query: WaterQuery = {
     heightAt(p: Readonly<Vec3>, time: number): number {
       ST[S_T] = time;
-      const f = prepare(false);
+      const f = prepare();
       toLocal(p);
       ST[S_PE] = ST[S_LE]; ST[S_PN] = ST[S_LN];
       invert(f, false);
@@ -625,7 +688,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
     },
     velocityAt(p: Readonly<Vec3>, time: number, out: Vec3): Vec3 {
       ST[S_T] = time;
-      const f = prepare(true);
+      const f = prepare();
       toLocal(p); // also fills `frame`
       ST[S_PE] = ST[S_LE]; ST[S_PN] = ST[S_LN];
       invert(f, true);
@@ -646,15 +709,28 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
     shape.tangentFrame(windPoint, frame);
     const we = windVec.x * frame.east.x + windVec.y * frame.east.y + windVec.z * frame.east.z;
     const wn = windVec.x * frame.north.x + windVec.y * frame.north.y + windVec.z * frame.north.z;
-    if (snap || !windInit) { TS[T_WIND_E] = we; TS[T_WIND_N] = wn; windInit = true; }
-    else {
+    // Speed and direction are low-passed SEPARATELY (a vector EMA would pass through ~0 m/s when
+    // the wind reverses, and the sea would collapse). Direction follows the shortest arc.
+    const speedNow = Math.sqrt(we * we + wn * wn);
+    if (snap || !windInit) {
+      TS[T_WIND_SPEED] = speedNow;
+      if (speedNow > 1e-3) TS[T_WIND_DIR] = Math.atan2(wn, we);
+      windInit = true;
+    } else {
       const a = sim.windTimeConstant > 0 ? 1 - Math.exp(-dt / sim.windTimeConstant) : 1;
-      TS[T_WIND_E] += (we - TS[T_WIND_E]) * a;
-      TS[T_WIND_N] += (wn - TS[T_WIND_N]) * a;
+      TS[T_WIND_SPEED] += (speedNow - TS[T_WIND_SPEED]) * a;
+      if (speedNow > 0.5) {
+        let dd = Math.atan2(wn, we) - TS[T_WIND_DIR];
+        while (dd > Math.PI) dd -= 2 * Math.PI;
+        while (dd < -Math.PI) dd += 2 * Math.PI;
+        let d = TS[T_WIND_DIR] + dd * a;
+        while (d > Math.PI) d -= 2 * Math.PI;
+        while (d < -Math.PI) d += 2 * Math.PI;
+        TS[T_WIND_DIR] = d;
+      }
     }
-    const speed = Math.hypot(TS[T_WIND_E], TS[T_WIND_N]);
-    target.windSpeed = speed;
-    if (speed > 1e-3) target.windDirection = Math.atan2(TS[T_WIND_N], TS[T_WIND_E]);
+    target.windSpeed = TS[T_WIND_SPEED];
+    target.windDirection = TS[T_WIND_DIR];
   }
 
   function rebuildTarget(): void {
@@ -730,15 +806,38 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
       if (perf) perf.begin(MODULE_ID, 'sim');
       if (!initialised) init();
       const T = info.time;
+      if (!(T - T === 0)) throw new RangeError('world/ocean: tick time must be finite');
       TS[T_LAST_TICK] = T;
+      ticked = true;
       TS[T_DT] = info.dt;
       sampleWind(false);
       // Regeneration (only once the current crossfade has finished and nothing is pending).
       const blendDone = fromSlot === toSlot || T >= TS[T_BLEND_START] + TS[T_BLEND_DURATION];
       if (regenSlot >= 0) stepRegen(sim.regenRowsPerTick);
-      else if (pendingId < 0 && blendDone && (++checkCounter & 7) === 0 && differs(target, slots[toSlot].params)) {
-        startRegen();
-        stepRegen(sim.regenRowsPerTick);
+      else if (pendingId < 0 && blendDone) {
+        // Inlined copy of differs() (a function called once per tick stays in the interpreter for a
+        // long time, which boxes every double it computes = allocation per tick).
+        const a = target, b = slots[toSlot].params;
+        let du = a.windSpeed - b.windSpeed;
+        if (du < 0) du = -du;
+        let regen = du > sim.windSpeedTolerance * (b.windSpeed > 1 ? b.windSpeed : 1);
+        if (!regen && a.windSpeed > 0.5 && b.windSpeed > 0.5) {
+          let dd = a.windDirection - b.windDirection;
+          while (dd > Math.PI) dd -= 2 * Math.PI;
+          while (dd < -Math.PI) dd += 2 * Math.PI;
+          if (dd < 0) dd = -dd;
+          regen = dd > (sim.windDirectionToleranceDeg * Math.PI) / 180;
+        }
+        if (!regen) {
+          let df = a.fetch - b.fetch;
+          if (df < 0) df = -df;
+          regen = df > 1e-6 * (1 + b.fetch) || a.gamma !== b.gamma || a.spread !== b.spread || a.standing !== b.standing ||
+            a.choppiness !== b.choppiness || a.amplitude !== b.amplitude;
+        }
+        if (regen) {
+          startRegen();
+          stepRegen(sim.regenRowsPerTick);
+        }
       }
       // Switch to the pending source once the CPU has its snapshots for this interval (normally
       // well before its crossfade starts; at the start time at the latest, computing them now).
@@ -746,7 +845,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
         let ready = T >= TS[T_PEND_START];
         for (let k = 0; k < K && !ready; k++) {
           const sm = kSim[k];
-          const j0 = Math.floor(T / sm.snapshotDt) | 0;
+          const j0 = Math.floor(T / sm.snapshotDt);
           if (!sm.has(pendingId, j0) || !sm.has(pendingId, j0 + 1)) break;
           if (k === K - 1) ready = true;
         }
@@ -754,11 +853,12 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
       }
       // CPU snapshots (amortised) + the field at T for this step's queries.
       for (let k = 0; k < K; k++) {
-        CALL[0] = T; CALL[1] = info.dt; CALL[2] = TS[T_PEND_SWITCH];
-        kSim[k].schedule(activeId, pendingId);
+        const sm = kSim[k];
+        sm.args[0] = T; sm.args[1] = info.dt; sm.args[2] = TS[T_PEND_SWITCH];
+        sm.schedule(activeId, pendingId);
       }
       ST[S_T] = T;
-      prepare(false);
+      prepare();
       syncState();
       if (perf) perf.end();
     },
@@ -792,7 +892,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
 
     heightAtLocal(east: number, north: number, time: number): number {
       ST[S_T] = time;
-      const f = prepare(false);
+      const f = prepare();
       ST[S_PE] = east; ST[S_PN] = north;
       invert(f, false);
       return ST[S_H];
@@ -800,7 +900,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
 
     invertLocal(east: number, north: number, time: number, out: RestSample): number {
       ST[S_T] = time;
-      const f = prepare(true);
+      const f = prepare();
       ST[S_PE] = east; ST[S_PN] = north;
       invert(f, true);
       const residual = Math.hypot(ST[S_E] - east, ST[S_N] - north);
@@ -811,7 +911,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
 
     sampleRest(east: number, north: number, time: number, out: RestSample): RestSample {
       ST[S_T] = time;
-      const f = prepare(true);
+      const f = prepare();
       const se = east - wrapPeriod(east), sn = north - wrapPeriod(north);
       ST[S_FE] = east - se; ST[S_FN] = north - sn;
       forward(f, true, false);
@@ -826,9 +926,30 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
       return out;
     },
 
+    heightsAt(points: Float64Array, time: number, out: Float64Array, count?: number): Float64Array {
+      const n = count ?? Math.min(out.length, (points.length / 3) | 0);
+      ST[S_T] = time;
+      const f = prepare();
+      for (let i = 0; i < n; i++) {
+        P3.x = points[3 * i]; P3.y = points[3 * i + 1]; P3.z = points[3 * i + 2];
+        toLocal(P3);
+        ST[S_PE] = ST[S_LE]; ST[S_PN] = ST[S_LN];
+        invert(f, false);
+        out[i] = ST[S_H];
+      }
+      return out;
+    },
+
     dispose(): void {
-      // Drop the world references; the query keeps answering from the last state (no GPU resources here).
+      // Release the CPU buffers (slots, snapshot pools, frames); the query throws afterwards.
+      disposed = true;
       wind = undefined;
+      for (let k = 0; k < K; k++) kSim[k].dispose();
+      K = 0;
+      kSim.length = 0;
+      sims.length = 0;
+      slots.length = 0;
+      xi.length = 0;
     },
   };
   return ocean;
