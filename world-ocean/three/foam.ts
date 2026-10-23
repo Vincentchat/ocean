@@ -109,7 +109,7 @@ import {
 } from 'three/webgpu';
 import {
   Fn, If, abs, clamp, dFdx, dFdy, dot, exp, float, globalId, int, max, mix, modelWorldMatrix, normalize, pmremTexture,
-  select, smoothstep, sqrt, storage, texture, textureStore, uint, uniform, uvec2, varying, vec2, vec3, vec4,
+  smoothstep, sqrt, storage, texture, textureStore, uint, uniform, uvec2, varying, vec2, vec3, vec4,
   cameraPosition, positionWorld, reflect, pow,
 } from 'three/tsl';
 import type { FloatingOrigin, TangentFrame, Vec3, WorldShape } from '../stubs/world-core.ts';
@@ -309,7 +309,9 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
     }
     const nrm = normalize(vec3(slope.x, 1, slope.y));
     const downwind = max(dot(vec2(nrm.x, nrm.z), windAB), 0);
-    return smoothstep(P.compressionLo, P.compressionHi, max(comp, 0)).mul(P.compressionGain).add(sqrt(downwind).mul(P.slopeGain));
+    const compTerm = smoothstep(P.compressionLo, P.compressionHi, max(comp, 0)).toVar();
+    const slopeTerm = sqrt(downwind).toVar();
+    return { src: compTerm.mul(P.compressionGain).add(slopeTerm.mul(P.slopeGain)), compTerm, slopeTerm };
   }
 
   function buildTier(t: FoamTier): FoamTierState {
@@ -328,7 +330,8 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
     const kernel = Fn(() => {
       const i = globalId.x, j = globalId.y;
       const o = vec2(float(i), float(j)).add(0.5 - R / 2).mul(cell).toVar();
-      const src = sourceAt(o).toVar();
+      const sa = sourceAt(o);
+      const src = sa.src.toVar();
       const old = src.toVar();
       If(uResample.greaterThan(0.5), () => {
         const uvOld = o.add(uResampleOffset).div(P.window).add(0.5).toVar();
@@ -341,7 +344,8 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
       });
       const h = max(mix(src, old, uRetention), 0);
       hist.element(uCurBase.add(j.mul(uint(R)).add(i))).assign(h);
-      textureStore(out, uvec2(i, j), vec4(h, src, 0, 1));
+      // (history, source, compression term, sqrt downwind-slope term): the material reads .x only
+      textureStore(out, uvec2(i, j), vec4(h, src, sa.compTerm, sa.slopeTerm));
     })().compute([R / 8, R / 8, 1], [8, 8, 1]);
     const bytes = 2 * R * R * 4 + R * R * 8;
     return { tier: t, res: R, cell, histAttr, out, kernel, bytes };
@@ -689,7 +693,7 @@ export interface FoamDebugOptions {
   preExposure?: any;
   /** Direction towards the sun (flat frame), read every frame. */
   sunDir: () => Vec3;
-  mode: 'foam' | 'foamraw';
+  mode: 'foam' | 'foamraw' | 'foamcov' | 'foamsrc';
 }
 
 export function attachFoamDebugView(o: FoamDebugOptions) {
@@ -711,9 +715,25 @@ export function attachFoamDebugView(o: FoamDebugOptions) {
   const rest = varying(n.localPos.xz);
   const f = foam.nodes.layers(rest);
   if (o.mode === 'foamraw') {
-    const inWin = abs(rest.sub(foam.uniforms.anchorRel)).lessThan(200);
-    const win = select(inWin.x.and(inWin.y), float(0.15), float(0));
+    // window mask as arithmetic (no select / branch in the fragment path)
+    const d = abs(rest.sub(foam.uniforms.anchorRel));
+    const win = float(1).sub(clamp(max(d.x, d.y).sub(200).mul(1e3), 0, 1)).mul(0.15);
     material.colorNode = vec3(f.history.mul(0.5), f.foam, win).mul(envIntensity).mul(preExposure);
+  } else if (o.mode === 'foamcov' || o.mode === 'foamsrc') {
+    // Measurement view: the demo tonemap (ACES fit + gamma 2.2, exposure 1) is inverted so the captured 8-bit
+    // pixel = (foam coverage, clamp(history / 2), 1) exactly like the patched reference (gl_FragColor =
+    // vec4(foam, clamp(history * .5), 1, 1)): tools compare coverage statistics pixel for pixel.
+    const inv = (v: any) => {
+      const y = pow(clamp(v, 0, 0.999), 2.2);
+      const a = float(2.51).sub(y.mul(2.43)), b = float(0.03).sub(y.mul(0.59)), c = y.mul(-0.14);
+      return b.negate().add(sqrt(max(b.mul(b).sub(a.mul(c).mul(4)), 0))).div(a.mul(2));
+    };
+    if (o.mode === 'foamsrc') {
+      // instantaneous source terms at the rest point (history texture B, A = bilinear of the texel values)
+      const w = rest.sub(foam.uniforms.anchorRel);
+      const hs = foam.nodes.historyTexture.sample(clamp(w.div(FOAM_PARAMS.window).add(0.5), 0.001, 0.999));
+      material.colorNode = vec3(inv(hs.z), inv(hs.w), 100);
+    } else material.colorNode = vec3(inv(f.foam), inv(clamp(f.history.mul(0.5), 0, 1)), 100);
   } else {
     const footprint = max(max(abs(dFdx(rest.x)), abs(dFdx(rest.y))), max(abs(dFdy(rest.x)), abs(dFdy(rest.y))));
     const tileV = new Map<number, any>(FFT_CASCADES.map((c) => [c.domain, varying(n.tileCoord(c.domain))] as [number, any]));

@@ -12,14 +12,16 @@ test('zero allocation: tick, tick + 100 heightsAt + 10 velocityAt, velocityAt, h
   assert.equal(r.status, 0, r.stderr);
   const out = JSON.parse(r.stdout.trim().split('\n').pop() as string);
   console.log(`  heap growth over 1e3 ticks + 1.1e5 queries (incl. a regeneration): ${(out.growth / 1024).toFixed(1)} KB`);
-  console.log(`  allocated (stub world step ${out.perStubStep.toFixed(1)} B subtracted): tick ${out.perTick.toFixed(2)} B, tick + 100 heightsAt + 10 velocityAt ${out.perTickLoad.toFixed(2)} B, ` +
+  console.log(`  allocated (stub world step ${out.perStubStep.toFixed(1)} B subtracted): tick ${out.perTick.toFixed(2)} B, tick + 100 heightsAt + 10 velocityAt ${out.perTickLoad.toFixed(2)} B, during regenerations ${out.perTickRegen.toFixed(2)} B, ` +
     `velocityAt ${out.perVelocity.toFixed(2)} B/call, heightsAt ${out.perBatchPoint.toFixed(3)} B/point, heightAt ${out.perHeight.toFixed(2)} B/call`);
   assert.ok(out.acc);
   assert.ok(out.version >= 3, 'the measured run regenerated the spectrum');
   assert.ok(out.growth < 32 * 1024, `heap grew by ${out.growth} bytes`);
   // A single 16-byte boxed double per tick would already fail these.
-  assert.ok(out.perTick < 8, `tick allocates ${out.perTick} B`);
-  assert.ok(out.perTickLoad < 8, `tick + queries allocate ${out.perTickLoad} B`);
+  assert.ok(out.perTick < 2, `tick allocates ${out.perTick} B`);
+  assert.ok(out.perTickLoad < 2, `tick + queries allocate ${out.perTickLoad} B`);
+  // Wind changing all the time (regeneration / pending switch / crossfade events): amortised.
+  assert.ok(out.perTickRegen < 4, `tick during regenerations allocates ${out.perTickRegen} B`);
   assert.ok(out.perVelocity < 1, `velocityAt allocates ${out.perVelocity} B`);
   assert.ok(out.perBatchPoint < 0.2, `heightsAt allocates ${out.perBatchPoint} B/point`); // < 20 B per 100-point call (harness)
   // heightAt returns a JS number: V8 boxes the returned double (one 16-byte HeapNumber) when the

@@ -38,8 +38,8 @@
 //   With the demo (REF_NITS, preExposure = 1 / REF_NITS) the written value equals the reference's pre-tonemap colour.
 import { DoubleSide, MeshBasicNodeMaterial, Vector3 } from 'three/webgpu';
 import {
-  cameraPosition, clamp, dFdx, dFdy, dot, exp, exp2, float, length, max, min, mix, modelWorldMatrix, normalize,
-  pmremTexture, pow, positionWorld, reflect, smoothstep, sqrt, uniform, varying, vec2, vec3, vec4,
+  abs, cameraWorldMatrix, clamp, dFdx, dFdy, dot, exp, exp2, float, length, log2, max, min, mix, modelWorldMatrix,
+  normalize, pmremTexture, positionView, positionWorld, pow, reflect, smoothstep, sqrt, uniform, varying, vec2, vec3, vec4,
 } from 'three/tsl';
 import type { EnvironmentState, SkyLight } from '../stubs/world-core.ts';
 import type { FftSampling, OceanFft } from './fft.ts';
@@ -77,7 +77,7 @@ export interface OceanTransmissionContext {
   restLocal: any;
   /** The material's preExposure node (scene.color = radiance x preExposure). */
   preExposure: any;
-  /** Foam / contact white level (cd/m^2 per reference unit). */
+  /** Lambert radiance (cd/m^2) of a unit-albedo flat white surface at the fragment, from SKY_LIGHT (sky + sun). */
   foamWhite: any;
 }
 
@@ -124,6 +124,10 @@ export interface OceanMaterialOptions {
   waveScale?: number;
   /** Shade with the 4th (0.84 m) cascade's normals too (high / ultra). Default false = the reference's 3 cascades. */
   fineNormals?: boolean;
+  /** Diffuse albedo of the foam (lit by SKY_LIGHT). Default 0.8. */
+  foamAlbedo?: number;
+  /** Debug view: 'rough' (roughness / mip shortening / LOD) or 'footprint' (derivative vs analytic footprint). */
+  debug?: 'rough' | 'footprint';
   /** Ocean core (for expectedHs). */
   ocean?: { expectedHs(): number };
   name?: string;
@@ -133,13 +137,13 @@ export interface OceanMaterial {
   readonly material: any;
   /** Uniform nodes (tunables, all set by update() from the contracts unless overridden). */
   readonly uniforms: {
-    sunDir: any; sunE: any; sunSpecularScale: any; hazeDistance: any; waveScale: any; diffuseSH: any;
-    envIntensity: any; foamWhite: any;
+    sunDir: any; sunE: any; skyE: any; hazeDistance: any; waveScale: any; diffuseSH: any;
+    envIntensity: any; foamAlbedo: any;
   };
   /** Copy SKY_LIGHT / ENVIRONMENT into the uniforms. Allocation-free; call once per frame. */
   update(): void;
   /** Override (set) or release (null) a contract-driven value. */
-  readonly overrides: { sunSpecularScale: number | null; hazeDistance: number | null; waveScale: number | null };
+  readonly overrides: { hazeDistance: number | null; waveScale: number | null };
   dispose(): void;
 }
 
@@ -151,18 +155,22 @@ const F0 = 0.0180094;
 const SKY_REFLECTION_BLUR = 0.22;
 const SUN_GAIN = 4.5;
 const HS_AT_AMP1 = 2.575;
+/** Max ratio of the derivative footprint to the analytic pixel footprint before it is treated as a silhouette quad. */
+const FOOTPRINT_CLAMP = 2;
+/** Diffuse albedo of whitecap foam (fresh dense foam ~0.6-0.9). */
+const FOAM_ALBEDO = 0.8;
 
 export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
   const { fft, sampling, nodes: n } = o;
   const envI = uniform(o.envIntensity ?? 1);
-  const foamWhite = uniform(o.envIntensity ?? 1);
+  const foamAlbedo = uniform(o.foamAlbedo ?? FOAM_ALBEDO);
   const sunDir = uniform(new Vector3(-0.6, 0.6, -0.45).normalize());
   const sunE = uniform(new Vector3(4.5, 4.5, 4.5));
-  const sunSpecularScale = uniform(1);
+  const skyE = uniform(new Vector3(1, 1, 1));
   const hazeDistance = uniform(280);
   const waveScale = uniform(o.waveScale ?? 1);
   const diffuseSH = uniform(new Vector3(0.12, 0.2, 0.3));
-  const overrides = { sunSpecularScale: null as number | null, hazeDistance: null as number | null, waveScale: o.waveScale ?? null };
+  const overrides = { hazeDistance: null as number | null, waveScale: o.waveScale ?? null };
 
   // ---------------------------------------------------------------- geometry inputs (varyings)
   const restLocal = varying(n.localPos.xz);
@@ -170,21 +178,38 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
   const tileV = new Map<number, any>(FFT_CASCADES.map((c) => [c.domain, varying(n.tileCoord(c.domain))] as [number, any]));
   const tileF = (P: number) => tileV.get(P) ?? varying(n.tileCoord(P));
 
-  // ---------------------------------------------------------------- derivatives (top level: uniform control flow)
-  const footprint = max(length(dFdx(restLocal)), length(dFdy(restLocal)));
+  // ---------------------------------------------------------------- view vector (view space: floating-origin exact)
+  // positionView = modelViewMatrix (composed on the CPU in float64) x the small local position: no large world-space
+  // f32 values are subtracted, so V / dist are identical 100 km from the origin (rule 5).
+  const toWorld = (v: any) => normalize(modelWorldMatrix.mul(vec4(v, 0)).xyz);
+  const upW = toWorld(vec3(0, 1, 0));
+  const pView = positionView;
+  const dist = length(pView);
+  const rayView = pView.div(max(dist, 1e-6));                         // camera -> fragment, view space
+  const V = normalize(cameraWorldMatrix.mul(vec4(rayView.negate(), 0)).xyz); // reference V = normalize(cam - P), world axes
+  const camToP = V.negate().mul(dist);
+
+  // ---------------------------------------------------------------- footprint + derivatives (top level: uniform control flow)
+  // The reference footprint is max(|d rest/dx|, |d rest/dy|). Across a crest silhouette a 2x2 quad straddles two
+  // different waves and that derivative explodes (and so does dN): the LOD and roughness of those quads toggle from
+  // frame to frame = rows of flickering single-pixel speckles on distant crest lines. Bound both by the analytic
+  // footprint of a pixel on the mean water plane: dist x pixelAngle / |V.up| (the ray direction is continuous
+  // across silhouettes, so its derivative gives the pixel angle robustly).
+  const pixelAngle = max(length(dFdx(rayView)), length(dFdy(rayView)));
+  const cosUp = max(abs(dot(V, upW)), 0.02);
+  const footprintAnalytic = dist.mul(pixelAngle).div(cosUp);
+  const footprintDeriv = max(length(dFdx(restLocal)), length(dFdy(restLocal)));
+  const footprint = min(footprintDeriv, footprintAnalytic.mul(FOOTPRINT_CLAMP));
+  // 0 where the quad is coherent, -> 1 where it straddles a silhouette (derivatives meaningless there).
+  const straddle = smoothstep(FOOTPRINT_CLAMP, FOOTPRINT_CLAMP * 2, footprintDeriv.div(max(footprintAnalytic, 1e-6)));
   // The reference shades with the 3 reference cascades. The extra 0.84 m cascade (high / ultra) adds sub-0.1 m
   // ripples the reference does not have: it turns the broad glitter blobs into fine sparkle. Opt-in.
   const surf = sampling.sampleSurface(tileF, { footprint, threeCascades: !o.fineNormals });
-  const toWorld = (v: any) => normalize(modelWorldMatrix.mul(vec4(v, 0)).xyz);
-  const upW = toWorld(vec3(0, 1, 0));
   const surfaceNormal = toWorld(surf.normal);
-  const camToP = positionWorld.sub(cameraPosition);
-  const dist = length(camToP);
-  const V = camToP.negate().div(max(dist, 1e-6));             // reference V = normalize(cam - P)
   const faceV = (nn: any) => normalize(nn.add(V.mul(max(float(0.025).sub(dot(nn, V)), 0))));
   const N = faceV(surfaceNormal);
   const dNx = dFdx(N), dNy = dFdy(N);
-  const variance = max(dot(dNx, dNx), dot(dNy, dNy));
+  const variance = max(dot(dNx, dNx), dot(dNy, dNy)).mul(float(1).sub(straddle));
 
   const R = normalize(reflect(V.negate(), N));
   const NoV = max(dot(N, V), 0.015);
@@ -207,12 +232,15 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
   const G = NoV.div(NoV.mul(float(1).sub(k)).add(k)).mul(NoL.div(NoL.mul(float(1).sub(k)).add(k)));
   const sunF = float(F0).add(float(1 - F0).mul(pow(float(1).sub(max(dot(V, H), 0)), 5)));
   const spec = D.mul(G).mul(sunF).div(NoV.mul(4).add(0.04));
-  const sunSpec = sunE.mul(min(spec, 22)).mul(sunSpecularScale);  // = sunlight * min(spec,22) * (4.5-3.5s) * vis
+  const sunSpec = sunE.mul(min(spec, 22));                         // = sunlight * min(spec,22) * gain * vis
   const sunRef = sunE.div(SUN_GAIN);                               // = sunlight() * solarVisibility
 
   // ---------------------------------------------------------------- environment
   const env = (dir: any, r: any) => (o.envMap ? pmremTexture(o.envMap, dir, r).rgb.mul(envI) : null);
   const diffuseSky = env(upW, float(1)) ?? diffuseSH;
+
+  // Lambert radiance per unit albedo of a flat sea-level white surface (contact rim, shoreline foam): SKY_LIGHT.
+  const foamLightFlat = skyE.add(sunE.mul(max(dot(upW, L), 0))).div(Math.PI);
 
   // ---------------------------------------------------------------- water body (absorption + scatter)
   const deep = vec3(...DEEP);
@@ -223,7 +251,7 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
     const refractionNormal = faceV(normalize(mix(surfaceNormal, N, 0.22)));
     transmitted = o.transmission({
       normalWorld: refractionNormal, viewDir: V, positionWorld, upWorld: upW, tileCoord: tileF, restLocal,
-      preExposure: o.preExposure, foamWhite,
+      preExposure: o.preExposure, foamWhite: foamLightFlat,
     });
     const ext = exp(vec3(...SIGMA).negate().mul(transmitted.path));
     // mix with a 0/1 mask (mix(a, b, 0) == a exactly: open water stays bit-identical to the no-refraction path).
@@ -254,7 +282,11 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
   else foam = smoothstep(0.4, 1.0, surf.compression).mul(0.5); // placeholder until the foam piece plugs in
   foam = clamp(foam, 0, 1);
   color = color.sub(sunSpec.mul(float(1).sub(clamp(float(1).sub(foam.mul(2)), 0, 1))));
-  const foamColor = vec3(clamp(dot(surfaceNormal, L), 0, 1).mul(0.7).add(0.3)).mul(foamWhite);
+  // Foam is a diffuse white (Lambert) lit by SKY_LIGHT: sky irradiance (up-facing lux, cosine-weighted for the foam
+  // normal's tilt) + sun irradiance x N.L. (The reference used an unlit grey .3 + .7 N.L in its display units.)
+  const foamLight = skyE.mul(dot(surfaceNormal, upW).mul(0.5).add(0.5))
+    .add(sunE.mul(clamp(dot(surfaceNormal, L), 0, 1))).div(Math.PI);    // cd/m^2 per unit albedo
+  const foamColor = foamLight.mul(foamAlbedo);
   color = mix(color, foamColor, foam);
   // contact / shoreline (refraction piece; reference :337-348): soft intersection + contact foam over rocks.
   if (transmitted?.contact) color = transmitted.contact(color);
@@ -270,22 +302,34 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
     color = mix(color, hazeColor, haze);
   }
 
-  const material = new MeshBasicNodeMaterial({ side: DoubleSide });
+  // fog = false: the haze above is the water's own (reference) aerial perspective; with an engine fog pass use
+  // haze: false instead of stacking both.
+  const material = new MeshBasicNodeMaterial({ side: DoubleSide, fog: false });
   material.name = o.name ?? 'ocean.water';
   material.positionNode = o.positionNode;
   let out: any = max(color, vec3(0)).mul(o.preExposure);
   if (transmitted?.occlusion && transmitted.background) out = mix(out, transmitted.background, transmitted.occlusion);
+  if (o.debug === 'rough') {
+    // R = roughness / .8, G = mip shortening (spectral variance) x 4, B = LOD of cascade 1 (96 m) / 8. Not exposed.
+    const lod1 = max(log2(max(footprint, 1e-6).mul(256 / 96)), 0);
+    out = vec3(rough.div(0.8), surf.variance.mul(4), lod1.div(8));
+  } else if (o.debug === 'footprint') {
+    // R = derivative / analytic footprint / 4, G = sqrt(dN variance) (after the silhouette gate) x 4, B = straddle.
+    out = vec3(footprintDeriv.div(max(footprintAnalytic, 1e-6)).div(4), sqrt(variance).mul(4), straddle);
+  }
   material.colorNode = out;
 
   // ---------------------------------------------------------------- per-frame contract copy (allocation-free)
   let shVersion = -1;
   function update() {
     const sl = o.skyLight, en = o.environment;
-    const sd = en?.sunDir ?? (sl as any)?.sunDir;
+    const sd = en?.sunDir;
     if (sd) (sunDir.value as Vector3).set(sd.x, sd.y, sd.z);
     if (sl) {
       const e = sl.sunIlluminance;
       (sunE.value as Vector3).set(sl.sunColor.r * e, sl.sunColor.g * e, sl.sunColor.b * e);
+      const ks = sl.skyIlluminance;
+      (skyE.value as Vector3).set(sl.skyColor.r * ks, sl.skyColor.g * ks, sl.skyColor.b * ks);
       if (overrides.hazeDistance === null) hazeDistance.value = sl.fogDensity > 0 ? 1 / sl.fogDensity : 1e9;
       if (sl.version !== shVersion) {
         shVersion = sl.version;
@@ -297,8 +341,6 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
       }
     }
     if (overrides.hazeDistance !== null) hazeDistance.value = overrides.hazeDistance;
-    if (overrides.sunSpecularScale !== null) sunSpecularScale.value = overrides.sunSpecularScale;
-    else sunSpecularScale.value = 1 - (3.5 / 4.5) * Math.min(Math.max(en?.cloudCover ?? 0, 0), 1);
     if (overrides.waveScale !== null) waveScale.value = overrides.waveScale;
     else if (o.ocean) waveScale.value = o.ocean.expectedHs() / HS_AT_AMP1;
   }
@@ -306,7 +348,7 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
 
   return {
     material,
-    uniforms: { sunDir, sunE, sunSpecularScale, hazeDistance, waveScale, diffuseSH, envIntensity: envI, foamWhite },
+    uniforms: { sunDir, sunE, skyE, hazeDistance, waveScale, diffuseSH, envIntensity: envI, foamAlbedo },
     update,
     overrides,
     dispose() { material.dispose(); },

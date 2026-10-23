@@ -23,6 +23,8 @@
 //   nomesh     hide the ocean (perf baseline).
 //   nosnap     disable LOD snapping (control for the swim test: the surface crawls).
 //   lodoff:u:v offset the LOD's camera foot by (u east, v south) metres (swim test without moving the view).
+//   rough      water material: R = roughness / .8, G = mip shortening x 4, B = cascade-1 LOD / 8.
+//   footprint  water material: R = derivative / analytic footprint / 4, G = sqrt(dN variance) x 4, B = silhouette gate.
 //   velocity   screen-space motion of the displaced surface (current - previous position), pixels / frame, log brightness (16 px saturates), hue = direction.
 import { DoubleSide, FrontSide, Mesh, MeshBasicNodeMaterial, Scene } from 'three/webgpu';
 import {
@@ -246,6 +248,7 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
       skyLight: opts.skyLight, environment: opts.environment, envMap: opts.envMap, envIntensity: opts.envIntensity ?? 1,
       preExposure, foamCoverage: opts.foamCoverage ?? ((c) => foam.nodes.coverage(c.restLocal)), transmission: opts.transmission ?? refraction?.transmission, haze: opts.haze,
       waveScale: opts.waveScale, ocean: opts.ocean as any,
+      debug: dbg.has('rough') ? 'rough' : dbg.has('footprint') ? 'footprint' : undefined,
     });
     material = water.material;
   }

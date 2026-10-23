@@ -148,3 +148,29 @@ test('snapshot workers: bit-identical heights with and without workers', () => {
   }
   a.ocean.dispose!(); b.ocean.dispose!();
 });
+test('crossfade schedule is independent of thread timing: wind change, workers vs main thread, bit-identical', () => {
+  const mk = (worker: boolean) => {
+    const world = createStubWorld({ shape });
+    const wind = createStubWind(15, -57.29578, shape);
+    world.provide(WIND_QUERY, wind);
+    const ocean = createOcean({ preset: 'windy', worker, windTimeConstant: 1 });
+    world.use(ocean); world.start();
+    return { world, wind, ocean };
+  };
+  const a = mk(true), b = mk(false);
+  const p: Vec3 = { x: 0, y: 0, z: 0 };
+  let maxDiff = 0;
+  for (let i = 0; i < 1500; i++) {
+    if (i === 30) { a.wind.set(22, 0); b.wind.set(22, 0); }
+    a.world.stepOnce(); b.world.stepOnce();
+    if (i % 50 === 0) for (let k = 0; k < 20; k++) {
+      p.x = k * 37.1; p.z = k * 11.3;
+      maxDiff = Math.max(maxDiff, Math.abs(a.ocean.query.heightAt(p, a.world.time) - b.ocean.query.heightAt(p, b.world.time)));
+    }
+  }
+  const sa = a.ocean.getState(), sb = b.ocean.getState();
+  assert.ok(sa.version > 2, 'regenerated');
+  assert.equal(sa.blendStart, sb.blendStart);
+  assert.equal(maxDiff, 0);
+  a.ocean.dispose!(); b.ocean.dispose!();
+});

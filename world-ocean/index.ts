@@ -526,11 +526,6 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
     return false;
   }
 
-  function smoothstep01(x: number): number {
-    if (x <= 0) return 0;
-    if (x >= 1) return 1;
-    return x * x * (3 - 2 * x);
-  }
   /**
    * Crossfade state at time ST[S_T]: ST[S_W] = w(t) = smoothstep((t - blendStart) / blendDuration),
    * ST[S_DW] = dw/dt, ST[S_CHOP] = lerp(chop_from, chop_to, w), ST[S_DCHOP] = d chop / dt.
@@ -541,7 +536,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
     const a = slots[fromSlot].params.choppiness, b = slots[toSlot].params.choppiness;
     if (fromSlot === toSlot) { ST[S_W] = 1; ST[S_DW] = 0; ST[S_CHOP] = b; ST[S_DCHOP] = 0; return; }
     const x = (t - TS[T_BLEND_START]) / TS[T_BLEND_DURATION];
-    const w = smoothstep01(x);
+    const w = x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x); // smoothstep inlined (a call returning a double may box)
     const dw = x <= 0 || x >= 1 ? 0 : (6 * x * (1 - x)) / TS[T_BLEND_DURATION];
     ST[S_W] = w; ST[S_DW] = dw; ST[S_CHOP] = a + (b - a) * w; ST[S_DCHOP] = (b - a) * dw;
   }

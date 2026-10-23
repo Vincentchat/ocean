@@ -87,14 +87,14 @@ const perTickLoadRaw = bytesPer(600, () => {
   ocean.heightsAt(pts, world.time, hs);
   for (let k = 0; k < 10; k++) { p.x = k * 11; p.z = k * 5; q.velocityAt(p, world.time, v); }
 });
-// The stub WIND_QUERY (stubs/impl.ts, not part of the ocean) allocates in at(); measured and subtracted.
+// The probe's WIND_QUERY itself (reported, not subtracted: it should be ~0).
 const wp = { x: 0, y: 10, z: 0 }, wv = { x: 0, y: 0, z: 0 };
 const perWindSample = bytesPer(600, () => { wind.at(wp, wv); });
-const perTick = perTickRaw - perStubStep - perWindSample, perTickLoad = perTickLoadRaw - perStubStep - perWindSample;
+const perTick = perTickRaw - perStubStep, perTickLoad = perTickLoadRaw - perStubStep;
 // While the wind keeps changing (regenerations, pending switches, crossfades): rare event code paths.
 let flip = 0;
 const perTickRegenRaw = bytesPer(600, () => { if ((++flip % 150) === 0) wind.set(flip & 256 ? 20 : 15, flip & 512 ? 10 : -50); if (process.env.NAP !== '0') Atomics.wait(nap, 0, 0, 3); world.stepOnce(); });
-const perTickRegen = perTickRegenRaw - perStubStep - perWindSample;
+const perTickRegen = perTickRegenRaw - perStubStep;
 console.log(JSON.stringify({
   before, after, growth: after - before, acc: Number.isFinite(acc), version: ocean.getState().version,
   perHeight, perVelocity, perBatchPoint, perTick, perTickLoad, perTickRegen, perStubStep, perWindSample,

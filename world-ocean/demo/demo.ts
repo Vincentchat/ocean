@@ -20,7 +20,9 @@
 //   ?wind=speed,dirDeg           provide a stub WIND_QUERY (m/s, direction blown towards, CCW from east).
 //   ?debug=name                  debug view name handed to createOceanGpu (e.g. velocity).
 //   ?exposure=x                  extra tonemap exposure (default 1).  ?dpr=x pixel ratio cap (default 1.75).
-//   ?parity                      reserved for the ocean parity check (handed through as window.__demo.flags).
+//   ?parity[=N]                  GPU drawn heights vs CPU WATER_QUERY at N points, overlay + window.__parity
+//                                (demo/parity-demo.ts, three/parity.ts).  ?buoy: floating test objects (window.__buoy).
+//                                ?cpufilter=bilinear|cubic overrides the CPU query filter (A/B).
 //   ?seabed=1|0|nomesh           demo seabed (reference sand + rocks + caustics; default 1). 0 = open ocean only.
 //                                nomesh = TERRAIN_QUERY / TERRAIN_GPU provided but the mesh not drawn (contract test).
 //   ?refraction=1|0              water in the transparent stage refracting scene.color / scene.depth (default 1).
@@ -204,6 +206,8 @@ async function main() {
     if (typeof core.createOcean === 'function') {
       const amp = flags.scene ? core.REFERENCE_SCENE_AMPLITUDE?.[flags.scene] : undefined;
       ocean = core.createOcean(amp !== undefined ? { preset: 'windy', seed: 1, amplitude: amp } : { preset: flags.preset, seed: 1 });
+      // ?cpufilter=bilinear|cubic: CPU query filter override (parity A/B), else the core default.
+      if (params.get('cpufilter')) { ocean.dispose?.(); ocean = core.createOcean({ preset: amp !== undefined ? 'windy' : flags.preset, seed: 1, ...(amp !== undefined ? { amplitude: amp } : {}), query: core.DEFAULT_QUERY_CASCADES.map((c: any) => ({ ...c, filter: params.get('cpufilter') })) }); }
       world.use(ocean);
     } else console.info('[demo] ../index.ts has no createOcean yet; running without the core');
   } catch (e) {
@@ -269,7 +273,8 @@ async function main() {
 
   // Foam is part of createOceanGpu (gpu.foam, pass 'ocean.foam'). Opt-in foam debug view (?debug=foam | ?debug=foamraw):
   // a debug material with the reference foam composition. window.__foam = { foam, view } for tools/foam-check.mjs.
-  const foamMode = flags.debug.split(',').includes('foamraw') ? 'foamraw' : flags.debug.split(',').includes('foam') ? 'foam' : null;
+  const dbgList = flags.debug.split(',');
+  const foamMode = dbgList.includes('foamsrc') ? 'foamsrc' : dbgList.includes('foamcov') ? 'foamcov' : dbgList.includes('foamraw') ? 'foamraw' : dbgList.includes('foam') ? 'foam' : null;
   if (foamMode && ocean) {
     const { attachFoamDebugView } = await import('../three/foam.ts');
     const foam = gpu.foam;
@@ -355,6 +360,15 @@ async function main() {
     lookTarget.set(camera.position.x + fwd.x, camera.position.y + fwd.y, camera.position.z + fwd.z);
     camera.lookAt(lookTarget);
     camera.updateMatrixWorld();
+  }
+
+  // ?parity / ?buoy (demo/parity-demo.ts): GPU drawn-height probe vs the CPU WATER_QUERY; floating test objects.
+  if (ocean && (flags.parity || params.has('buoy'))) {
+    await (await import('./parity-demo.ts')).attachParityDemo({
+      parity: flags.parity, buoy: params.has('buoy'), points: Number(params.get('parity')) || undefined, renderer, gpu, ocean, origin,
+      shape: world.shape, camera, scene, runner, preExposure, refNits: REF_NITS, sunDir: sky.skyLight.sunDir,
+      cubic: !flags.debug.split(',').includes('fftbilinear'), camWorld: freeCam, yaw: freeCam.yaw,
+    });
   }
 
   // ---------------------------------------------------------------------------------- UI
