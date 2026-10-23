@@ -5,14 +5,23 @@
 // 2) Bytes allocated per tick / per query. Prints one JSON line.
 import v8 from 'node:v8';
 import { createOcean, WIND_QUERY } from '../../index.ts';
-import { createFlatShape, createStubWorld, createStubWind } from '../../stubs/impl.ts';
+import { createFlatShape, createStubWorld } from '../../stubs/impl.ts';
 
 const gc = (globalThis as { gc?: () => void }).gc;
 if (!gc) throw new Error('run with --expose-gc');
 
 const shape = createFlatShape();
 const world = createStubWorld({ shape });
-const wind = createStubWind(15, -57.3, shape);
+// An allocation-free WIND_QUERY (the stub's at() goes through helper calls that V8 may box): we measure the ocean.
+const windState = { speed: 15, dir: -57.3 };
+const wind = {
+  set(speed: number, dirDeg: number) { windState.speed = speed; windState.dir = dirDeg; },
+  at(_p: { x: number; y: number; z: number }, out: { x: number; y: number; z: number }) {
+    const r = (windState.dir * Math.PI) / 180;
+    out.x = windState.speed * Math.cos(r); out.y = 0; out.z = -windState.speed * Math.sin(r);
+    return out;
+  },
+};
 world.provide(WIND_QUERY, wind);
 const ocean = createOcean({ preset: 'windy', windTimeConstant: 2, blendTime: 2, worker: process.env.WORKER !== '0' });
 world.use(ocean);
@@ -56,6 +65,8 @@ function bytesPer(n: number, fn: (i: number) => void): number {
   }
   return best;
 }
+// Let the sea settle (finish the crossfades of the last wind change) before the steady measurements.
+for (let i = 0; i < 1200; i++) world.stepOnce();
 const t = world.time;
 const perHeight = bytesPer(20000, (i) => { p.x = (i * 37) % 997; p.z = (i * 11) % 911; q.heightAt(p, t); });
 const perVelocity = bytesPer(20000, (i) => { p.x = (i * 37) % 997; p.z = (i * 11) % 911; q.velocityAt(p, t, v); });
@@ -80,7 +91,11 @@ const perTickLoadRaw = bytesPer(600, () => {
 const wp = { x: 0, y: 10, z: 0 }, wv = { x: 0, y: 0, z: 0 };
 const perWindSample = bytesPer(600, () => { wind.at(wp, wv); });
 const perTick = perTickRaw - perStubStep - perWindSample, perTickLoad = perTickLoadRaw - perStubStep - perWindSample;
+// While the wind keeps changing (regenerations, pending switches, crossfades): rare event code paths.
+let flip = 0;
+const perTickRegenRaw = bytesPer(600, () => { if ((++flip % 150) === 0) wind.set(flip & 256 ? 20 : 15, flip & 512 ? 10 : -50); if (process.env.NAP !== '0') Atomics.wait(nap, 0, 0, 3); world.stepOnce(); });
+const perTickRegen = perTickRegenRaw - perStubStep - perWindSample;
 console.log(JSON.stringify({
   before, after, growth: after - before, acc: Number.isFinite(acc), version: ocean.getState().version,
-  perHeight, perVelocity, perBatchPoint, perTick, perTickLoad, perStubStep, perWindSample,
+  perHeight, perVelocity, perBatchPoint, perTick, perTickLoad, perTickRegen, perStubStep, perWindSample,
 }));
