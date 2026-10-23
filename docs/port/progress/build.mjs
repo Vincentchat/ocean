@@ -123,7 +123,7 @@ ${(status.checks ?? []).map((c) => `<tr><td class="num">${esc(c.id)}</td><td>${e
 ${(status.issues ?? []).length ? `<ul class="issues">${status.issues.map((i) => `<li><span class="sev ${esc(i.severity)}">${esc(i.severity)}</span>${esc(i.text)}</li>`).join('')}</ul>` : '<p class="sub">None open.</p>'}
 </section>
 
-<section><h2>Log</h2><div class="log">${(status.log ?? []).slice().reverse().map((l) => `<div><b>${esc(l.time)}</b> ${esc(l.text)}</div>`).join('')}</div></section>
+<section><h2>Log</h2><div class="log">${(status.log ?? []).map((l) => `<div><b>${esc(l.time)}</b> ${esc(l.text)}</div>`).join('')}</div></section>
 </main>`;
 
 writeFileSync(resolve(here, 'index.html'), html);

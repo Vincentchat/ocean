@@ -40,7 +40,11 @@
 //     ocean's seed (gaussianField(seed, 3)), same JONSWAP + spreading, gravity dispersion (quantised like the
 //     core). Height sigma ~1.7 mm (CPU parity unaffected: < 0.05 % Hs); slope variance ~= c2's (0.04-0.055):
 //     it adds real micro roughness (the material sees it through the mip shortening / `fineGain`).
-//   GPU cost (RTX 2070, timestamps, see fft-debug ?bench): reported in the module report / TUNING.md.
+//   GPU cost, whole FFT pass incl. derived fields + mip chains (RTX 2070, compute timestamps, 600 frames,
+//   tools/fft-check.mjs, 2026-10-23; run-to-run spread ~15 %): low 0.24-0.28 ms, medium 0.24-0.32 ms,
+//   high 0.32-0.42 ms, ultra 0.67-0.88 ms. Memory (textures + buffers): low 22 MB, medium/high 36 MB, ultra 71 MB.
+//   Async tier compile ~1.0-1.3 s (renderer.compileComputeAsync), old tier drawn meanwhile.
+//   The base group (fixed) dominates low/medium: shrinking only c2 to 128 saves little; it is kept for weak GPUs.
 //
 // =====================================================================================================
 // OUTPUT TEXTURES (all rgba16float 2D-ARRAY storage textures, Repeat, LinearMipmapLinear, full mip chains
@@ -569,9 +573,13 @@ export function createOceanFft(opts: OceanFftOptions): OceanFft {
   let retired: TierState | null = null;
   let retireFrames = 0;
 
-  async function buildTier(t: OceanTier): Promise<TierState> {
+  function makeDetail(t: OceanTier): Group {
     const config = FFT_TIERS[t];
-    const detail = buildGroup(u, config.detailSize, [2, 3], config.cascades === 4 ? 2 : 1, `detail${config.detailSize}`, omegaFor);
+    return buildGroup(u, config.detailSize, [2, 3], config.cascades === 4 ? 2 : 1, `detail${config.detailSize}`, omegaFor);
+  }
+  async function buildTier(t: OceanTier, prebuilt: Group | null): Promise<TierState> {
+    const config = FFT_TIERS[t];
+    const detail = prebuilt ?? makeDetail(t);
     const list = [...base.kernels, ...detail.kernels];
     const t0 = performance.now();
     await renderer.compileComputeAsync(list);
@@ -579,28 +587,32 @@ export function createOceanFft(opts: OceanFftOptions): OceanFft {
     return { tier: t, config, detail, list, bytes: base.bytes + detail.bytes };
   }
 
-  function startBuild(t: OceanTier) {
+  function startBuild(t: OceanTier, prebuilt: Group | null = null) {
     pendingTier = t;
-    buildTier(t).then((ts) => {
+    buildTier(t, prebuilt).then((ts) => {
       if (pendingTier !== t) { disposeGroup(ts.detail); return; } // superseded
       pending = ts;
     }, (e) => { console.error('[ocean.fft] tier build failed', e); if (pendingTier === t) pendingTier = null; });
   }
 
-  // Texture nodes for the material (values swap on tier change).
+  // Texture nodes for the material (values swap on tier change). The first tier's detail group is created now
+  // (only its compilation is async) so every node starts with its own distinct texture: three merges texture
+  // nodes that share a texture into one binding when a shader is built, so a shared placeholder would alias
+  // the detail lookups to the base textures for the material's whole life.
+  const firstDetail = makeDetail(requested);
   const nodes: OceanFftTextures = {
     displacementBase: texture(base.displacement),
     normalBase: texture(base.normal),
     derivativesBase: texture(base.derivatives),
-    displacementDetail: texture(base.displacement), // placeholder value until the first tier is ready
-    normalDetail: texture(base.normal),
-    derivativesDetail: texture(base.derivatives),
+    displacementDetail: texture(firstDetail.displacement),
+    normalDetail: texture(firstDetail.normal),
+    derivativesDetail: texture(firstDetail.derivatives),
   };
   const uniforms = {
     dispCurLayer: uniform(0),
     dispPrevLayer: uniform(0),
-    detailSize: uniform(256),
-    fineEnabled: uniform(0),
+    detailSize: uniform(FFT_TIERS[requested].detailSize),
+    fineEnabled: uniform(FFT_TIERS[requested].cascades === 4 ? 1 : 0),
     unresolvedSlopeVariance: uniform(0),
     windAB: u.windAB,
   };
@@ -627,7 +639,7 @@ export function createOceanFft(opts: OceanFftOptions): OceanFft {
     freshHistory = true;
   }
 
-  startBuild(requested);
+  startBuild(requested, firstDetail);
 
   const pass: Pass = {
     desc: {

@@ -1,0 +1,17 @@
+{
+  "shots": [
+    { "name": "C1-water", "demoQuery": "shot&t=30&scene=storm&cam=0,4.8,8,0,-16.04", "referenceQuery": "shot&t=30&preset=storm&creature=0&cam=0,4.8,8,0,-16.04" },
+    { "name": "C1-lod", "demoQuery": "shot&t=30&scene=storm&debug=lod&cam=0,4.8,8,0,-16.04" },
+    { "name": "C5-water", "demoQuery": "shot&t=30&scene=storm&cam=0,1.2,8,-17.19,-1.15", "referenceQuery": "shot&t=30&preset=storm&creature=0&cam=0,1.2,8,-17.19,-1.15" },
+    { "name": "C5-lod", "demoQuery": "shot&t=30&scene=storm&debug=lod&cam=0,1.2,8,-17.19,-1.15" },
+    { "name": "C5-facets", "demoQuery": "shot&t=30&scene=storm&debug=facets&cam=0,1.2,8,-17.19,-1.15" },
+    { "name": "C4-water", "demoQuery": "shot&t=30&scene=azure&cam=0,60,8,0,-42.97", "referenceQuery": "shot&t=30&preset=azure&creature=0&cam=0,60,8,0,-42.97" },
+    { "name": "C4-lod", "demoQuery": "shot&t=30&scene=azure&debug=lod&cam=0,60,8,0,-42.97" },
+    { "name": "C6-water", "demoQuery": "shot&t=30&scene=storm&cam=20,3,-20,0,-68.75", "referenceQuery": "shot&t=30&preset=storm&creature=0&cam=20,3,-20,0,-68.75" },
+    { "name": "C6-lod", "demoQuery": "shot&t=30&scene=storm&debug=lod&cam=20,3,-20,0,-68.75" },
+    { "name": "H400-horizon", "demoQuery": "shot&t=30&scene=azure&cam=0,400,8,0,-3", "referenceQuery": "shot&t=30&preset=azure&creature=0&cam=0,400,8,0,-3" },
+    { "name": "H400-lod", "demoQuery": "shot&t=30&scene=azure&debug=lod&cam=0,400,8,0,-3" },
+    { "name": "H5-horizon", "demoQuery": "shot&t=30&scene=azure&cam=0,4.8,8,90,0", "referenceQuery": "shot&t=30&preset=azure&creature=0&cam=0,4.8,8,90,0" },
+    { "name": "H5-horizon-lod", "demoQuery": "shot&t=30&scene=azure&debug=lod&cam=0,4.8,8,90,0" }
+  ]
+}

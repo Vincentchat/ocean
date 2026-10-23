@@ -1,12 +1,16 @@
-// PLACEHOLDER three adapter (infra scaffold). The real WebGPU/TSL ocean replaces the material + fft pass
-// (fft.ts, material.ts, passes.ts ...). Keep the createOceanGpu signature (spec Â§3/Â§5).
+// three adapter (WebGPU / TSL): createOceanGpu wires the GPU FFT (three/fft.ts) to the camera-centred LOD mesh
+// (three/lod.ts). Keep the createOceanGpu signature (spec §3/§5).
 //
-// What it does now: the real camera-centred LOD mesh (three/lod.ts: snapped clipmap, geomorph, horizon skirt,
-// camera-relative, floating-origin tile anchors) displaced by a TEMPORARY test pattern â€” a sum of six
-// Gerstner-like waves with integer wave numbers per tile of 1024 / 96 / 9 m, sampled through
-// lod.nodes.tileCoord(P), so it is periodic in WORLD space exactly like the FFT tiles will be. The FFT agent
-// replaces `testWaves` with the FFT displacement and keeps the lod wiring.
-// Shading: Fresnel env reflection + Gaussian distance haze (reference Â§2.11), radiance x preExposure, no tonemap.
+// Displacement: the FFT's chained cascade lookup (createFftSampling().sampleDisplacement, reference spectralField)
+// at lod.nodes.tileCoord(P) (world-periodic, floating-origin safe), explicit LOD from the vertex footprint
+// (lod.nodes.cellSize), faded to flat between 200 m and 1200 m (reference farFade). The core's spectrum anchor is
+// the world origin (createOcean anchor 0), which is what tileCoord measures from.
+// Motion vectors: previousPositionNode = lod.nodes.previousLocalPos + the PREVIOUS frame's displacement (the FFT
+// keeps last frame's displacement layers = the field at time - frameDt), same lookup.
+// Shading (TEMPORARY simple lit material; the real material builder replaces it): per-fragment normal from the
+// FFT normal textures (reference spectralSurface: chained, footprint LOD from d(rest)/d(screen)), roughness from
+// the mip shortening, Fresnel env reflection, deep-water body colour, grey whitecaps from the Jacobian
+// compression, Gaussian distance haze (reference §2.11). Radiance x preExposure, no tonemap.
 //
 // Debug views (opts.debug, comma separated; demo ?debug=...):
 //   lod        level colours (hue per level, darker = geomorph), lit by facet normals, wireframe overlay,
@@ -15,19 +19,24 @@
 //   nomesh     hide the ocean (perf baseline).
 //   nosnap     disable LOD snapping (control for the swim test: the surface crawls).
 //   lodoff:u:v offset the LOD's camera foot by (u east, v south) metres (swim test without moving the view).
+//   velocity   screen-space motion of the displaced surface (current - previous position), |NDC v| x 200 per frame.
 import { DoubleSide, FrontSide, Mesh, MeshBasicNodeMaterial } from 'three/webgpu';
 import {
-  cameraPosition, clamp, cos, cross, floor, dFdx, dFdy, dot, exp, float, max, mix, modelWorldMatrix,
-  normalize, pmremTexture, pow, positionWorld, reflect, sin, smoothstep, uniform, varying, vec2, vec3, vec4,
+  abs, cameraPosition, cameraProjectionMatrix, cameraViewMatrix, clamp, cross, dFdx, dFdy, dot, exp, float, floor,
+  max, mix, modelWorldMatrix, normalize, pmremTexture, pow, positionWorld, reflect, smoothstep, sqrt, uniform,
+  varying, vec3, vec4,
 } from 'three/tsl';
 import type { FloatingOrigin, SkyLight, Vec3, WorldShape } from '../stubs/world-core.ts';
 import type { Pass, PassContext } from './pass-types.ts';
 import { createOceanLod, type OceanLod } from './lod.ts';
+import { createOceanFft, createFftSampling, FFT_CASCADES, type OceanFft, type FftOceanSource } from './fft.ts';
 
 export type { Pass, PassContext, PassDesc, Stage } from './pass-types.ts';
 export { STAGES } from './pass-types.ts';
 export { createOceanLod } from './lod.ts';
 export type { OceanLod, OceanLodNodes, OceanLodOptions, OceanLodStats } from './lod.ts';
+export { createOceanFft, createFftSampling, FFT_TIERS, FFT_CASCADES, BASE_SIZE, FINE_DOMAIN } from './fft.ts';
+export type { OceanFft, FftSampling, FftSampleOptions, FftSurfaceSample, FftTierConfig } from './fft.ts';
 
 export type OceanTier = 'low' | 'medium' | 'high' | 'ultra';
 
@@ -37,7 +46,7 @@ export interface PerfSink {
 }
 
 export interface OceanGpuOptions {
-  /** The core WorldSystem from createOcean() (may be null while the core is not built). */
+  /** The core WorldSystem from createOcean() (required: the FFT reads its spectrum slots). */
   ocean: unknown;
   /** three/webgpu WebGPURenderer (must be the WebGPU backend). */
   renderer: any;
@@ -66,6 +75,10 @@ export interface OceanGpu {
   readonly material: any;
   /** The LOD (mesh, TSL nodes, stats). */
   readonly lod: OceanLod;
+  /** The GPU FFT (textures, uniforms, tiers, readback). */
+  readonly fft: OceanFft;
+  /** Resolves once the first FFT tier is compiled and has run. */
+  readonly ready: Promise<void>;
   /** Last frame's displaced local position node (motion vectors). */
   readonly previousPositionNode: any;
   setTier(t: OceanTier): void;
@@ -85,56 +98,33 @@ function defaultFlatShape(): WorldShape {
   };
 }
 
-// TEMPORARY test waves: integer wave numbers (kx, kz) per tile so each is exactly periodic over its tile.
-const TEST_WAVES = [
-  { P: 1024, kx: 20, kz: 10, A: 0.55, phase: 0.3 },  // lambda 45.8 m (reference peak)
-  { P: 1024, kx: 7, kz: -3, A: 0.7, phase: 1.1 },    // 134 m swell
-  { P: 96, kx: 5, kz: 3, A: 0.13, phase: 2.0 },      // 16.5 m
-  { P: 96, kx: -2, kz: 7, A: 0.09, phase: 0.7 },     // 13.2 m
-  { P: 9, kx: 3, kz: 4, A: 0.028, phase: 1.7 },      // 1.8 m
-  { P: 9, kx: -4, kz: 1, A: 0.018, phase: 0.2 },     // 2.2 m
-];
-const G = 9.80665;
-const CHOP = 0.9;
-
 export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
-  const { origin, camera, scene } = opts;
+  const { origin, camera, scene, renderer } = opts;
+  if (!opts.ocean) throw new Error('createOceanGpu: options.ocean (the core createOcean() system) is required');
   const shape = opts.shape ?? defaultFlatShape();
   const preExposure = typeof opts.preExposure === 'object' && opts.preExposure ? opts.preExposure : uniform(opts.preExposure ?? 1);
   const envIntensity = uniform(opts.envIntensity ?? 1);
   const dbg = new Set((opts.debug ?? '').split(',').map((s) => s.trim()).filter(Boolean));
   let lodOffU = 0, lodOffV = 0;
   for (const d of dbg) if (d.startsWith('lodoff:')) { const [, u, v] = d.split(':'); lodOffU = Number(u) || 0; lodOffV = Number(v) || 0; }
+  const tier = opts.tier ?? 'high';
 
-  const lod = createOceanLod({ tier: opts.tier ?? 'high', shape, origin });
+  const lod = createOceanLod({ tier, shape, origin });
   lod.debug.noSnap = dbg.has('nosnap');
   lod.debug.footOffsetU = lodOffU;
   lod.debug.footOffsetV = lodOffV;
   const n = lod.nodes;
 
-  // ------------------------------------------------------------------ temporary test displacement
-  const phaseNow = TEST_WAVES.map(() => uniform(0));
-  const phasePrev = TEST_WAVES.map(() => uniform(0));
+  const fft = createOceanFft({ renderer, ocean: opts.ocean as FftOceanSource, tier, perf: opts.perf });
+  const sampling = createFftSampling(fft);
+
+  // ------------------------------------------------------------------ displacement (vertex)
   const fade = float(1).sub(smoothstep(200, 1200, n.distanceToCamera)); // reference farFade
-  function testWaves(phases: any[], tileOf: (P: number) => any, cell: any, fadeNode: any) {
-    let disp: any = vec3(0, 0, 0);
-    let slope: any = vec2(0, 0);
-    TEST_WAVES.forEach((w, i) => {
-      const kx = (2 * Math.PI * w.kx) / w.P, kz = (2 * Math.PI * w.kz) / w.P;
-      const k = Math.hypot(kx, kz), lambda = (2 * Math.PI) / k;
-      const theta = dot(tileOf(w.P), vec2(kx, kz)).sub(phases[i]);
-      // Footprint LOD: drop waves the local grid cannot resolve (cell > lambda / 4).
-      const att = float(1).sub(smoothstep(lambda / 6, lambda / 3, cell)).mul(fadeNode).mul(w.A);
-      const c = cos(theta), s = sin(theta);
-      disp = disp.add(vec3(s.mul(-CHOP * kx / k), c, s.mul(-CHOP * kz / k)).mul(att));
-      slope = slope.add(vec2(kx, kz).mul(s.negate()).mul(att));
-    });
-    return { disp, slope };
-  }
-  const vtx = testWaves(phaseNow, (P) => n.tileCoord(P), n.cellSize, fade);
-  const vtxPrev = testWaves(phasePrev, (P) => n.tileCoord(P), n.cellSize, fade);
-  const positionNode = n.localPos.add(vtx.disp);
-  const previousPositionNode = n.previousLocalPos.add(vtxPrev.disp);
+  const tile = (P: number) => n.tileCoord(P);
+  const disp = sampling.sampleDisplacement(tile, { footprint: n.cellSize }).mul(fade);
+  const dispPrev = sampling.sampleDisplacement(tile, { footprint: n.cellSize, previous: true }).mul(fade);
+  const positionNode = n.localPos.add(disp);
+  const previousPositionNode = n.previousLocalPos.add(dispPrev);
 
   // ------------------------------------------------------------------ materials
   const upW = normalize(modelWorldMatrix.mul(vec4(0, 1, 0, 0)).xyz);
@@ -184,21 +174,37 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
     const L = normalize(upW.mul(0.25).add(vec3(0.8, 0, 0.55)));
     const g = float(0.03).add(pow(clamp(dot(facetN, L), 0, 1), 2).mul(1.6));
     material.colorNode = vec3(g).mul(envIntensity).mul(0.5).mul(preExposure);
+  } else if (dbg.has('velocity')) {
+    material = new MeshBasicNodeMaterial({ side: DoubleSide });
+    material.name = 'ocean.debug.velocity';
+    // NDC motion of the displaced vertex (current - previous), both with this frame's camera (object motion only).
+    const toClip = (p: any) => cameraProjectionMatrix.mul(cameraViewMatrix).mul(modelWorldMatrix).mul(vec4(p, 1));
+    const c0 = toClip(positionNode), c1 = toClip(previousPositionNode);
+    const vel = varying(c0.xy.div(c0.w).sub(c1.xy.div(c1.w)));
+    material.colorNode = vec3(abs(vel.x).mul(200), abs(vel.y).mul(200), 0.05).mul(envIntensity).mul(preExposure);
   } else {
     material = new MeshBasicNodeMaterial({ side: DoubleSide });
-    material.name = 'ocean.placeholder';
-    // Fragment normal from the analytic slope at the (world-periodic) tile coordinates: no swimming.
-    const frag = testWaves(phaseNow, (P) => varying(n.tileCoord(P)), varying(n.cellSize).mul(0.5), float(1));
-    const nLocal = normalize(vec3(frag.slope.x.negate(), 1, frag.slope.y.negate()));
-    let N: any = normalize(modelWorldMatrix.mul(vec4(nLocal, 0)).xyz);
+    material.name = 'ocean.fft.simple';
+    // Fragment surface from the FFT normal textures at the (world-periodic) rest tile coordinates.
+    const restLocal = varying(n.localPos.xz);
+    const footprint = max(max(abs(dFdx(restLocal.x)), abs(dFdx(restLocal.y))), max(abs(dFdy(restLocal.x)), abs(dFdy(restLocal.y))));
+    const tileV = new Map<number, any>(FFT_CASCADES.map((c) => [c.domain, varying(n.tileCoord(c.domain))] as [number, any]));
+    const tileF = (P: number) => tileV.get(P);
+    const surf = sampling.sampleSurface(tileF, { footprint });
+    let N: any = normalize(modelWorldMatrix.mul(vec4(surf.normal, 0)).xyz);
     N = normalize(N.add(V.negate().mul(max(float(0.025).sub(dot(N, V.negate())), 0)))); // keep N facing the viewer
     const NoV = clamp(dot(N, V.negate()), 0.015, 1);
     const fresnel = float(0.018).add(float(0.982).mul(pow(float(1).sub(NoV), 5)));
+    const rough = clamp(float(0.018).add(surf.variance.mul(0.8))
+      .add(sqrt(float(1).add(fft.uniforms.unresolvedSlopeVariance)).sub(1).mul(0.8)), 0.018, 0.8);
     const deep = vec3(0.0159963, 0.0612461, 0.0998987);
-    const sky = envAt(reflect(V, N), float(0.24));
+    const sky = envAt(reflect(V, N), clamp(rough.add(0.22), 0, 1));
     const diffuse = envAt(upW, float(1));
     let color: any = mix(deep.mul(diffuse).mul(0.8), sky, fresnel);
-    // Gaussian distance haze towards the env colour just above the horizon (reference Â§2.11).
+    // Whitecaps (simple): grey foam where the surface compresses (reference foam source smoothstep(.15,.5,c)).
+    const foam = smoothstep(0.4, 1.0, surf.compression).mul(0.5);
+    color = mix(color, diffuse.mul(0.6), foam);
+    // Gaussian distance haze towards the env colour just above the horizon (reference §2.11).
     const horiz = toFrag.sub(upW.mul(dot(toFrag, upW)));
     const hazeDir = normalize(horiz.add(upW.mul(dist.mul(0.002))));
     const haze = float(1).sub(exp(dist.div(280).pow(2).negate()));
@@ -212,23 +218,14 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
   if (overlay) lod.mesh.add(overlay); // child: shares the LOD mesh transform
 
   // ------------------------------------------------------------------ pass
-  const omega = TEST_WAVES.map((w) => Math.sqrt(G * Math.hypot(2 * Math.PI * w.kx / w.P, 2 * Math.PI * w.kz / w.P)));
-  const TWO_PI = Math.PI * 2;
-  let lastTime = NaN;
-  function setPhases(target: any[], t: number) {
-    for (let i = 0; i < TEST_WAVES.length; i++) target[i].value = ((omega[i] * t - TEST_WAVES[i].phase) % TWO_PI + TWO_PI) % TWO_PI;
-  }
-
   const fftPass: Pass = {
-    desc: { id: 'ocean.fft', module: 'world/ocean', stage: 'compute', reads: [], writes: ['ocean.displacement'] },
+    desc: fft.pass.desc,
     execute(ctx: PassContext) {
       opts.perf?.begin('world/ocean', 'ocean.lod');
       lod.update(camera);
       if (overlay && overlay.geometry !== lod.mesh.geometry) overlay.geometry = lod.mesh.geometry;
-      setPhases(phasePrev, Number.isFinite(lastTime) ? lastTime : ctx.time);
-      setPhases(phaseNow, ctx.time);
-      lastTime = ctx.time;
       opts.perf?.end();
+      fft.pass.execute(ctx);
     },
   };
 
@@ -238,12 +235,16 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
     mesh: lod.mesh,
     material,
     lod,
+    fft,
+    ready: fft.ready,
     previousPositionNode,
-    setTier(t) { lod.setTier(t); },
+    setTier(t) { lod.setTier(t); fft.setTier(t); },
     dispose() {
       lod.dispose();
+      fft.dispose();
       material.dispose();
       if (overlay) { overlay.removeFromParent(); overlay.material.dispose(); scene.backgroundNode = savedBackground; }
     },
   };
 }
+

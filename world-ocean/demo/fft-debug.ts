@@ -148,8 +148,8 @@ async function main() {
     { name: 't=12.5', t: 12.5 }, { name: 't=8191.7 (loop wrap)', t: 8191.7 }, { name: 't=100000.37', t: 100000.37 },
     { name: 'crossfade breeze->storm, mid', t: 'xfade' },
   ];
-  let checkIdx = -1, checkWait = 0, checkBusy = false, checkTime = 0;
-  const startCheck = () => { if (checkIdx < 0 || results.done) { results.tests = []; results.done = false; results.tier = fft.tier; checkIdx = 0; checkWait = 4; checkBusy = false; } };
+  let checkIdx = -1, checkWait = 0, checkBusy = false, checkTime = 0, checkSetup = false;
+  const startCheck = () => { if (checkIdx < 0 || results.done) { results.tests = []; results.done = false; results.tier = fft.tier; checkIdx = 0; checkWait = 4; checkBusy = false; checkSetup = false; } };
   $('check').onclick = startCheck;
 
   function cpuField(c: number, n: number, T: number, chop: number): Float32Array {
@@ -213,13 +213,15 @@ async function main() {
   function checkFrame() {
     if (checkIdx < 0 || checkIdx >= TESTS.length || checkBusy) return;
     const test = TESTS[checkIdx];
-    if (checkWait === 4) {
+    if (!checkSetup) {
+      checkSetup = true;
       checkTime = test.t === 'xfade' ? runXfadeSetup() : test.t;
       if (test.t === 'xfade') checkWait = 16; // let the amortised cascade-3 spectrum + uploads finish
     }
     if (--checkWait > 0) return;
     // this frame's FFT ran at checkTime (see loop); request readbacks (resolved later, never awaited here)
     checkBusy = true;
+    console.log('[fft-debug] check readback', test.name, checkTime);
     const T = checkTime, chop = ocean.choppinessAt(T), hs = results.hs;
     const st = ocean.getState();
     const info = { name: test.name, t: T, blend: st.fromSlot === st.toSlot ? 1 : ocean.blendAt(T), chop, from: st.fromSlot, to: st.toSlot };
@@ -231,6 +233,7 @@ async function main() {
       fft.debug.readFields('base'), fft.debug.readFields('detail'),
       wantChain ? renderer.getArrayBufferAsync(outAttr).then((b: ArrayBuffer) => new Float32Array(b)) : Promise.resolve(null),
     ]).then(([gb, gd, chainOut]) => {
+      console.log('[fft-debug] readback done', test.name);
       const rows: Row[] = [];
       rows.push(compare(gb, 0, cpuField(0, nb, T, chop), nb, 0, hs));
       rows.push(compare(gb, 1, cpuField(1, nb, T, chop), nb, 1, hs));
@@ -239,7 +242,7 @@ async function main() {
       const entry: any = { ...info, fields: rows };
       if (chainOut) entry.chained = chainedCompare(chainOut, T, hs);
       results.tests.push(entry);
-      checkIdx++; checkWait = 4; checkBusy = false;
+      checkIdx++; checkWait = 4; checkBusy = false; checkSetup = false;
       if (checkIdx >= TESTS.length) { results.done = true; ocean.setPreset(preset, true); }
       showResults();
     }).catch((e) => { results.error = String(e?.stack ?? e); results.done = true; checkBusy = false; showResults(); });
