@@ -5,8 +5,10 @@
 //   const lod = createOceanLod({ tier: 'high', shape, origin, material? , coverage? });
 //   scene.add(lod.mesh);                         // ONE draw call (merged indexed mesh), frustumCulled = false
 //   material.positionNode = lod.nodes.localPos.add(displacementLocal);   // REQUIRED (see below)
-//   per frame (after the camera moved, before rendering):  lod.update(camera);   // allocation-free
-//   lod.setTier('low');  lod.dispose();
+//   per frame (after the camera moved, before rendering):  lod.update(camera);   // allocation-free; reads the
+//                                                camera's matrixWorld and far (far only caps the ring count)
+//   lod.setTier('low');   // non-blocking: built in 2 ms slices inside update(), old tier drawn until the swap
+//   lod.dispose();
 //
 // lod.nodes (TSL, vertex stage; wrap in varying(...) to use per fragment):
 //   localPos          vec3  undisplaced vertex position in the mesh's LOCAL frame, metres, float32, small:
@@ -14,8 +16,9 @@
 //                           The mesh is placed at the foot (render space) and rotated by the shape's tangent
 //                           frame there, so "up" is local +Y for every shape — displace along local +Y.
 //                           (On the flat shape local == world axes.)
-//   previousLocalPos  vec3  where the same world point was in LAST frame's local frame (undisplaced): add last
-//                           frame's displacement to build the motion-vector previous position.
+//   previousLocalPos  vec3  where the same world point was in LAST frame's local frame (undisplaced), using last
+//                           frame's foot AND last frame's geomorph; the horizon closure is camera-attached (= localPos).
+//                           Add last frame's displacement to build the motion-vector previous position.
 //   tileCoord(P)      vec2  periodic sampling coordinate for an FFT tile of period P metres, in tangent axes
 //                           (east, south) = (world x, world z) on the flat shape: (world mod P) + small lattice
 //                           offset. Built as anchor_P + q, anchor_P = (B_render + origin.wrapped(P)) mod P on the
@@ -25,7 +28,12 @@
 //   distanceToCamera  float 3D distance camera -> undisplaced vertex, metres (displacement fade, LOD).
 //   morphFactor       float 0..1 geomorph weight towards the next coarser level.
 //   cellSize          float local grid spacing (m) including the morph (footprint for explicit texture LOD).
-//   isSkirt           float 1 on the horizon skirt (flat annulus + wall up to eye level), 0 on the grid.
+//   isSkirt           float 1 on the horizon closure, 0 on the grid. The closure is a flat sea-level annulus from
+//                           the last ring out to view depth 0.995 far, then a strip up to EYE LEVEL at view depth
+//                           0.999 far (= the true horizon line; a positionNode cannot emit w = 0, so points at infinity
+//                           are mapped onto the far plane). Computed per rendering camera in the shader from cameraFar
+//                           and the view matrix (far = Infinity / huge -> 1e6 m). It covers up to the horizon for any
+//                           far plane and hides nothing nearer than 0.995 far.
 //   level             float level index (0 = finest), -1 on the skirt (debug views).
 //   cameraLocal       vec3  camera position in the local frame = (0, altitude, 0) (view vectors in local space).
 //
@@ -38,7 +46,12 @@
 // nothing on screen. origin.onShift re-places the mesh and the wrapped anchors immediately (no one-frame jump).
 //
 // Up from the shape: foot = shape.atAltitude(camera, 0), frame = shape.tangentFrame(foot). Nothing assumes +Y.
-// Sphere: the grid is laid flat in the tangent plane at the foot (curvature not applied yet).
+// Sphere (DESIGN LIMIT, not just 'curvature missing'): the snapping lattice lives in the tangent frame at the camera
+// foot. On a sphere that frame rotates as the camera moves, so vertices would swim; a sphere needs the lattice anchored
+// to a fixed per-region frame (or a cube-sphere quadtree) plus curvature. tileAnchor's non-axis-aligned path wraps the
+// float64 lattice coordinate (equivalent value) instead of origin.wrapped.
+//
+// tileCoord(P) creates its uniform/node on first call: call it at material-build time, never per frame.
 import { BufferAttribute, BufferGeometry, Matrix4, Mesh, Sphere, Vector2, Vector3, Vector4 } from 'three/webgpu';
 import {
   abs, cameraFar, clamp, float, floor, int, length, max, min, cameraViewMatrix, modelWorldMatrix, normalize, positionGeometry, select,

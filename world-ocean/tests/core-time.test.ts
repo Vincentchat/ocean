@@ -17,21 +17,21 @@ function tickedOcean(opts: Record<string, unknown> = {}) {
   return { world, ocean };
 }
 
-test('query time window: far times are clamped to lastTick +- timeWindow, never compute snapshots', () => {
+test('query time window: times are clamped to [lastTick - timeWindow, lastTick], never compute snapshots', () => {
   const { world, ocean } = tickedOcean();
   const st: number[] = [];
   const before = ocean.cpuStats(st).slice();
   const p: Vec3 = { x: 12, y: 0, z: -7 };
   const T = world.time, w = ocean.sim.timeWindow;
   const far = ocean.query.heightAt(p, T + 1000);
-  assert.equal(far, ocean.query.heightAt(p, T + w));
+  assert.equal(far, ocean.query.heightAt(p, T));
   assert.equal(ocean.query.heightAt(p, T - 1e6), ocean.query.heightAt(p, T - w));
   // inside the window: exact and cached (the interpolated render time)
   ocean.query.heightAt(p, T - 0.5 / 60);
   const v = { x: 0, y: 0, z: 0 };
   ocean.query.velocityAt(p, T - 0.5 / 60, v);
   const after = ocean.cpuStats(st);
-  for (let c = 0; c < 3; c++) assert.equal(after[4 * c + 1], before[4 * c + 1], `cascade ${c}: no synchronous snapshot`);
+  for (let c = 0; c < 3; c++) assert.equal(after[5 * c + 1], before[5 * c + 1], `cascade ${c}: no synchronous snapshot`);
 });
 
 test('timeWindow = Infinity: any time is exact (synchronous cost), and differs from the clamp', () => {
@@ -83,8 +83,8 @@ test('lazy velocity: the first velocityAt after a tick fills only the blocks it 
   ocean.query.velocityAt({ x: 10, y: 0, z: 20 }, world.time, v);
   const b = ocean.cpuStats(st);
   for (let c = 0; c < 3; c++) {
-    assert.ok(b[4 * c + 3] - a[4 * c + 3] <= 4 * 8, `cascade ${c}: ${b[4 * c + 3] - a[4 * c + 3]} velocity blocks`);
-    assert.equal(b[4 * c + 1], a[4 * c + 1], 'no synchronous snapshot');
+    assert.ok(b[5 * c + 4] - a[5 * c + 4] <= 4 * 8, `cascade ${c}: ${b[5 * c + 4] - a[5 * c + 4]} velocity blocks`);
+    assert.equal(b[5 * c + 1], a[5 * c + 1], 'no synchronous snapshot');
   }
 });
 
@@ -131,4 +131,20 @@ test('caps: fetch / wind speed / peak wavelength are bounded (Hs <= ~15 m)', () 
   const p = { ...PRESETS.storm.params, windSpeed: 60, fetch: 2e6 };
   const hs = expectedHs(p, 9.80665);
   assert.ok(hs < 15.5, `Hs ${hs}`);
+});
+
+test('snapshot workers: bit-identical heights with and without workers', () => {
+  const a = tickedOcean({ worker: true }), b = tickedOcean({ worker: false });
+  for (let i = 0; i < 200; i++) { a.world.stepOnce(); b.world.stepOnce(); }
+  const st: number[] = [];
+  a.ocean.cpuStats(st);
+  console.log(`  worker-computed snapshots: ${st[2] + st[7] + st[12]} of ${st[0] + st[5] + st[10]}`);
+  const p: Vec3 = { x: 0, y: 0, z: 0 }, va = { x: 0, y: 0, z: 0 }, vb = { x: 0, y: 0, z: 0 };
+  for (let i = 0; i < 200; i++) {
+    p.x = i * 17.3 - 1500; p.z = (i * 7.9) % 900;
+    assert.equal(a.ocean.query.heightAt(p, a.world.time), b.ocean.query.heightAt(p, b.world.time));
+    a.ocean.query.velocityAt(p, a.world.time, va); b.ocean.query.velocityAt(p, b.world.time, vb);
+    assert.ok(va.x === vb.x && va.y === vb.y && va.z === vb.z);
+  }
+  a.ocean.dispose!(); b.ocean.dispose!();
 });

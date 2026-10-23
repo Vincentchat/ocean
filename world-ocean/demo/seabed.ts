@@ -14,7 +14,7 @@
 import { BufferAttribute, BufferGeometry, Mesh, MeshBasicNodeMaterial, Vector3 } from 'three/webgpu';
 import {
   Fn, abs, clamp, dFdx, dFdy, dot, exp, float, floor, fract, ivec2, length, max, min, mix, normalLocal, normalize,
-  positionLocal, refract, select, sin, smoothstep, uint, uniform, uvec2, vec2, vec3,
+  positionLocal, refract, sin, smoothstep, step, uint, uniform, uvec2, vec2, vec3,
 } from 'three/tsl';
 import type { FloatingOrigin, TerrainQuery, Vec3 } from '../stubs/world-core.ts';
 
@@ -159,7 +159,8 @@ const noiseGpu = Fn(([p]: any[]) => {
 function filteredNoise(p: any) {
   const footprint = max(length(dFdx(p)), length(dFdy(p)));
   const resolved = exp(footprint.mul(footprint).mul(-1.1));
-  return select(resolved.lessThan(0.015), float(0.5), mix(float(0.5), noiseGpu(p), resolved));
+  // (reference: resolved < .015 -> .5) as a mask, not select(): no if/else around derivative-based terms.
+  return mix(float(0.5), noiseGpu(p), resolved.mul(step(0.015, resolved)));
 }
 
 function rockMask(p: any) {

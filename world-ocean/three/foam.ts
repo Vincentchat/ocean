@@ -278,6 +278,7 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
   const uLacePhase = uniform(new Vector2());    // fract(M foot + c)
   const uSurfacePhase = uniform(new Vector2()); // fract(foot / surfaceTile)
   const windAB = fft.uniforms.windAB;
+  const fftSampling = createFftSampling(fft);
 
   // Placeholder textures: distinct objects (three merges texture nodes sharing a texture into one binding).
   const prevTierPlaceholder = new StorageTexture(4, 4);
@@ -294,18 +295,15 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
   /** Instantaneous foam source at window offset o (east, south, m from the anchor). Reference foamSurface + source. */
   function sourceAt(o: any) {
     let slope: any = null, comp: any = null;
-    for (let c = 0; c < 4; c++) {
+    // (fft r2: single N x N array per tier, 3 cascades; was base/detail groups + an optional 4th cascade)
+    for (let c = 0; c < fftSampling.cascades; c++) {
       const tc = vec2(uAnchorMod[c]).add(o);
-      const half = c < 2 ? float(0.5 / BASE_SIZE) : fft.uniforms.detailSize.reciprocal().mul(0.5);
-      const uvc = tc.add(C[c].offset).div(C[c].domain).add(half);
-      const tex = c < 2 ? fft.nodes.normalBase : fft.nodes.normalDetail;
-      const n = tex.sample(uvc).depth(int(c & 1)).level(0);
+      const n = fftSampling.normal(c, tc, float(0));
       let s: any = vec2(n.x, n.y.negate());                  // (n.east, n.south)
       let k: any = float(1).sub(n.w);                          // compression_c (downwind-masked)
       // c2 on a detail grid other than the reference's 256 (low 128, ultra 512): rescaled to the 256-grid
       // finite-difference slope variance (uDetailGain, computed from the spectrum, see detailGainFor).
       if (c === 2) { s = s.mul(uDetailGain); k = k.mul(uDetailGain); }
-      if (c === 3) { const g = fft.uniforms.fineEnabled.mul(fineInSource); s = s.mul(g); k = k.mul(g); }
       slope = slope === null ? s : slope.add(s);
       comp = comp === null ? k : comp.add(k);
     }
@@ -603,7 +601,7 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
       anchorIU = iu; anchorIV = iv; anchorU = newU; anchorV = newV;
       (uShift.value as Vector2).set(du, dv);
       uRetention.value = reset ? 0 : Math.exp(-Math.max(dt, 0) / P.tau);
-      for (let c = 0; c < 4; c++) {
+      for (let c = 0; c < C.length; c++) {
         const Pc = C[c].domain;
         (uAnchorMod[c].value as Vector2).set(mod64(anchorU, Pc), mod64(anchorV, Pc));
       }

@@ -14,7 +14,10 @@
 // i.e. the spectrum is stored CENTRED (k = 0 at (N/2, N/2)), exactly like the reference.
 // The tile's two horizontal axes are  a = local EAST  and  b = local SOUTH (= -north). This is the
 // reference's (world +X, world +Z) on the canonical flat frame (east +X, north -Z), so the flat
-// case reproduces the reference waves wave-for-wave.
+// case reproduces the reference waves wave-for-wave AT THE REFERENCE GRAVITY 9.81 (verified to float32).
+// With the shipped g = shape.surfaceGravity (9.80665, spec section 3) 84 % of the integer dispersion
+// indices differ by up to 8, so the waves are identical at t = 0 and drift apart in phase (2.5 % rms
+// of height at 60 s, decorrelated after ~1 h): same statistics, not the same waves at late times.
 //
 // Initial spectrum layout  (Float32Array, 4 floats per cell, index 4*i):
 //     [ Re h0(k), Im h0(k), Re h0m(k), Im h0m(k) ]     with  h0m(k) = conj(h0(-k))
@@ -62,7 +65,7 @@
 //     h0 = lerp(h0[fromSlot], h0[toSlot], w(t))   (both h0 and h0m),   chop = lerp(chop_from, chop_to, w(t))
 //     w(t) = smoothstep(clamp((t - blendStart) / blendDuration, 0, 1))      (w = 1 if fromSlot == toSlot)
 // fromSlot / toSlot / blendStart / blendDuration come from ocean.getState() (they change when
-// state.blendVersion bumps; blendStart may lie up to ~1.6 s in the future: w = 0 until then).
+// state.blendVersion bumps; blendStart may lie up to ~2 s in the future: w = 0 until then).
 // Evaluate w and chop at the draw time with ocean.blendAt(t) / ocean.choppinessAt(t).
 //
 // GPU checklist for CPU = GPU parity (what index.ts's WATER_QUERY assumes is drawn):
@@ -517,4 +520,148 @@ export function expectedHeightVariance(p: Readonly<SpectrumParams>, g: number, c
 /** Expected significant wave height Hs = 4 sigma, m. */
 export function expectedHs(p: Readonly<SpectrumParams>, g: number, cascades: readonly CascadeDef[] = CASCADES): number {
   return 4 * Math.sqrt(expectedHeightVariance(p, g, cascades));
+}
+
+// =============================================================================================
+// Tier-sized band layouts (ADDITIVE, used by the GPU adapter's quality tiers; the reference layout
+// above is unchanged). A tier draws every cascade on an N x N grid; the band split is a function of N:
+//     upper_c = pi N / L_c / 1.5,  lower_0 = 1e-9,  lower_c = upper_{c-1}   (same smoothstep cross-overs)
+// so the bands stay contiguous at any N (N = 256 gives exactly CASCADES). What lies above the last
+// cascade's band at a small N is not drawn (the adapter reports it as unresolved slope variance).
+// Random draws: the centred 256 block of every cascade is the master gaussianField (so the same k cell
+// has the same draw at every tier); cells outside it (N > 256) come from a second generator.
+// =============================================================================================
+
+/** Surface tension / density of sea water, m^3/s^2 (gravity-capillary dispersion w^2 = g k + S k^3). */
+export const CAPILLARY_S = 7.4e-5;
+
+/** Band layout for an N-sized tier (see above). `topUpper` caps the last cascade's upper k (rad/m). */
+export function bandCascades(n: number, domains: readonly number[] = REFERENCE_DOMAINS, topUpper = Infinity): CascadeDef[] {
+  const out: CascadeDef[] = [];
+  let lower = 1e-9;
+  for (let c = 0; c < domains.length; c++) {
+    const domain = domains[c];
+    let upper = (Math.PI * n) / domain / 1.5;
+    if (c === domains.length - 1 && upper > topUpper) upper = topUpper;
+    out.push({ domain, lower, upper, offset: domain * (0.5 - 0.5 / REFERENCE_SIZE) });
+    lower = upper;
+  }
+  return out;
+}
+
+/** Quantised gravity-capillary dispersion: round(sqrt(g (k + 1e-4) + S k^3) / OMEGA_UNIT). */
+export function omegaIndexOfCapillary(k: number, g: number): number {
+  return Math.round(Math.sqrt(g * (k + 1e-4) + CAPILLARY_S * k * k * k) / OMEGA_UNIT);
+}
+
+/** Omega indices of a size-n grid (gravity, or gravity-capillary when `capillary`). Setup-time. */
+export function omegaIndicesGrid(cascade: Readonly<CascadeDef>, g: number, n: number, capillary: boolean, out: Float32Array): Float32Array {
+  const dk = (2 * Math.PI) / cascade.domain;
+  for (let y = 0; y < n; y++) {
+    const kz = Math.fround((y - n / 2) * dk);
+    for (let x = 0; x < n; x++) {
+      const kx = Math.fround((x - n / 2) * dk);
+      const k = Math.hypot(kx, kz);
+      out[y * n + x] = capillary ? omegaIndexOfCapillary(k, g) : omegaIndexOf(k, g);
+    }
+  }
+  return out;
+}
+
+/**
+ * Gaussian draws on a size-n centred grid (2 floats per cell): the centred 256 block equals the master
+ * gaussianField (n <= 256: its centred sub-block); n > 256 adds outer cells from a second generator
+ * (row-major over the n grid, skipping the master block). `master` = gaussianField(seed, cascade) if known.
+ */
+export function gaussianFieldSized(seed: number, cascade: number, n: number, out: Float64Array, master?: Float64Array): Float64Array {
+  const m = REFERENCE_SIZE;
+  if (out.length < 2 * n * n) throw new RangeError('gaussianFieldSized: out too small');
+  const mf = master ?? gaussianField(seed, cascade, new Float64Array(2 * m * m));
+  const rng = n > m ? randomGenerator((cascadeSeed(seed, cascade) ^ 0x5bd1e995) | 0) : null;
+  for (let y = 0; y < n; y++) {
+    const sy = y - n / 2 + m / 2;
+    for (let x = 0; x < n; x++) {
+      const sx = x - n / 2 + m / 2;
+      const d = 2 * (y * n + x);
+      if (sx >= 0 && sx < m && sy >= 0 && sy < m) {
+        const s = 2 * (sy * m + sx);
+        out[d] = mf[s]; out[d + 1] = mf[s + 1];
+      } else if (rng) {
+        const radius = Math.sqrt(-2 * Math.log(Math.max(rng(), 1e-4)));
+        const phase = 2 * Math.PI * rng();
+        out[d] = radius * Math.cos(phase); out[d + 1] = radius * Math.sin(phase);
+      } else { out[d] = 0; out[d + 1] = 0; }
+    }
+  }
+  return out;
+}
+
+/** generateRawRows on a size-n grid (identical maths; n = 256 is bit-identical to generateRawRows). */
+export function generateRawRowsSized(
+  p: Readonly<SpectrumParams>, sc: Readonly<SpectrumScalars>, cascade: Readonly<CascadeDef>, n: number,
+  xi: Float64Array, raw: Float64Array, rowStart: number, rowEnd: number,
+): void {
+  const half = n / 2;
+  const dk = (2 * Math.PI) / cascade.domain;
+  const kMax = cascade.upper * 1.5;
+  const amp = p.amplitude;
+  const g = sc.g, wp = sc.wp;
+  const alphaG2 = 0.076 * Math.pow((Math.max(sc.U, 0.1) * wp) / (22 * g), 0.66) * g * g;
+  const lnGamma = Math.log(p.gamma);
+  const cd = Math.cos(sc.dirGrid), sd = Math.sin(sc.dirGrid);
+  const s9 = p.spread * 9.77;
+  const m0 = 0.07 + 0.93 * p.standing;
+  const inv2sqrtPi = 1 / (2 * Math.sqrt(Math.PI));
+  const lo0 = cascade.lower / 1.5, lo1 = cascade.lower * 1.5, up0 = cascade.upper / 1.5, up1 = kMax;
+  const dk2 = dk * dk;
+  for (let y = rowStart; y < rowEnd; y++) {
+    const kz = Math.fround((y - half) * dk);
+    for (let x = 0; x < n; x++) {
+      const i = y * n + x;
+      const kx = Math.fround((x - half) * dk);
+      let P = 0;
+      const kr = Math.sqrt(kx * kx + kz * kz);
+      if (x !== 0 && y !== 0 && kr < kMax) {
+        const k = kr > 1e-4 ? kr : 1e-4;
+        const omega = Math.sqrt(g * k);
+        const ratio = omega / wp, r2 = ratio * ratio, r4 = r2 * r2;
+        const below = omega < wp;
+        const sigma = below ? 0.07 : 0.09;
+        const dw = omega - wp;
+        const peakShape = Math.exp(-(dw * dw) / (2 * sigma * sigma * wp * wp + 1e-4));
+        const o2 = omega * omega;
+        const energy = (alphaG2 / (o2 * o2 * omega)) * Math.exp(-1.25 / r4 + peakShape * lnGamma) *
+          ((0.5 * Math.sqrt(g / k)) / k);
+        let q = (kx * cd + kz * sd) / k;
+        q = q < -1 ? -1 : q > 1 ? 1 : q;
+        let s = s9 * (below ? r4 * ratio : 1 / (r2 * Math.sqrt(ratio)));
+        if (s < 0.5) s = 0.5;
+        const hc2 = (q + 1) * 0.5;
+        const directional = Math.exp(s * Math.log(hc2 > 1e-4 ? hc2 : 1e-4)) * Math.sqrt(s + 0.25) * inv2sqrtPi *
+          (m0 + (1 - m0) * hc2);
+        let bandLo = (k - lo0) / (lo1 - lo0); bandLo = bandLo < 0 ? 0 : bandLo > 1 ? 1 : bandLo;
+        let bandUp = (k - up0) / (up1 - up0); bandUp = bandUp < 0 ? 0 : bandUp > 1 ? 1 : bandUp;
+        const band = bandLo * bandLo * (3 - 2 * bandLo) * (1 - bandUp * bandUp * (3 - 2 * bandUp));
+        P = energy * directional * dk2 * band;
+      }
+      const a = Math.sqrt(P * 0.5) * amp;
+      raw[2 * i] = xi[2 * i] * a;
+      raw[2 * i + 1] = xi[2 * i + 1] * a;
+    }
+  }
+}
+
+/** packInitialSpectrum on a size-n grid: out[4i..] = [h0(k), conj(h0(-k))]. n = 256 is bit-identical. */
+export function packInitialSpectrumSized(raw: Float64Array, standing: number, n: number, out: Float32Array): Float32Array {
+  const a = 1 - standing * 0.5, b = standing * 0.5;
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+    const i = y * n + x;
+    const j = ((n - y) % n) * n + ((n - x) % n);
+    const hr = a * raw[2 * i] + b * raw[2 * j];
+    const hi = a * raw[2 * i + 1] - b * raw[2 * j + 1];
+    const mr = a * raw[2 * j] + b * raw[2 * i];
+    const mi = a * raw[2 * j + 1] - b * raw[2 * i + 1];
+    out[4 * i] = hr; out[4 * i + 1] = hi; out[4 * i + 2] = mr; out[4 * i + 3] = -mi;
+  }
+  return out;
 }

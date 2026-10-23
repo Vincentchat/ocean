@@ -19,7 +19,27 @@
 // drawn h0 crossfades from the old slot to the new one:  h0 = lerp(h0_from, h0_to, w(t)),
 // w(t) = smoothstep(clamp((t - blendStart) / blendDuration, 0, 1)); choppiness is lerped the same
 // way. Both slots share the same random draws (same seed), so only amplitudes change: no phase
-// cancellation, heights stay continuous (C1 in time).
+// cancellation, heights stay continuous (C1 in time). Wind speed and direction are smoothed
+// separately (a reversal never passes through 0 m/s) and the spectrum turns by at most
+// maxTurnPerBlendDeg per crossfade (no mid-blend energy loss: a 180 deg turn keeps Hs >= 95 %).
+//
+// Threads (option worker, default true when SharedArrayBuffer + workers exist): one worker per cascade
+// (ocean-worker.ts) computes the snapshot FFTs, prefills the next tick's position frames and
+// regenerates the spectrum; the main thread only schedules, adopts and answers queries. Same code,
+// bit-identical results with or without workers (tested).
+//
+// Query semantics and costs (60 Hz budget):
+//  - Exact within [lastTick - timeWindow, lastTick] (default 0.1 s: tick time and the interpolated
+//    render time, which lies between the last two ticks). Other times are CLAMPED to that window (bounded cost; an exact
+//    far time needs ~6 fresh snapshots, 50-70 ms). timeWindow = Infinity: exact anywhere, at that
+//    cost. Before the first tick every time is exact. Non-finite times throw RangeError.
+//  - Heights reflect the CURRENT spectrum sources: a time before the last crossfade start is
+//    evaluated with today's spectra (history is not kept).
+//  - Where crests fold over (rare, storm), several surface sheets cover p; any of them is returned.
+//  - Allocation: tick, velocityAt and heightsAt allocate nothing. heightAt returns a JS number,
+//    which V8 boxes (16 B) when the call is not inlined into the caller: use heightsAt on hot paths.
+//  - Not supported yet: a curved (sphere) world. Local coordinates are (p - anchor) projected on the
+//    tangent frame at p, which is valid for flat worlds only.
 import {
   WATER_QUERY, WIND_QUERY, ENVIRONMENT, TERRAIN_QUERY, TERRAIN_GPU, SKY_LIGHT, DEFAULT_SIM_PARAMS,
   DEFAULT_QUERY_CASCADES,
@@ -61,6 +81,39 @@ const GUESS_STEPS = 2;
 const RESCUE_ITERATIONS = 12;
 /** Cost of packing one cascade's h0 in units of generated master rows (amortised regeneration budget). */
 const PACK_ROWS_EQUIVALENT = 8;
+
+// ---- snapshot workers --------------------------------------------------------------------------
+type Proc = { versions?: { node?: string }; getBuiltinModule?: (id: string) => unknown };
+function nodeProcess(): Proc | undefined {
+  const p = (globalThis as { process?: Proc }).process;
+  return p?.versions?.node && p.getBuiltinModule ? p : undefined;
+}
+/** Workers need SharedArrayBuffer (cross-origin isolated pages in browsers) and a Worker API. */
+function canUseWorkers(): boolean {
+  if (typeof SharedArrayBuffer === 'undefined' || typeof Atomics === 'undefined') return false;
+  if (nodeProcess()) return true;
+  const g = globalThis as { Worker?: unknown; crossOriginIsolated?: boolean };
+  return typeof g.Worker === 'function' && g.crossOriginIsolated === true;
+}
+/** Start ocean-worker.ts for one cascade (null if it cannot start: the main thread then does the work). */
+function spawnSnapshotWorker(data: unknown): { terminate(): unknown } | null {
+  try {
+    const url = new URL('./ocean-worker.ts', import.meta.url);
+    const proc = nodeProcess();
+    if (proc) {
+      const wt = proc.getBuiltinModule!('node:worker_threads') as { Worker: new (u: URL, o: object) => { unref(): void; terminate(): unknown } };
+      const w = new wt.Worker(url, { workerData: data });
+      w.unref(); // never keeps a Node process alive
+      return w;
+    }
+    const W = (globalThis as unknown as { Worker: new (u: URL, o: object) => { postMessage(d: unknown): void; terminate(): unknown } }).Worker;
+    const w = new W(url, { type: 'module' });
+    w.postMessage(data);
+    return w;
+  } catch {
+    return null;
+  }
+}
 
 /** One crossfade slot as the GPU adapter sees it. */
 export interface OceanSlot {
@@ -141,7 +194,8 @@ export interface Ocean extends WorldSystem {
   /** Local (east, north) metres -> height at time t; same as heightAt but without the world mapping. */
   heightAtLocal(east: number, north: number, time: number): number;
   /**
-   * Diagnostics / tests: invert the displacement at local (east, north). Writes the REST point to
+   * Diagnostics / tests (exact at any time, no time window: may compute snapshots synchronously):
+   * invert the displacement at local (east, north). Writes the REST point to
    * out.east / out.north, the height and velocity to out.up / out.v*; returns the residual |P(r) - p| (m).
    */
   invertLocal(east: number, north: number, time: number, out: RestSample): number;
@@ -151,11 +205,12 @@ export interface Ocean extends WorldSystem {
    * returns a JS number, which V8 boxes (16 B) when the call is not inlined into the caller).
    */
   heightsAt(points: Float64Array, time: number, out: Float64Array, count?: number): Float64Array;
-  /** Surface point that rests at local (east, north): displaced position, height, velocity. */
+  /** Diagnostics (exact at any time, like invertLocal): surface point resting at local (east, north). */
   sampleRest(east: number, north: number, time: number, out: RestSample): RestSample;
   /**
-   * Diagnostics per cascade c: out[4c] snapshots computed, out[4c+1] of them synchronously (prefetch
-   * missed or cold time), out[4c+2] / out[4c+3] lazy position / velocity blocks filled.
+   * Diagnostics per cascade c: out[5c] snapshots computed, out[5c+1] of them synchronously (prefetch
+   * missed or cold time), out[5c+2] of them by the worker, out[5c+3] / out[5c+4] lazy position /
+   * velocity blocks filled.
    */
   cpuStats(out: number[]): number[];
   /** Diagnostics: CPU snapshots computed per cascade so far. */
@@ -191,6 +246,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
   if (!PRESETS[presetName]) throw new Error(`Unknown ocean preset '${presetName}'`);
   const seed = opts.seed ?? 1;
   const useWind = opts.useWind ?? true;
+  const useWorker = (opts.worker ?? true) && canUseWorkers();
   const perf: PerfSink | undefined = opts.perf;
   const anchor: Vec3 = { x: opts.anchor?.x ?? 0, y: opts.anchor?.y ?? 0, z: opts.anchor?.z ?? 0 };
   const queryCfg: readonly QueryCascadeConfig[] = opts.query ?? DEFAULT_QUERY_CASCADES;
@@ -218,6 +274,22 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
   /** True once tick() ran: queries are then limited to the time window around the last tick. */
   let ticked = false;
   let disposed = false;
+  const workers: { terminate(): unknown }[] = [];
+  let workersStarted = false;
+  /** Start the snapshot workers on the first tick (standalone, never-ticked oceans do not need them). */
+  function startWorkers(): void {
+    workersStarted = true;
+    if (!useWorker) return;
+    for (let c = 0; c < sims.length; c++) {
+      const sm = sims[c];
+      if (!sm || !sm.shared) continue;
+      const q = queryCfg[c];
+      const masterH0: SharedArrayBuffer[] = [];
+      for (let s = 0; s < NUM_SLOTS; s++) masterH0.push(slots[s].h0[c].buffer as SharedArrayBuffer);
+      const w = spawnSnapshotWorker({ cascade: c, cfg: { size: q.size, snapshotDt: q.snapshotDt, filter: q.filter }, g, seed, numSlots: NUM_SLOTS, poolSize: SNAPSHOT_POOL, shared: sm.shared, masterH0 });
+      if (w) workers.push(w);
+    }
+  }
 
   // ---- spectrum slots -----------------------------------------------------------------------
   const nm = REFERENCE_SIZE;
@@ -226,7 +298,8 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
   const slots: SlotData[] = [];
   for (let s = 0; s < NUM_SLOTS; s++) {
     const h0: Float32Array[] = [];
-    for (let c = 0; c < CASCADES.length; c++) h0.push(new Float32Array(nm * nm * 4));
+    // Shared when workers may run (they write regenerated spectra straight into it).
+    for (let c = 0; c < CASCADES.length; c++) h0.push(useWorker ? new Float32Array(new SharedArrayBuffer(nm * nm * 4 * 4)) : new Float32Array(nm * nm * 4));
     slots.push({ params: emptyParams(), version: 0, h0 });
   }
   let version = 0, blendVersion = 0;
@@ -247,7 +320,9 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
   // Regeneration job
   const regenRaw = new Float64Array(2 * nm * nm);
   const regenScalars: SpectrumScalars = { g: 0, U: 0, dirGrid: 0, wp: 0 };
-  let regenSlot = -1, regenCascade = 0, regenRow = 0;
+  let regenSlot = -1, regenCascade = 0, regenRow = 0, regenRemote = false;
+  /** Regeneration params handed to the workers (wind, dir, fetch, gamma, spread, standing, chop, amp). */
+  const RP = new Float64Array(8);
 
   // ---- CPU query ---------------------------------------------------------------------------
   const sims: (CascadeSim | null)[] = [];
@@ -280,7 +355,8 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
     for (let c = 0; c < CASCADES.length; c++) {
       const q = queryCfg[c];
       if (q.size > 0) {
-        sims.push(new CascadeSim(CASCADES[c], q, omegaIndex[c], NUM_SLOTS, SNAPSHOT_POOL));
+        const sm = new CascadeSim(CASCADES[c], q, omegaIndex[c], NUM_SLOTS, SNAPSHOT_POOL, useWorker ? true : undefined);
+        sims.push(sm);
       } else sims.push(null);
     }
     for (let c = 0; c < sims.length; c++) {
@@ -351,11 +427,49 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
     spectrumScalars(slots[regenSlot].params, g, regenScalars);
     regenCascade = 0;
     regenRow = 0;
+    // Offload to the cascade workers when every cascade has a ready one (each regenerates its own
+    // cascade: master h0 for the GPU + its slot grid); the main thread then only polls.
+    regenRemote = false;
+    if (workers.length > 0 && K === CASCADES.length) {
+      let ready = true;
+      for (let k = 0; k < K; k++) if (!kSim[k].remoteReady()) ready = false;
+      if (ready) {
+        RP[0] = p.windSpeed; RP[1] = p.windDirection; RP[2] = p.fetch; RP[3] = p.gamma;
+        RP[4] = p.spread; RP[5] = p.standing; RP[6] = p.choppiness; RP[7] = p.amplitude;
+        let ok = true;
+        for (let k = 0; k < K; k++) if (!kSim[k].requestRegen(regenSlot, RP)) ok = false;
+        regenRemote = ok; // (if a worker refused, the main thread regenerates: same numbers)
+      }
+    }
+  }
+
+  /** Regenerated spectrum is in slot regenSlot (all cascades): publish it and define the pending source. */
+  function finishRegen(): void {
+    const sd = slots[regenSlot];
+    sd.version++;
+    version++;
+    // Pending source: crossfade from the current spectrum to the new one, starting later.
+    pendingId = ++srcCounter; pendingFrom = toSlot; pendingSlot = regenSlot;
+    TS[T_PEND_START] = TS[T_LAST_TICK] + pendingLead; TS[T_PEND_DURATION] = sim.blendTime;
+    TS[T_PEND_SWITCH] = TS[T_PEND_START] - switchMargin;
+    for (let k = 0; k < K; k++) {
+      const sm = kSim[k];
+      sm.args[0] = TS[T_PEND_START]; sm.args[1] = TS[T_PEND_DURATION];
+      sm.setSource(1, pendingId, pendingFrom, pendingSlot);
+    }
+    regenSlot = -1;
+    regenRemote = false;
   }
 
   /** Advance the amortised regeneration by `rows` master rows. */
   function stepRegen(rows: number): void {
     if (regenSlot < 0) return;
+    if (regenRemote) {
+      for (let k = 0; k < K; k++) if (!kSim[k].regenDone()) return;
+      for (let k = 0; k < K; k++) { kSim[k].ackRegen(); kSim[k].slotChanged(regenSlot); }
+      finishRegen();
+      return;
+    }
     const sd = slots[regenSlot];
     while (rows > 0 && regenSlot >= 0) {
       if (regenRow < nm) {
@@ -369,19 +483,8 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
         regenCascade++;
         regenRow = 0;
         if (regenCascade >= CASCADES.length) {
-          sd.version++;
-          version++;
           for (let c = 0; c < sims.length; c++) sims[c]?.setSlot(regenSlot, sd.h0[c]);
-          // Pending source: crossfade from the current spectrum to the new one, starting later.
-          pendingId = ++srcCounter; pendingFrom = toSlot; pendingSlot = regenSlot;
-          TS[T_PEND_START] = TS[T_LAST_TICK] + pendingLead; TS[T_PEND_DURATION] = sim.blendTime;
-          TS[T_PEND_SWITCH] = TS[T_PEND_START] - switchMargin;
-          for (let k = 0; k < K; k++) {
-            const sm = kSim[k];
-            sm.args[0] = TS[T_PEND_START]; sm.args[1] = TS[T_PEND_DURATION];
-            sm.setSource(1, pendingId, pendingFrom, pendingSlot);
-          }
-          regenSlot = -1;
+          finishRegen();
         }
       }
     }
@@ -435,10 +538,11 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
    * forward(). Two frames are cached (keyed by time + state stamp). The query time is first
    * validated and limited to the query window (see clampQueryTime). Allocation-free.
    */
-  function prepare(): number {
+  function prepare(exact = false): number {
     if (disposed) throw new Error('world/ocean: disposed');
     if (!initialised) init();
-    clampQueryTime();
+    if (exact) { const t = ST[S_T]; if (!(t - t === 0)) throw new RangeError('world/ocean: query time must be a finite number of seconds'); }
+    else clampQueryTime();
     const t = ST[S_T];
     if (K === 0) return 0;
     const s0 = kSim[0];
@@ -461,7 +565,8 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
 
   /**
    * Query time policy. Non-finite times throw. Once the system ticks, queries are exact within
-   * [lastTick - timeWindow, lastTick + timeWindow] (the cached snapshots: no stall); times outside
+   * [lastTick - timeWindow, lastTick] (the cached snapshots: no stall; covers the interpolated render
+   * time, which lies between the last two ticks); times outside
    * are clamped to that window, which keeps every query bounded in cost (an arbitrary time would
    * otherwise need six fresh 256^2 snapshots, ~50-70 ms). timeWindow = Infinity disables the clamp
    * (exact at any time, synchronous snapshot cost). Before the first tick (standalone use) every
@@ -471,7 +576,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
     const t = ST[S_T];
     if (!(t - t === 0)) throw new RangeError('world/ocean: query time must be a finite number of seconds');
     if (!ticked) return;
-    const lo = TS[T_LAST_TICK] - sim.timeWindow, hi = TS[T_LAST_TICK] + sim.timeWindow;
+    const lo = TS[T_LAST_TICK] - sim.timeWindow, hi = sim.timeWindow === Infinity ? Infinity : TS[T_LAST_TICK];
     if (t < lo) ST[S_T] = lo; else if (t > hi) ST[S_T] = hi;
   }
 
@@ -746,6 +851,11 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
 
   function applyImmediate(): void {
     if (!initialised) { init(); return; }
+    if (regenRemote) {
+      // A worker may still be writing a slot: let it finish (setup-time call, rare) before reusing slots.
+      for (let k = 0; k < K; k++) { while (!kSim[k].regenDone()) { /* spin */ } kSim[k].ackRegen(); }
+      regenRemote = false;
+    }
     regenSlot = -1;
     pendingId = -1; pendingSlot = -1;
     const slot = (toSlot + 1) % NUM_SLOTS;
@@ -814,6 +924,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
       if (!(T - T === 0)) throw new RangeError('world/ocean: tick time must be finite');
       TS[T_LAST_TICK] = T;
       ticked = true;
+      if (!workersStarted) startWorkers();
       TS[T_DT] = info.dt;
       sampleWind(false);
       // Regeneration (only once the current crossfade has finished and nothing is pending).
@@ -864,6 +975,17 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
       }
       ST[S_T] = T;
       prepare();
+      // Ask the workers to fill the position frames of the NEXT tick (T + dt) ahead of time; the next
+      // prepare() adopts them (bit-identical to filling here), so queries at tick time fill nothing.
+      if (workers.length > 0) {
+        ST[S_T] = T + info.dt;
+        blendInto();
+        for (let k = 0; k < K; k++) {
+          const sm = kSim[k];
+          sm.args[0] = ST[S_T]; sm.args[1] = ST[S_CHOP];
+          sm.requestPrefill(activeId);
+        }
+      }
       syncState();
       if (perf) perf.end();
     },
@@ -905,7 +1027,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
 
     invertLocal(east: number, north: number, time: number, out: RestSample): number {
       ST[S_T] = time;
-      const f = prepare();
+      const f = prepare(true);
       ST[S_PE] = east; ST[S_PN] = north;
       invert(f, true);
       const residual = Math.hypot(ST[S_E] - east, ST[S_N] - north);
@@ -916,7 +1038,7 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
 
     sampleRest(east: number, north: number, time: number, out: RestSample): RestSample {
       ST[S_T] = time;
-      const f = prepare();
+      const f = prepare(true);
       const se = east - wrapPeriod(east), sn = north - wrapPeriod(north);
       ST[S_FE] = east - se; ST[S_FN] = north - sn;
       forward(f, true, false);
@@ -929,8 +1051,9 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
     cpuStats(out: number[]): number[] {
       for (let k = 0; k < K; k++) {
         const sm = kSim[k], c = kCascade[k];
-        out[4 * c] = sm.computed; out[4 * c + 1] = sm.syncComputed;
-        out[4 * c + 2] = sm.posBlocksFilled; out[4 * c + 3] = sm.velBlocksFilled;
+        out[5 * c] = sm.computed; out[5 * c + 1] = sm.syncComputed; out[5 * c + 2] = sm.remoteComputed;
+        out[5 * c + 3] = sm.posBlocksFilled; out[5 * c + 4] = sm.velBlocksFilled;
+        out[5 * K + c] = sm.prefillsAdopted;
       }
       return out;
     },
@@ -955,9 +1078,12 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
     },
 
     dispose(): void {
-      // Release the CPU buffers (slots, snapshot pools, frames); the query throws afterwards.
+      // Release the CPU buffers (slots, snapshot pools, frames) and the workers; the query throws afterwards.
       disposed = true;
       wind = undefined;
+      for (let k = 0; k < K; k++) kSim[k].stopRemote();
+      for (const w of workers) w.terminate();
+      workers.length = 0;
       for (let k = 0; k < K; k++) kSim[k].dispose();
       K = 0;
       kSim.length = 0;

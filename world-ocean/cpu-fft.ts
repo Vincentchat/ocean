@@ -294,6 +294,48 @@ const UNIT_CELLS = 4096;
 /** Margin on the steady per-tick work rate (the job also catches up when it falls behind). */
 const RATE_MARGIN = 1.15;
 
+/**
+ * Shared memory of a CascadeSim and its snapshot worker (ocean-worker.ts): slot h0 sub-grids, the
+ * snapshot pool, the source table and a small control block. Main thread and worker run the same
+ * code on the same numbers, so a snapshot is bit-identical whichever thread computed it.
+ */
+export interface SharedSimBuffers {
+  readonly slots: SharedArrayBuffer[];
+  readonly pool: SharedArrayBuffer[];
+  readonly srcI: SharedArrayBuffer;   // Int32 x 6: id[2], from[2], to[2]
+  readonly srcF: SharedArrayBuffer;   // Float64 x 4: start[2], duration[2]
+  readonly frames: SharedArrayBuffer[]; // 3 position frames: two in use, one being prefilled
+  readonly ctrl: SharedArrayBuffer;   // Int32 x 12, see C_*
+  readonly ctrlF: SharedArrayBuffer;  // Float64 x 16: [j, prefill t, prefill h00 h10 h01 h11 chop, -, regen params x 8]
+}
+// Control block. Snapshot request: state / pool / entry; prefill request: pstate / pa / pb / pbuf;
+// ready / quit; bell (incremented with every request; the worker sleeps on it).
+const C_STATE = 0, C_POOL = 1, C_ENTRY = 2, C_READY = 3, C_QUIT = 4, C_PSTATE = 5, C_PA = 6, C_PB = 7, C_PBUF = 8, C_BELL = 9;
+/** Spectrum regeneration request (served by ocean-worker.ts): state, target slot. Params at ctrlF[F_REGEN..+7]. */
+export const C_RSTATE = 10, C_RSLOT = 11, F_REGEN = 8;
+const F_J = 0, F_PT = 1, F_PCOEF = 2;
+
+/**
+ * Hermite-in-time position fill of one lazy block (positions; choppiness on the horizontal
+ * channels). coef[c..c+3] = h00 h10 h01 h11, coef[chopIdx] = choppiness. The single implementation
+ * used by the main thread (fillBlock) and the worker prefill: identical numbers either way.
+ */
+function fillPositions(out: Float32Array, A0: Float32Array, B0: Float32Array, coef: Float64Array, c: number, chopIdx: number,
+  n: number, shift: number, bx: number, by: number): void {
+  const B = 1 << shift;
+  const a0 = coef[c], a1 = coef[c + 1], b0 = coef[c + 2], b1 = coef[c + 3], chop = coef[chopIdx];
+  const ca0 = chop * a0, ca1 = chop * a1, cb0 = chop * b0, cb1 = chop * b1;
+  for (let y = by * B, yEnd = y + B; y < yEnd; y++) {
+    for (let x = bx * B, xEnd = x + B; x < xEnd; x++) {
+      const i = y * n + x, o = i * 6, q = i * 3;
+      out[q] = a0 * A0[o] + a1 * A0[o + 3] + b0 * B0[o] + b1 * B0[o + 3];
+      out[q + 1] = ca0 * A0[o + 1] + ca1 * A0[o + 4] + cb0 * B0[o + 1] + cb1 * B0[o + 4];
+      out[q + 2] = ca0 * A0[o + 2] + ca1 * A0[o + 5] + cb0 * B0[o + 2] + cb1 * B0[o + 5];
+    }
+  }
+}
+export const S_IDLE = 0, S_REQUESTED = 1, S_DONE = 2;
+
 export class CascadeSim {
   readonly n: number;
   readonly domain: number;
@@ -356,7 +398,32 @@ export class CascadeSim {
   /** Per frame (stride LC): h00 h10 h01 h11 d00 d10 d01 d11 chop dchop. */
   readonly lazyCoef: Float64Array;
 
-  constructor(def: Readonly<CascadeDef>, cfg: Readonly<QueryCascadeSettings>, masterOmegaIndex: Float32Array, numSlots: number, poolSize: number) {
+  /** Shared buffers when the snapshot work can run in a worker (null: everything on this thread). */
+  readonly shared: SharedSimBuffers | null;
+  private readonly ctrl: Int32Array | null;
+  private readonly ctrlF: Float64Array | null;
+  /** Shared position-frame buffers (worker mode): frames[f] = frameBufs[frameBuf[f]], prefill target frameBufs[preBuf]. */
+  private readonly frameBufs: Float32Array[];
+  private readonly frameBuf = new Int32Array([0, 1]);
+  private preBuf = 2;
+  /** Prefill in flight / done for time preT with pool refs (preA, preB). */
+  private preBusy = false;
+  private preA = -1;
+  private preB = -1;
+  /** Frames adopted from the worker's prefill (diagnostics). */
+  prefillsAdopted = 0;
+  private remoteSnap = -1;
+  private remoteSrc = -1;
+  private remoteJ = 0;
+  /** Snapshots computed by the worker (diagnostics). */
+  remoteComputed = 0;
+
+  /**
+   * shared: undefined = plain memory; true = allocate SharedArrayBuffers (main thread, a worker may
+   * attach); a SharedSimBuffers object = attach to them (worker side).
+   */
+  constructor(def: Readonly<CascadeDef>, cfg: Readonly<QueryCascadeSettings>, masterOmegaIndex: Float32Array, numSlots: number, poolSize: number,
+    shared?: true | SharedSimBuffers) {
     const n = cfg.size;
     this.n = n;
     this.domain = def.domain;
@@ -381,21 +448,35 @@ export class CascadeSim {
         this.omegaIndex[i] = om[i];
       }
     }
+    let sh: SharedSimBuffers | null = null;
+    if (shared === true) {
+      const slots: SharedArrayBuffer[] = [], pool: SharedArrayBuffer[] = [];
+      for (let s = 0; s < numSlots; s++) slots.push(new SharedArrayBuffer(nn * 4 * 4));
+      for (let i = 0; i < poolSize; i++) pool.push(new SharedArrayBuffer(nn * FIELD_STRIDE * 4));
+      const frames = [new SharedArrayBuffer(nn * 3 * 4), new SharedArrayBuffer(nn * 3 * 4), new SharedArrayBuffer(nn * 3 * 4)];
+      sh = { slots, pool, frames, srcI: new SharedArrayBuffer(6 * 4), srcF: new SharedArrayBuffer(4 * 8), ctrl: new SharedArrayBuffer(12 * 4), ctrlF: new SharedArrayBuffer(16 * 8) };
+    } else if (shared) sh = shared;
+    this.shared = sh;
     this.slotH0 = [];
-    for (let s = 0; s < numSlots; s++) this.slotH0.push(new Float32Array(nn * 4));
-    this.srcId = new Int32Array(2).fill(-1);
-    this.srcFrom = new Int32Array(2);
-    this.srcTo = new Int32Array(2);
-    this.srcStart = new Float64Array(2);
-    this.srcDur = new Float64Array(2).fill(1);
+    for (let s = 0; s < numSlots; s++) this.slotH0.push(sh ? new Float32Array(sh.slots[s]) : new Float32Array(nn * 4));
+    const srcI = sh ? new Int32Array(sh.srcI) : new Int32Array(6), srcF = sh ? new Float64Array(sh.srcF) : new Float64Array(4);
+    this.srcId = srcI.subarray(0, 2);
+    this.srcFrom = srcI.subarray(2, 4);
+    this.srcTo = srcI.subarray(4, 6);
+    this.srcStart = srcF.subarray(0, 2);
+    this.srcDur = srcF.subarray(2, 4);
+    if (shared === true || !sh) { this.srcId.fill(-1); this.srcDur.fill(1); }
+    this.ctrl = sh ? new Int32Array(sh.ctrl) : null;
+    this.ctrlF = sh ? new Float64Array(sh.ctrlF) : null;
     this.re1 = new Float64Array(nn); this.im1 = new Float64Array(nn);
     this.re2 = new Float64Array(nn); this.im2 = new Float64Array(nn);
     this.re3 = new Float64Array(nn); this.im3 = new Float64Array(nn);
     this.pool = [];
     for (let i = 0; i < poolSize; i++) {
-      this.pool.push({ src: -1, j: 0, valid: false, lastUse: 0, data: new Float32Array(nn * FIELD_STRIDE) });
+      this.pool.push({ src: -1, j: 0, valid: false, lastUse: 0, data: sh ? new Float32Array(sh.pool[i]) : new Float32Array(nn * FIELD_STRIDE) });
     }
-    this.frames = [new Float32Array(nn * 3), new Float32Array(nn * 3)];
+    this.frameBufs = sh ? [new Float32Array(sh.frames[0]), new Float32Array(sh.frames[1]), new Float32Array(sh.frames[2])] : [];
+    this.frames = sh ? [this.frameBufs[0], this.frameBufs[1]] : [new Float32Array(nn * 3), new Float32Array(nn * 3)];
     this.velFrames = [new Float32Array(nn * 3), new Float32Array(nn * 3)];
     this.frameTime = new Float64Array([NaN, NaN]);
     this.frameStamp = new Float64Array([-1, -1]);
@@ -437,6 +518,155 @@ export class CascadeSim {
     this.srcDur[e] = this.args[1] > 0 ? this.args[1] : 1;
   }
 
+  // ---- worker offload (main thread side) -----------------------------------------------------
+
+  /** True when a worker has attached to the shared buffers and serves snapshot requests. */
+  remoteReady(): boolean {
+    return this.ctrl !== null && Atomics.load(this.ctrl, C_READY) === 1;
+  }
+
+  /** Accept a finished remote snapshot (if still wanted). Allocation-free, never blocks. */
+  private pollRemote(): void {
+    const ctrl = this.ctrl;
+    if (ctrl === null || this.remoteSnap < 0 || Atomics.load(ctrl, C_STATE) !== S_DONE) return;
+    const s = this.pool[this.remoteSnap];
+    if (s.src === this.remoteSrc && s.j === this.remoteJ && this.entryOf(s.src) >= 0) {
+      s.valid = true;
+      s.lastUse = ++this.useCounter;
+      this.computed++;
+      this.remoteComputed++;
+    }
+    this.remoteSnap = -1;
+    Atomics.store(ctrl, C_STATE, S_IDLE);
+  }
+
+  /** Ask the worker for snapshot (src, j) into a fresh pool entry. */
+  private submitRemote(src: number, j: number): void {
+    const ctrl = this.ctrl as Int32Array;
+    const i = this.acquire(src, j);
+    this.remoteSnap = i; this.remoteSrc = src; this.remoteJ = j;
+    ctrl[C_POOL] = i;
+    ctrl[C_ENTRY] = this.entryOf(src);
+    (this.ctrlF as Float64Array)[F_J] = j;
+    Atomics.store(ctrl, C_STATE, S_REQUESTED);
+    this.ring();
+  }
+
+  private ring(): void {
+    const ctrl = this.ctrl as Int32Array;
+    Atomics.add(ctrl, C_BELL, 1);
+    Atomics.notify(ctrl, C_BELL);
+  }
+
+  /**
+   * Ask the worker to fill a whole position frame for time t = args[0], choppiness args[1], ahead of
+   * time (the next tick). Only when both snapshots are cached and the worker is idle for prefill.
+   * The next materialise() at exactly that time adopts it instead of filling blocks on this thread.
+   */
+  requestPrefill(src: number): void {
+    const ctrl = this.ctrl;
+    if (ctrl === null || this.cubic || !this.remoteReady()) return;
+    if (this.preBusy) {
+      if (Atomics.load(ctrl, C_PSTATE) === S_REQUESTED) return; // still working on an older one
+      this.preBusy = false; // done but not adopted (stale): drop it
+      Atomics.store(ctrl, C_PSTATE, S_IDLE);
+    }
+    const t = this.args[0], chop = this.args[1], dt = this.snapshotDt;
+    const j = Math.floor(t / dt);
+    const ia = this.find(src, j), ib = this.find(src, j + 1);
+    if (ia < 0 || ib < 0) return;
+    const u = (t - j * dt) / dt, u2 = u * u, u3 = u2 * u;
+    const f = this.ctrlF as Float64Array;
+    f[F_PT] = t;
+    // Same expressions as materialise() (bit-identical coefficients).
+    f[F_PCOEF] = 2 * u3 - 3 * u2 + 1; f[F_PCOEF + 1] = (u3 - 2 * u2 + u) * dt; f[F_PCOEF + 2] = -2 * u3 + 3 * u2; f[F_PCOEF + 3] = (u3 - u2) * dt;
+    f[F_PCOEF + 4] = chop;
+    ctrl[C_PA] = ia; ctrl[C_PB] = ib; ctrl[C_PBUF] = this.preBuf;
+    this.preA = ia; this.preB = ib; this.preBusy = true;
+    Atomics.store(ctrl, C_PSTATE, S_REQUESTED);
+    this.ring();
+  }
+
+  /**
+   * Ask the worker to regenerate this cascade's spectrum into slot (master h0 + this sim's slot
+   * grid) with params written by setRegenParams. Poll regenDone(); then call slotChanged(slot).
+   */
+  requestRegen(slot: number, params: Float64Array): boolean {
+    const ctrl = this.ctrl;
+    if (ctrl === null || !this.remoteReady() || Atomics.load(ctrl, C_RSTATE) === S_REQUESTED) return false;
+    const f = this.ctrlF as Float64Array;
+    for (let i = 0; i < 8; i++) f[F_REGEN + i] = params[i];
+    ctrl[C_RSLOT] = slot;
+    Atomics.store(ctrl, C_RSTATE, S_REQUESTED);
+    this.ring();
+    return true;
+  }
+  regenDone(): boolean { return this.ctrl !== null && Atomics.load(this.ctrl, C_RSTATE) === S_DONE; }
+  ackRegen(): void { if (this.ctrl !== null) Atomics.store(this.ctrl, C_RSTATE, S_IDLE); }
+  /** A slot grid was rewritten by the worker: drop snapshots of sources that use it. */
+  slotChanged(slot: number): void {
+    for (let e = 0; e < 2; e++) {
+      const id = this.srcId[e];
+      if (id >= 0 && (this.srcFrom[e] === slot || this.srcTo[e] === slot)) this.invalidateSource(id);
+    }
+  }
+  /** Worker side: resample a master h0 into this sim's slot grid (no invalidation: main does that). */
+  loadSlot(slot: number, masterH0: Float32Array): void { resampleCentred(masterH0, this.slotH0[slot], this.n, 4, true); }
+  /** Worker side: the control block (for extra work served between requests). */
+  get control(): { ctrl: Int32Array; ctrlF: Float64Array } { return { ctrl: this.ctrl as Int32Array, ctrlF: this.ctrlF as Float64Array }; }
+
+  /** Ask a serving worker to exit. */
+  stopRemote(): void {
+    if (this.ctrl === null) return;
+    Atomics.store(this.ctrl, C_QUIT, 1);
+    this.ring();
+  }
+
+  // ---- worker side ---------------------------------------------------------------------------
+
+  /**
+   * Worker loop: wait for a request, compute the snapshot into the shared pool entry, signal done.
+   * Never returns (until quit). Blocks with Atomics.wait (allowed in workers only).
+   */
+  serve(extra?: () => boolean): void {
+    const ctrl = this.ctrl as Int32Array, ctrlF = this.ctrlF as Float64Array;
+    Atomics.store(ctrl, C_READY, 1);
+    for (;;) {
+      const bell = Atomics.load(ctrl, C_BELL);
+      if (Atomics.load(ctrl, C_QUIT) === 1) return;
+      let worked = false;
+      if (Atomics.load(ctrl, C_PSTATE) === S_REQUESTED) { // prefill first: short and needed next tick
+        const out = this.frameBufs[ctrl[C_PBUF]], A = this.pool[ctrl[C_PA]].data, B = this.pool[ctrl[C_PB]].data;
+        for (let by = 0; by < this.nb; by++) for (let bx = 0; bx < this.nb; bx++) fillPositions(out, A, B, ctrlF, F_PCOEF, F_PCOEF + 4, this.n, this.blockShift, bx, by);
+        Atomics.store(ctrl, C_PSTATE, S_DONE);
+        worked = true;
+      }
+      if (Atomics.load(ctrl, C_STATE) === S_REQUESTED) {
+        const i = ctrl[C_POOL], e = ctrl[C_ENTRY], j = ctrlF[F_J];
+        this.computeInto(this.pool[i].data, e, j);
+        Atomics.store(ctrl, C_STATE, S_DONE);
+        worked = true;
+      }
+      if (extra && extra()) worked = true; // one chunk of background work per round (e.g. spectrum regeneration)
+      if (!worked) Atomics.wait(ctrl, C_BELL, bell);
+    }
+  }
+
+  /** Full snapshot of source table entry e at time index j into out (same steps as the job). */
+  private computeInto(out: Float32Array, e: number, j: number): void {
+    const n = this.n, S = this.colSteps;
+    this.evolveRows(e, j, 0, (n >> 1) + 1);
+    for (let a = 0; a < 3; a++) {
+      const re = a === 0 ? this.re1 : a === 1 ? this.re2 : this.re3;
+      const im = a === 0 ? this.im1 : a === 1 ? this.im2 : this.im3;
+      for (let k = 0; k < S; k++) fftColumnsStep(this.plan, re, im, k, 1);
+      transposeSquare(n, re, im);
+      for (let k = 0; k < S; k++) fftColumnsStep(this.plan, re, im, k, 1);
+      transposeSquare(n, re, im);
+    }
+    this.packRows(out, 0, n);
+  }
+
   private invalidateSource(id: number): void {
     if (this.jobSnap >= 0 && this.pool[this.jobSnap].src === id) this.jobSnap = -1;
     for (let i = 0; i < this.pool.length; i++) if (this.pool[i].src === id) { this.pool[i].valid = false; this.pool[i].src = -1; }
@@ -467,21 +697,21 @@ export class CascadeSim {
 
   private isLazyRef(i: number): boolean {
     const r = this.lazyRef;
-    return r[0] === i || r[1] === i || r[2] === i || r[3] === i;
+    return r[0] === i || r[1] === i || r[2] === i || r[3] === i || (this.preBusy && (this.preA === i || this.preB === i));
   }
 
   private acquire(src: number, j: number): number {
     let best = -1, bestUse = Infinity;
     for (let i = 0; i < this.pool.length; i++) {
       const s = this.pool[i];
-      if (i === this.jobSnap) continue;
+      if (i === this.jobSnap || i === this.remoteSnap) continue;
       if (!s.valid || this.entryOf(s.src) < 0) { best = i; break; }
       if (this.isPinned(s) || this.isLazyRef(i)) continue;
       if (s.lastUse < bestUse) { bestUse = s.lastUse; best = i; }
     }
     if (best < 0) { // everything pinned: take the least recently used anyway
       for (let i = 0; i < this.pool.length; i++) {
-        if (i !== this.jobSnap && this.pool[i].lastUse < bestUse) { bestUse = this.pool[i].lastUse; best = i; }
+        if (i !== this.jobSnap && i !== this.remoteSnap && this.pool[i].lastUse < bestUse) { bestUse = this.pool[i].lastUse; best = i; }
       }
     }
     // A lazy frame still reading this entry becomes invalid (recomputed on demand).
@@ -501,6 +731,18 @@ export class CascadeSim {
     let i = this.find(src, j);
     if (i >= 0) { this.pool[i].lastUse = ++this.useCounter; return i; }
     if (this.entryOf(src) < 0) throw new Error(`CascadeSim: unknown source ${src}`);
+    if (this.remoteSnap >= 0) {
+      this.pollRemote();
+      if (this.remoteSnap >= 0 && this.remoteSrc === src && this.remoteJ === j) {
+        // The worker is computing exactly this one: wait for it (spin: Atomics.wait is not allowed
+        // on a browser main thread). Rare: the prefetch runs two snapshot intervals ahead.
+        const ctrl = this.ctrl as Int32Array;
+        while (Atomics.load(ctrl, C_STATE) !== S_DONE) { /* spin */ }
+        this.pollRemote();
+        i = this.find(src, j);
+        if (i >= 0) { this.pool[i].lastUse = ++this.useCounter; this.syncComputed++; return i; }
+      }
+    }
     if (this.jobSnap >= 0) {
       const js = this.pool[this.jobSnap];
       if (js.src === src && js.j === j) {
@@ -659,7 +901,19 @@ export class CascadeSim {
     this.pinCount = 0;
     this.pin(active, j0 - 1); this.pin(active, j0); this.pin(active, j0 + 1); this.pin(active, j0 + 2); this.pin(active, j0 + 3);
     if (pending >= 0) { this.pin(pending, jp); this.pin(pending, jp + 1); this.pin(pending, jp + 2); }
+    this.pollRemote();
     this.ensure(active, j0); this.ensure(active, j0 + 1);
+    if (this.remoteReady()) {
+      // Background snapshots go to the worker: one request in flight, picked in priority order.
+      if (this.remoteSnap < 0) {
+        if (!this.has(active, j0 + 2)) this.submitRemote(active, j0 + 2);
+        else if (pending >= 0 && !this.has(pending, jp)) this.submitRemote(pending, jp);
+        else if (pending >= 0 && !this.has(pending, jp + 1)) this.submitRemote(pending, jp + 1);
+        else if (pending >= 0 && !this.has(pending, jp + 2)) this.submitRemote(pending, jp + 2);
+        else if (!this.has(active, j0 + 3)) this.submitRemote(active, j0 + 3);
+      }
+      return;
+    }
     // Steady rate: one active snapshot per interval, plus the pending source's missing snapshots
     // spread over the ticks left until its switch. Catch up at double rate when behind.
     let rate = (this.unitsPerSnapshot * tickDt) / dt;
@@ -711,10 +965,26 @@ export class CascadeSim {
     k[c + 4] = (6 * u2 - 6 * u) / dt; k[c + 5] = 3 * u2 - 4 * u + 1; k[c + 6] = (-6 * u2 + 6 * u) / dt; k[c + 7] = 3 * u2 - 2 * u;
     k[c + 8] = chop; k[c + 9] = dchop;
     this.lazyRef[2 * frame] = ia; this.lazyRef[2 * frame + 1] = ib;
-    this.blockValid[frame].fill(0);
     this.velValid[frame].fill(0);
     this.frameTime[frame] = t;
     this.frameStamp[frame] = stamp;
+    // Adopt the worker's prefill for exactly this frame (same snapshots, time and choppiness).
+    const ctrl = this.ctrl;
+    if (this.preBusy && ctrl !== null) {
+      const f = this.ctrlF as Float64Array;
+      // Never wait: if the worker has not finished (it may be busy with a snapshot), fill lazily here.
+      if (Atomics.load(ctrl, C_PSTATE) === S_DONE && f[F_PT] === t && this.preA === ia && this.preB === ib && f[F_PCOEF + 4] === chop) {
+        const b = this.frameBuf[frame];
+        this.frameBuf[frame] = this.preBuf; this.preBuf = b;
+        this.frames[frame] = this.frameBufs[this.frameBuf[frame]];
+        this.preBusy = false;
+        Atomics.store(ctrl, C_PSTATE, S_IDLE);
+        this.blockValid[frame].fill(1);
+        this.prefillsAdopted++;
+        return;
+      }
+    }
+    this.blockValid[frame].fill(0);
   }
 
   /** Fill the position blocks covering texel columns x0..x1 and rows y0..y1 (wrapped, each span <= BLOCK). */
@@ -738,19 +1008,8 @@ export class CascadeSim {
   }
 
   private fillBlock(f: number, bx: number, by: number): void {
-    const n = this.n, B = 1 << this.blockShift, c = f * 10, k = this.lazyCoef;
-    const A0 = this.pool[this.lazyRef[2 * f]].data, B0 = this.pool[this.lazyRef[2 * f + 1]].data;
-    const out = this.frames[f];
-    const a0 = k[c], a1 = k[c + 1], b0 = k[c + 2], b1 = k[c + 3], chop = k[c + 8];
-    const ca0 = chop * a0, ca1 = chop * a1, cb0 = chop * b0, cb1 = chop * b1;
-    for (let y = by * B, yEnd = y + B; y < yEnd; y++) {
-      for (let x = bx * B, xEnd = x + B; x < xEnd; x++) {
-        const i = y * n + x, o = i * 6, q = i * 3;
-        out[q] = a0 * A0[o] + a1 * A0[o + 3] + b0 * B0[o] + b1 * B0[o + 3];
-        out[q + 1] = ca0 * A0[o + 1] + ca1 * A0[o + 4] + cb0 * B0[o + 1] + cb1 * B0[o + 4];
-        out[q + 2] = ca0 * A0[o + 2] + ca1 * A0[o + 5] + cb0 * B0[o + 2] + cb1 * B0[o + 5];
-      }
-    }
+    const c = f * 10;
+    fillPositions(this.frames[f], this.pool[this.lazyRef[2 * f]].data, this.pool[this.lazyRef[2 * f + 1]].data, this.lazyCoef, c, c + 8, this.n, this.blockShift, bx, by);
     this.blockValid[f][by * this.nb + bx] = 1;
     this.posBlocksFilled++;
   }

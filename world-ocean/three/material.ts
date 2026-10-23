@@ -1,5 +1,5 @@
-// Water surface material (three r186, WebGPU / TSL, MeshBasicNodeMaterial with a custom colorNode).
-// Faithful port of the WebGL reference fragment shader (src/ocean.js:228-354, docs/port/REFERENCE.md Â§2), every term
+﻿// Water surface material (three r186, WebGPU / TSL, MeshBasicNodeMaterial with a custom colorNode).
+// Faithful port of the WebGL reference fragment shader (src/ocean.js:228-354, docs/port/REFERENCE.md Ã‚Â§2), every term
 // in the same order with the same constants. Output: linear HDR radiance (cd/m^2) x preExposure, no tonemap.
 //
 // Term by term (reference line refs = src/ocean.js):
@@ -39,7 +39,7 @@
 import { DoubleSide, MeshBasicNodeMaterial, Vector3 } from 'three/webgpu';
 import {
   cameraPosition, clamp, dFdx, dFdy, dot, exp, exp2, float, length, max, min, mix, modelWorldMatrix, normalize,
-  pmremTexture, pow, positionWorld, reflect, select, smoothstep, sqrt, uniform, varying, vec2, vec3, vec4,
+  pmremTexture, pow, positionWorld, reflect, smoothstep, sqrt, uniform, varying, vec2, vec3, vec4,
 } from 'three/tsl';
 import type { EnvironmentState, SkyLight } from '../stubs/world-core.ts';
 import type { FftSampling, OceanFft } from './fft.ts';
@@ -73,6 +73,8 @@ export interface OceanTransmissionContext {
   upWorld: any;
   /** Periodic rest-tile coordinate for period P (m), varying (contact pattern). */
   tileCoord(period: number): any;
+  /** Undisplaced local position (x east, z south), m, varying (same as OceanFoamContext.restLocal). */
+  restLocal: any;
   /** The material's preExposure node (scene.color = radiance x preExposure). */
   preExposure: any;
   /** Foam / contact white level (cd/m^2 per reference unit). */
@@ -216,12 +218,13 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
   if (o.transmission) {
     const refractionNormal = faceV(normalize(mix(surfaceNormal, N, 0.22)));
     transmitted = o.transmission({
-      normalWorld: refractionNormal, viewDir: V, positionWorld, upWorld: upW, tileCoord: tileF,
+      normalWorld: refractionNormal, viewDir: V, positionWorld, upWorld: upW, tileCoord: tileF, restLocal,
       preExposure: o.preExposure, foamWhite,
     });
     const ext = exp(vec3(...SIGMA).negate().mul(transmitted.path));
-    // select (not x valid): open water stays bit-identical to the no-refraction path.
-    water = select(transmitted.valid.greaterThan(0.5), transmitted.color.mul(ext).add(water.mul(float(1).sub(ext))), water);
+    // mix with a 0/1 mask (mix(a, b, 0) == a exactly: open water stays bit-identical to the no-refraction path).
+    // Not select(): TSL emits an if/else for it, putting the derivative terms below in non-uniform control flow.
+    water = mix(water, transmitted.color.mul(ext).add(water.mul(float(1).sub(ext))), transmitted.valid);
   }
   // crest translucency (subsurface glow)
   const crest = smoothstep(-0.3, 0.85, height.div(max(waveScale, 0.1)));

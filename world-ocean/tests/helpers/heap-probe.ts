@@ -36,7 +36,7 @@ function run(ticks: number, phase: number): number {
 }
 
 // Warm-up (JIT, pools, every code path incl. a regeneration), then measure.
-run(1000, 0); run(600, 1); for (let r = 0; r < Number(process.env.WARM ?? 0); r++) run(1000, r & 1);
+run(1000, 0); run(600, 1); for (let r = 0; r < Number(process.env.WARM ?? 3); r++) run(1000, r & 1); // JIT / feedback warm-up
 gc(); gc();
 const before = process.memoryUsage().heapUsed;
 const acc = run(1000, 1);

@@ -52,7 +52,7 @@ export interface SimParams {
   /** Wind sampling height above sea level, m (spec: 10 m). */
   windSampleHeight: number;
   /**
-   * Query time window, s: once ticking, query times are clamped to [lastTick - w, lastTick + w]
+   * Query time window, s: once ticking, query times are clamped to [lastTick - w, lastTick]
    * (the cached snapshots, bounded cost). Infinity = exact at any time (a cold time costs ~50-70 ms).
    */
   timeWindow: number;
@@ -64,7 +64,10 @@ export interface SimParams {
 export interface QueryCascadeConfig {
   /** CPU FFT size for this cascade (power of two, 0 = cascade skipped by the CPU query). */
   size: number;
-  /** Snapshot spacing in time, s (cubic Hermite in time between snapshots, exact velocities). */
+  /**
+   * Snapshot spacing in time, s (cubic Hermite in time between snapshots, exact velocities). Should
+   * divide the 8192 s loop period (e.g. 0.5, 0.25, 0.125) so that t and t + 8192 give identical heights.
+   */
   snapshotDt: number;
   /** Spatial filter: 'bilinear' (matches GPU hardware/manual bilinear) or 'cubic' (Catmull-Rom). */
   filter: 'bilinear' | 'cubic';
@@ -88,6 +91,12 @@ export interface OceanOptions extends Partial<SpectrumParams>, Partial<SimParams
   query?: readonly QueryCascadeConfig[];
   /** Optional perf sink (engine perf.begin/end). */
   perf?: PerfSink;
+  /**
+   * Run the CPU query's snapshot FFTs in worker threads (one per cascade; ocean-worker.ts) when
+   * SharedArrayBuffer + workers are available (Node, or a cross-origin isolated page). Default true.
+   * Results are bit-identical either way; the main-thread tick drops by the snapshot cost (~1.5 ms).
+   */
+  worker?: boolean;
   /** Shape to use before install() (standalone / tests). install() uses world.shape if not given. */
   shape?: WorldShape;
 }
@@ -110,7 +119,7 @@ export const DEFAULT_SIM_PARAMS: Readonly<SimParams> = Object.freeze({
   windTimeConstant: 8,
   windSpeedTolerance: 0.03,
   windDirectionToleranceDeg: 3,
-  regenRowsPerTick: 8,
+  regenRowsPerTick: 4,
   inversionIterations: 6,
   inversionTolerance: 0.004,
   windSampleHeight: 10,
@@ -119,21 +128,23 @@ export const DEFAULT_SIM_PARAMS: Readonly<SimParams> = Object.freeze({
 });
 
 /**
- * CPU query cascades. Cascades 0 (1024 m, ~96 % of the height variance at 'breeze') and 1 (96 m,
+ * CPU query cascades. Cascades 0 (1024 m, ~96 % of the height variance at 'windy') and 1 (96 m,
  * ~4 %) run at 256, i.e. the same grid + bilinear filter the GPU draws at 256 (identical numbers
  * up to float32 / Hermite-in-time rounding). Cascade 2 (9 m, ~0.03 %) runs at 128, an exact
- * spectral subset of the 256 grid (modes |k| < 64 dk). Snapshot spacing in time: 0.6 / 0.25 / 0.15 s
- * (Hermite-in-time error <= 0.45 % of Hs for every preset; snapshot CPU cost per 60 Hz tick ~1.5 ms).
+ * spectral subset of the 256 grid (modes |k| < 64 dk). Snapshot spacing in time: 0.5 / 0.25 / 0.125 s
+ * (binary fractions that divide the 8192 s loop: the snapshot grid repeats with the waves)
+ * (Hermite-in-time error <= 0.45 % of Hs for every preset; snapshot cost ~1.5 ms per 60 Hz tick, run by the
+ * snapshot workers when available, see OceanOptions.worker).
  * Cost and measured parity vs a full 256^3 evaluation: see tests/core-parity.test.ts and the report.
  * LITE alternative (half the CPU): [{256, .4}, {128, .25, 'cubic'}, {64, .1}] (p99 error ~1.2 % of Hs).
  */
 export const DEFAULT_QUERY_CASCADES: readonly QueryCascadeConfig[] = Object.freeze([
-  Object.freeze({ size: 256, snapshotDt: 0.6, filter: 'bilinear' as const }),
+  Object.freeze({ size: 256, snapshotDt: 0.5, filter: 'bilinear' as const }),
   Object.freeze({ size: 256, snapshotDt: 0.25, filter: 'bilinear' as const }),
-  Object.freeze({ size: 128, snapshotDt: 0.15, filter: 'bilinear' as const }),
+  Object.freeze({ size: 128, snapshotDt: 0.125, filter: 'bilinear' as const }),
 ]);
 
-/** Every tunable with min / max / unit / label / default (default = the 'breeze' preset). */
+/** Every tunable with min / max / unit / label / default (default = the 'windy' preset = the reference). */
 export const PARAM_DEFS: readonly ParamDef[] = Object.freeze([
   { key: 'windSpeed', label: 'Wind speed (10 m)', unit: 'm/s', min: 0.5, max: 35, default: 15, step: 0.5, // hard cap MAX_WIND_SPEED
     description: 'U10 for the JONSWAP spectrum. From WIND_QUERY when installed (useWind).' },
@@ -159,14 +170,14 @@ export const PARAM_DEFS: readonly ParamDef[] = Object.freeze([
     description: 'Relative drift of the smoothed wind speed that triggers a regeneration + crossfade.' },
   { key: 'windDirectionToleranceDeg', label: 'Wind direction tolerance', unit: 'deg', min: 0.5, max: 45, default: 3, step: 0.5,
     description: 'Drift of the smoothed wind direction that triggers a regeneration + crossfade.' },
-  { key: 'regenRowsPerTick', label: 'Regeneration rows / tick', unit: 'rows', min: 1, max: 768, default: 8, step: 1,
+  { key: 'regenRowsPerTick', label: 'Regeneration rows / tick', unit: 'rows', min: 1, max: 768, default: 4, step: 1,
     description: 'Amortisation of the spectrum regeneration (3 x 256 rows in total).' },
   { key: 'inversionIterations', label: 'Inversion iterations', unit: '', min: 0, max: 12, default: 6, step: 1,
     description: 'Max Newton iterations to find the rest point that is displaced onto the query point (reference: 3 plain fixed-point steps).' },
   { key: 'inversionTolerance', label: 'Inversion tolerance', unit: 'm', min: 0.0001, max: 0.05, default: 0.004, step: 0.0005,
     description: 'Horizontal residual at which the inversion stops. Height error is about slope x residual.' },
   { key: 'timeWindow', label: 'Query time window', unit: 's', min: 0.02, max: Infinity, default: 0.1, step: 0.01,
-    description: 'Queries are exact within +-w of the last tick (cached snapshots, no stall); further times are clamped. Infinity = always exact (synchronous snapshot cost ~50-70 ms per new time).' },
+    description: 'Queries are exact within [lastTick - w, lastTick] (cached snapshots, no stall; covers the interpolated render time); other times are clamped (future times to the last tick). Infinity = always exact (synchronous snapshot cost ~50-70 ms per new time).' },
   { key: 'maxTurnPerBlendDeg', label: 'Max sea turn per crossfade', unit: 'deg', min: 1, max: 180, default: 15, step: 1,
     description: 'The spectrum direction follows the wind by at most this per crossfade (complex-amplitude crossfades between distant directions lose energy mid-blend).' },
   { key: 'windSampleHeight', label: 'Wind sample height', unit: 'm', min: 0, max: 100, default: 10, step: 1,

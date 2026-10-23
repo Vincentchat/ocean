@@ -1,36 +1,35 @@
 // GPU FFT debug page (WebGPU only): shows every cascade's textures and runs a numeric GPU-vs-CPU check.
+// Uses only public APIs: the core's createOcean (getState / blendAt / choppinessAt / tick / setPreset) and the
+// adapter's fft-tiers.ts (an independent exact CPU evaluation of the drawn fields).
 //
 // URL flags
 //   ?tier=low|medium|high|ultra   FFT tier (default high)
-//   ?preset=calm|breeze|windy|storm  core preset (default breeze)
+//   ?preset=calm|breeze|windy|storm  core preset (default windy = the reference)
 //   ?t=seconds                    fixed draw time (default: running clock from 0)
 //   ?lod=n                        mip level shown in the panels
 //   ?check                        run the GPU-vs-CPU check automatically; results in window.__fftCheck
 //   ?bench                        FFT only (no panels): GPU timestamps in window.__perf (tools/perf.mjs format)
 //
-// Panels (rows = cascades 0..3, columns): height (up, red +, blue -), per-cascade normal (east/north tilt in
-// red/green, blue = mip shortening x10), Jacobian J = (1+Exx)(1+Nyy)-Exy^2 (grey, red where J < 0) with the
-// foam compression in green.
+// Panels (rows = cascades 0..2, columns): height (up, red +, blue -), per-cascade normal (east/north tilt in
+// red/green, blue = mip shortening x10), foam compression (1 - normal.w).
 //
-// GPU-vs-CPU check: the f32 FFT fields (before the rgba16f store) are read back asynchronously (the frame loop
-// never waits; results arrive one or more frames later) and compared texel by texel with the core's CPU FFT
-// (cpu-fft.ts CascadeSim at the same grid size, exact time: snapshotDt = t so the Hermite weight is exactly 1)
-// for t = 12.5 s, 8191.7 s (loop wrap), 100000.37 s and in the middle of a preset crossfade. A second check
-// samples the TEXTURES through the material helper (createFftSampling().sampleDisplacement, chained lookup,
-// bilinear LOD 0) at 4096 random rest points and compares with the core's sampleRest (same grids, exact time).
+// Check 1 (fields): the f32 FFT output (before the rgba16f store) is read back asynchronously (the frame loop never
+// waits) and compared texel by texel with fft-tiers.evaluateFields (f64, exact time) for the same h0 / omega /
+// blend / chop, at t = 12.5 s, 8191.7 s (loop wrap), 100000.37 s and mid-crossfade.
+// Check 2 (textures + sampling kernel): createFftSampling().sampleDisplacement at 4096 random rest points, chained,
+// LOD 0, Catmull-Rom (and bilinear) vs the same lookup on the CPU (fft-tiers.sampleChained) of the exact fields.
 import { NodeMaterial, QuadMesh, StorageBufferAttribute, WebGPURenderer } from 'three/webgpu';
-import { Fn, clamp, float, floor, fract, instanceIndex, int, length, select, storage, uniform, uv, vec2, vec3, vec4 } from 'three/tsl';
+import { Fn, clamp, float, floor, fract, instanceIndex, int, ivec2, length, select, storage, uniform, uv, vec2, vec3, vec4 } from 'three/tsl';
 import { createOcean } from '../index.ts';
 import { createFlatShape } from '../stubs/impl.ts';
-import { CascadeSim, CALL } from '../cpu-fft.ts';
-import { omegaIndices } from '../spectrum.ts';
-import { createOceanFft, createFftSampling, FFT_CASCADES, FFT_TIERS, type OceanTier } from '../three/fft.ts';
+import { createOceanFft, createFftSampling, FFT_CASCADES, NORMAL_LAYER, type OceanTier } from '../three/fft.ts';
+import { tierCascades, evaluateFields, sampleChained } from '../three/fft-tiers.ts';
 import type { PassContext } from '../three/pass-types.ts';
 
 const $ = (id: string) => document.getElementById(id)!;
 const params = new URLSearchParams(location.search);
 const tierParam = (params.get('tier') ?? 'high') as OceanTier;
-const preset = (params.get('preset') ?? 'breeze') as any;
+const preset = (params.get('preset') ?? 'windy') as any;
 const fixedT = params.has('t') ? Number(params.get('t')) : null;
 const bench = params.has('bench');
 const autoCheck = params.has('check');
@@ -49,8 +48,6 @@ async function main() {
 
   const shape = createFlatShape();
   const ocean = createOcean({ shape, preset, seed: 1 });
-  const state = ocean.getState();
-  const g = state.gravity;
   const fft = createOceanFft({ renderer, ocean, tier: tierParam });
   (window as any).__fft = { fft, ocean, renderer };
   const tierSel = $('tier') as HTMLSelectElement;
@@ -58,13 +55,7 @@ async function main() {
   tierSel.onchange = () => fft.setTier(tierSel.value as OceanTier);
 
   // ---------------------------------------------------------------- panels
-  // Per-cascade colour scale: 2.5 sigma of the cascade's height (time average of |h0|^2 + |h0m|^2).
-  const sigma = [0, 1, 2, 3].map((c) => {
-    const h0 = c < 3 ? state.slots[state.toSlot].h0[c] : fft.debug.fineH0(state.toSlot);
-    let s = 0;
-    for (let i = 0; i < h0.length; i++) s += h0[i] * h0[i];
-    return Math.sqrt(s);
-  });
+  const sigma = [0.5, 0.08, 0.008].map((x) => x * Math.max(ocean.expectedHs(), 0.1));
   const uLod = uniform(Number(params.get('lod') ?? 0));
   ($('lod') as HTMLSelectElement).value = String(uLod.value);
   ($('lod') as HTMLSelectElement).onchange = (e) => { uLod.value = Number((e.target as HTMLSelectElement).value); };
@@ -72,62 +63,85 @@ async function main() {
   const mat = new NodeMaterial();
   mat.fragmentNode = Fn(() => {
     const p = uv();
-    const col = floor(p.x.mul(3)), row = floor(float(1).sub(p.y).mul(4));
-    const q = vec2(fract(p.x.mul(3)), fract(float(1).sub(p.y).mul(4)));
+    const col = floor(p.x.mul(3)), row = floor(float(1).sub(p.y).mul(3));
+    const q = vec2(fract(p.x.mul(3)), fract(float(1).sub(p.y).mul(3)));
     let out: any = vec3(0);
-    for (let r = 0; r < 4; r++) {
-      const isBase = r < 2;
-      const layer = r & 1;
-      const disp = (isBase ? N.displacementBase : N.displacementDetail).sample(q).depth(int(U.dispCurLayer.add(layer))).level(uLod);
-      const nrm = (isBase ? N.normalBase : N.normalDetail).sample(q).depth(int(layer)).level(uLod);
-      const der = (isBase ? N.derivativesBase : N.derivativesDetail).sample(q).depth(int(layer)).level(uLod);
-      const v = disp.x.div(2.5 * sigma[r] + 1e-9);
+    for (let r = 0; r < 3; r++) {
+      const disp = N.displacement.sample(q).depth(int(U.dispCurLayer.add(r))).level(uLod);
+      const nrm = N.normal.sample(q).depth(int(r + NORMAL_LAYER)).level(uLod);
+      const v = disp.x.div(sigma[r]);
       const cH = vec3(clamp(v, 0, 1), clamp(v.abs(), 0, 1).mul(0.15), clamp(v.negate(), 0, 1));
       const cN = vec3(nrm.x.mul(2).add(0.5), nrm.y.mul(2).add(0.5), float(1).sub(length(nrm.xyz)).mul(10));
-      const J = der.z.add(1).mul(der.w.add(1)).sub(disp.w.mul(disp.w));
-      const grey = clamp(J.mul(0.5), 0, 1);
-      const cJ = select(J.lessThan(0), vec3(1, 0, 0), vec3(grey, grey.add(float(1).sub(nrm.w).mul(2)), grey));
-      const c = select(col.equal(0), cH, select(col.equal(1), cN, cJ));
+      const comp = float(1).sub(nrm.w);
+      const cF = vec3(comp, comp, comp.mul(0.6).add(0.1));
+      const c = select(col.equal(0), cH, select(col.equal(1), cN, cF));
       out = select(row.equal(r), c, out);
     }
-    // thin separators
     const edge = q.x.lessThan(0.004).or(q.y.lessThan(0.006));
     return vec4(select(edge, vec3(0.1), out), 1);
   })();
   const quad = new QuadMesh(mat);
   const labels = $('labels');
-  const names = ['height (up)', 'normal tilt / mip shortening', 'Jacobian (red < 0), foam (green)'];
-  for (let r = 0; r < 4; r++) for (let c = 0; c < 3; c++) {
+  const names = ['height (up)', 'normal tilt / mip shortening', 'foam compression'];
+  for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) {
     const d = document.createElement('div');
-    d.style.left = `${(c / 3) * 100}%`; d.style.top = `${(r / 4) * 100}%`;
-    d.textContent = `c${r} L=${FFT_CASCADES[r].domain.toFixed(r === 3 ? 4 : 0)} m: ${names[c]}`;
+    d.style.left = `${(c / 3) * 100}%`; d.style.top = `${(r / 3) * 100}%`;
+    d.textContent = `c${r} L=${FFT_CASCADES[r].domain} m: ${names[c]}`;
     labels.appendChild(d);
   }
-  if (bench) { labels.style.display = 'none'; }
+  if (bench) labels.style.display = 'none';
 
-  // ---------------------------------------------------------------- chained-sampling check kernel
+  // ---------------------------------------------------------------- texture-lookup check kernels
   const K = 4096;
   const ptsArr = new Float32Array(K * 2);
   let s = 12345;
   const rnd = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
   for (let i = 0; i < K; i++) { ptsArr[2 * i] = rnd() * 400 - 200; ptsArr[2 * i + 1] = rnd() * 400 - 200; }
   const ptsAttr = new StorageBufferAttribute(ptsArr, 2);
-  const outAttr = new StorageBufferAttribute(K, 4);
+  const outCubic = new StorageBufferAttribute(K, 4), outBilin = new StorageBufferAttribute(K, 4);
   const sampling = createFftSampling(fft);
   const pts = storage(ptsAttr, 'vec2', K).toReadOnly();
-  const outBuf = storage(outAttr, 'vec4', K);
-  const chainKernel = Fn(() => {
-    const pt = pts.element(instanceIndex);
-    // tile coordinate (east, south) of a rest point (east e, north n) on the flat frame anchored at 0
-    const d = sampling.sampleDisplacement(() => vec2(pt.x, pt.y.negate()), { threeCascades: true });
-    outBuf.element(instanceIndex).assign(vec4(d, 0));
-  })().compute(K);
+  const mkKernel = (attr: any, cubic: boolean) => {
+    const o = storage(attr, 'vec4', K);
+    return Fn(() => {
+      const pt = pts.element(instanceIndex);
+      const d = sampling.sampleDisplacement(() => vec2(pt.x, pt.y.negate()), { cubic });
+      o.element(instanceIndex).assign(vec4(d, 0));
+    })().compute(K);
+  };
+  const chainKernels = [mkKernel(outCubic, true), mkKernel(outBilin, false)];
+  // Mip check: displacement mip levels 1, 3, 4, 7 at 3 x 256 texels vs the CPU box average of the f32 fields.
+  const MIP_LEVELS = [1, 3, 4, 7], MK = 256;
+  const mipOut = new StorageBufferAttribute(MIP_LEVELS.length * 3 * MK, 4);
+  const mipIdx = new Int32Array(MK * 2);
+  for (let i = 0; i < MK; i++) { mipIdx[2 * i] = Math.floor(rnd() * 4096); mipIdx[2 * i + 1] = Math.floor(rnd() * 4096); }
+  const mipIdxAttr = new StorageBufferAttribute(mipIdx, 2, Int32Array);
+  const mipKernels = new Map<number, any>();
+  function mipKernel(n: number) {
+    let k = mipKernels.get(n);
+    if (k) return k;
+    const ids = storage(mipIdxAttr, 'ivec2', MK).toReadOnly();
+    const o = storage(mipOut, 'vec4', mipOut.count);
+    k = Fn(() => {
+      const i = instanceIndex;
+      const p = ids.element(i);
+      for (let li = 0; li < MIP_LEVELS.length; li++) {
+        const lv = MIP_LEVELS[li], m = Math.max(1, n >> lv);
+        for (let c = 0; c < 3; c++) {
+          const xy = ivec2(p.x.mod(m), p.y.mod(m));
+          o.element(i.add((li * 3 + c) * MK)).assign(N.displacement.load(xy).depth(int(U.dispCurLayer.add(c))).level(int(lv)));
+        }
+      }
+    })().compute(MK);
+    mipKernels.set(n, k);
+    return k;
+  }
 
   // ---------------------------------------------------------------- perf state (tools/perf.mjs format)
   const RING = 2048;
   const perfState = {
     frames: 0, count: 0, head: 0,
-    cpuMs: new Float64Array(RING), frameMs: new Float64Array(RING), gpuMs: new Float64Array(RING), gpuComputeMs: new Float64Array(RING),
+    cpuMs: new Float64Array(RING), frameMs: new Float64Array(RING), gpuComputeMs: new Float64Array(RING),
     reset() { perfState.count = 0; perfState.head = 0; },
     snapshot() {
       const n = Math.min(perfState.count, RING), o: Record<string, number[]> = { cpuMs: [], frameMs: [], gpuMs: [], gpuComputeMs: [] };
@@ -135,69 +149,25 @@ async function main() {
         const j = (perfState.head - n + i + RING) % RING;
         o.cpuMs.push(perfState.cpuMs[j]); o.frameMs.push(perfState.frameMs[j]); o.gpuMs.push(0); o.gpuComputeMs.push(perfState.gpuComputeMs[j]);
       }
-      return { ...o, count: n, timestamps: renderer.hasFeature('timestamp-query'), tier: fft.tier, memoryMB: fft.debug.memoryBytes() / 1048576, compileMs: fft.debug.lastCompileMs() };
+      return { ...o, count: n, timestamps: renderer.hasFeature('timestamp-query'), tier: fft.pendingTier ? null : fft.tier,
+        memoryMB: fft.debug.memoryBytes() / 1048576, compileMs: fft.debug.lastCompileMs(), buildMainMs: fft.debug.lastBuildMainThreadMs() };
     },
   };
   (window as any).__perf = perfState;
 
   // ---------------------------------------------------------------- check state machine
-  type Row = { cascade: number; n: number; maxUp: number; maxEast: number; maxNorth: number; rmsUp: number; maxAbsM: number };
   const results: any = { tier: null, hs: ocean.expectedHs(), tests: [] as any[], done: false, error: null };
   (window as any).__fftCheck = results;
   const TESTS: { name: string; t: number | 'xfade' }[] = [
     { name: 't=12.5', t: 12.5 }, { name: 't=8191.7 (loop wrap)', t: 8191.7 }, { name: 't=100000.37', t: 100000.37 },
-    { name: 'crossfade breeze->storm, mid', t: 'xfade' },
+    { name: 'crossfade -> storm, mid', t: 'xfade' },
   ];
   let checkIdx = -1, checkWait = 0, checkBusy = false, checkTime = 0, checkSetup = false;
-  const startCheck = () => { if (checkIdx < 0 || results.done) { results.tests = []; results.done = false; results.tier = fft.tier; checkIdx = 0; checkWait = 4; checkBusy = false; checkSetup = false; } };
+  const startCheck = () => { if (checkIdx < 0 || results.done) { results.tests = []; results.done = false; results.tier = fft.tier; checkIdx = 0; checkWait = 6; checkBusy = false; checkSetup = false; } };
   $('check').onclick = startCheck;
 
-  function cpuField(c: number, n: number, T: number, chop: number): Float32Array {
-    const def = FFT_CASCADES[c];
-    const masterOmega = c < 3 ? state.omegaIndex[c] : omegaIndices(def, g, new Float32Array(256 * 256));
-    const sim = new CascadeSim(def, { size: n, snapshotDt: T, filter: 'bilinear' }, masterOmega, 3, 4);
-    for (let sl = 0; sl < 3; sl++) sim.setSlot(sl, c < 3 ? state.slots[sl].h0[c] : fft.debug.fineH0(sl));
-    CALL[0] = state.blendStart; CALL[1] = state.blendDuration;
-    sim.setSource(0, 1, state.fromSlot, state.toSlot);
-    CALL[0] = T; CALL[1] = chop; CALL[2] = 0;
-    sim.materialise(0, 1, true, 1);
-    return sim.frames[0];
-  }
-  function compare(gpu: Float32Array, layer: number, cpu: Float32Array, n: number, c: number, hs: number): Row {
-    let mu = 0, me = 0, mn = 0, su = 0;
-    const nn = n * n;
-    for (let i = 0; i < nn; i++) {
-      const o = (layer * nn + i) * 4, q = i * 3;
-      const du = Math.abs(gpu[o] - cpu[q]), de = Math.abs(gpu[o + 1] - cpu[q + 1]), dn = Math.abs(gpu[o + 2] - cpu[q + 2]);
-      if (du > mu) mu = du; if (de > me) me = de; if (dn > mn) mn = dn;
-      su += du * du;
-    }
-    return { cascade: c, n, maxUp: mu / hs, maxEast: me / hs, maxNorth: mn / hs, rmsUp: Math.sqrt(su / nn) / hs, maxAbsM: Math.max(mu, me, mn) };
-  }
-
-  let cpuOcean: any = null, cpuOceanTier = '';
-  function chainedCompare(out: Float32Array, T: number, hs: number) {
-    const nd = FFT_TIERS[fft.tier].detailSize;
-    if (!cpuOcean || cpuOceanTier !== `${fft.tier}:${T}`) {
-      cpuOcean = createOcean({ shape, preset, seed: 1, query: [
-        { size: 256, snapshotDt: T, filter: 'bilinear' }, { size: 256, snapshotDt: T, filter: 'bilinear' }, { size: nd, snapshotDt: T, filter: 'bilinear' },
-      ] });
-      cpuOceanTier = `${fft.tier}:${T}`;
-    }
-    const r = { east: 0, north: 0, up: 0, vEast: 0, vNorth: 0, vUp: 0 };
-    let mu = 0, me = 0, mn = 0, su = 0;
-    for (let i = 0; i < K; i++) {
-      const e = ptsArr[2 * i], nn = ptsArr[2 * i + 1];
-      cpuOcean.sampleRest(e, nn, T, r);
-      const du = Math.abs(out[4 * i + 1] - r.up), de = Math.abs(out[4 * i] - (r.east - e)), dn = Math.abs(-out[4 * i + 2] - (r.north - nn));
-      if (du > mu) mu = du; if (de > me) me = de; if (dn > mn) mn = dn;
-      su += du * du;
-    }
-    return { points: K, maxUp: mu / hs, maxEast: me / hs, maxNorth: mn / hs, rmsUp: Math.sqrt(su / K) / hs };
-  }
-
   function runXfadeSetup(): number {
-    ocean.setPreset('storm');
+    ocean.setPreset(preset === 'storm' ? 'calm' : 'storm');
     let t = 20, step = 0;
     const dt = 1 / 60;
     for (let i = 0; i < 4000; i++) {
@@ -216,33 +186,68 @@ async function main() {
     if (!checkSetup) {
       checkSetup = true;
       checkTime = test.t === 'xfade' ? runXfadeSetup() : test.t;
-      if (test.t === 'xfade') checkWait = 16; // let the amortised cascade-3 spectrum + uploads finish
+      if (test.t === 'xfade') checkWait = 40; // worker spectra of the new slot + upload
     }
     if (--checkWait > 0) return;
-    // this frame's FFT ran at checkTime (see loop); request readbacks (resolved later, never awaited here)
+    { // wait (any number of frames) until the worker spectra of both slots are on the GPU
+      const s0 = ocean.getState();
+      if (!fft.debug.spectrum(s0.fromSlot) || !fft.debug.spectrum(s0.toSlot)) { checkWait = 10; return; }
+    }
     checkBusy = true;
-    console.log('[fft-debug] check readback', test.name, checkTime);
-    const T = checkTime, chop = ocean.choppinessAt(T), hs = results.hs;
-    const st = ocean.getState();
-    const info = { name: test.name, t: T, blend: st.fromSlot === st.toSlot ? 1 : ocean.blendAt(T), chop, from: st.fromSlot, to: st.toSlot };
-    const tier = fft.tier;
-    const nb = fft.debug.groupSize('base'), nd = fft.debug.groupSize('detail');
-    const wantChain = test.t !== 'xfade';
-    if (wantChain) renderer.compute(chainKernel);
+    const T = checkTime, st = ocean.getState(), hs = results.hs;
+    const w = st.fromSlot === st.toSlot ? 1 : ocean.blendAt(T), chop = ocean.choppinessAt(T);
+    const info = { name: test.name, t: T, blend: w, chop, from: st.fromSlot, to: st.toSlot };
+    const tier = fft.tier, n = fft.debug.size(), nn = n * n, cs = tierCascades(tier);
+    const from = fft.debug.spectrum(st.fromSlot), to = fft.debug.spectrum(st.toSlot), omega = fft.debug.omega();
+    for (const k of chainKernels) renderer.compute(k);
+    renderer.compute(mipKernel(n));
     Promise.all([
-      fft.debug.readFields('base'), fft.debug.readFields('detail'),
-      wantChain ? renderer.getArrayBufferAsync(outAttr).then((b: ArrayBuffer) => new Float32Array(b)) : Promise.resolve(null),
-    ]).then(([gb, gd, chainOut]) => {
-      console.log('[fft-debug] readback done', test.name);
-      const rows: Row[] = [];
-      rows.push(compare(gb, 0, cpuField(0, nb, T, chop), nb, 0, hs));
-      rows.push(compare(gb, 1, cpuField(1, nb, T, chop), nb, 1, hs));
-      rows.push(compare(gd, 0, cpuField(2, nd, T, chop), nd, 2, hs));
-      if (FFT_TIERS[tier].cascades === 4) rows.push(compare(gd, 1, cpuField(3, nd, T, chop), nd, 3, hs));
-      const entry: any = { ...info, fields: rows };
-      if (chainOut) entry.chained = chainedCompare(chainOut, T, hs);
-      results.tests.push(entry);
-      checkIdx++; checkWait = 4; checkBusy = false; checkSetup = false;
+      fft.debug.readFields(),
+      renderer.getArrayBufferAsync(outCubic).then((b: ArrayBuffer) => new Float32Array(b)),
+      renderer.getArrayBufferAsync(outBilin).then((b: ArrayBuffer) => new Float32Array(b)),
+      renderer.getArrayBufferAsync(mipOut).then((b: ArrayBuffer) => new Float32Array(b)),
+    ]).then(([gf, gc, gb, gm]) => {
+      if (!from || !to || !omega) throw new Error('spectrum / omega not available');
+      const rows: any[] = [];
+      const fields: Float64Array[] = [];
+      for (let c = 0; c < 3; c++) {
+        const f = evaluateFields(from[c], to[c], w, omega.subarray(c * nn, (c + 1) * nn), n, cs[c].domain, T, chop);
+        fields.push(f);
+        let mu = 0, me = 0, mn = 0;
+        for (let i = 0; i < nn; i++) {
+          const o = (c * nn + i) * 4;
+          mu = Math.max(mu, Math.abs(gf[o] - f[3 * i])); me = Math.max(me, Math.abs(gf[o + 1] - f[3 * i + 1])); mn = Math.max(mn, Math.abs(gf[o + 2] - f[3 * i + 2]));
+        }
+        rows.push({ cascade: c, n, maxUp: mu / hs, maxEast: me / hs, maxNorth: mn / hs, maxAbsM: Math.max(mu, me, mn) });
+      }
+      const chained = (g: Float32Array, cubic: boolean) => {
+        const out = new Float64Array(3), tmp = new Float64Array(3);
+        let mu = 0, me = 0, mn = 0;
+        for (let i = 0; i < K; i++) {
+          sampleChained(fields, n, cs, ptsArr[2 * i], ptsArr[2 * i + 1], cubic, out, tmp);
+          mu = Math.max(mu, Math.abs(g[4 * i + 1] - out[0])); me = Math.max(me, Math.abs(g[4 * i] - out[1])); mn = Math.max(mn, Math.abs(-g[4 * i + 2] - out[2]));
+        }
+        return { points: K, maxUp: mu / hs, maxEast: me / hs, maxNorth: mn / hs };
+      };
+      // mips: box average of the f32 fields (xyz) over 2^lv x 2^lv texels
+      let mipMax = 0;
+      for (let li = 0; li < MIP_LEVELS.length; li++) {
+        const lv = MIP_LEVELS[li];
+        if ((1 << lv) > n) continue;
+        const m = n >> lv, B = 1 << lv;
+        for (let c = 0; c < 3; c++) for (let i = 0; i < MK; i++) {
+          const mx = mipIdx[2 * i] % m, my = mipIdx[2 * i + 1] % m;
+          const acc = [0, 0, 0];
+          for (let y = 0; y < B; y++) for (let x = 0; x < B; x++) {
+            const o = (c * nn + (my * B + y) * n + mx * B + x) * 4;
+            acc[0] += gf[o]; acc[1] += gf[o + 1]; acc[2] += gf[o + 2];
+          }
+          const g4 = ((li * 3 + c) * MK + i) * 4;
+          for (let q = 0; q < 3; q++) mipMax = Math.max(mipMax, Math.abs(gm[g4 + q] - acc[q] / (B * B)));
+        }
+      }
+      results.tests.push({ ...info, fields: rows, chainedCubic: chained(gc, true), chainedBilinear: chained(gb, false), mipMaxErr: mipMax / hs });
+      checkIdx++; checkWait = 6; checkBusy = false; checkSetup = false;
       if (checkIdx >= TESTS.length) { results.done = true; ocean.setPreset(preset, true); }
       showResults();
     }).catch((e) => { results.error = String(e?.stack ?? e); results.done = true; checkBusy = false; showResults(); });
@@ -250,11 +255,14 @@ async function main() {
 
   function showResults() {
     const f = (x: number) => x.toExponential(2);
-    let s = `GPU vs CPU (tier ${results.tier}, Hs ${results.hs.toFixed(3)} m), max |err| / Hs per field:\n`;
+    let s = `GPU vs CPU (tier ${results.tier}, Hs ${results.hs.toFixed(3)} m), max |err| / Hs:\n`;
     for (const t of results.tests) {
       s += `${t.name}  (t=${t.t.toFixed(3)}, w=${t.blend.toFixed(3)}, chop=${t.chop.toFixed(3)})\n`;
-      for (const r of t.fields) s += `  c${r.cascade} ${r.n}^2  up ${f(r.maxUp)}  east ${f(r.maxEast)}  north ${f(r.maxNorth)}  (rms up ${f(r.rmsUp)}, max ${f(r.maxAbsM)} m)\n`;
-      if (t.chained) s += `  chained texture lookup (rgba16f, bilinear, ${t.chained.points} pts): up ${f(t.chained.maxUp)}  east ${f(t.chained.maxEast)}  north ${f(t.chained.maxNorth)}\n`;
+      for (const r of t.fields) s += `  c${r.cascade} ${r.n}^2 field  up ${f(r.maxUp)}  east ${f(r.maxEast)}  north ${f(r.maxNorth)}  (max ${f(r.maxAbsM)} m)\n`;
+      s += `  displacement mips 1/3/4/7 vs CPU box average: max ${f(t.mipMaxErr)}\n`;
+      for (const [k, v] of [['catmull-rom', t.chainedCubic], ['bilinear', t.chainedBilinear]] as const) {
+        s += `  chained rgba16f lookup ${k}: up ${f(v.maxUp)}  east ${f(v.maxEast)}  north ${f(v.maxNorth)}\n`;
+      }
     }
     if (results.error) s += `ERROR ${results.error}\n`;
     if (results.done) s += 'done';
@@ -277,7 +285,7 @@ async function main() {
     ctx.time = checkIdx >= 0 && checkIdx < TESTS.length ? checkTime : fixedT ?? (now - t0) / 1000;
     ctx.tier = fft.tier;
     fft.pass.execute(ctx);
-    if (checkArmed && fft.pendingTier === null && ctx.frame > 10) { checkArmed = false; startCheck(); }
+    if (checkArmed && fft.pendingTier === null && fft.debug.size() > 0 && ctx.frame > 10) { checkArmed = false; startCheck(); }
     checkFrame();
     if (!bench) { renderer.setRenderTarget(null); quad.render(renderer); }
     if (!pendingC && renderer.hasFeature('timestamp-query')) { pendingC = true; renderer.resolveTimestampsAsync('compute').then(onC, onFail); }
@@ -287,9 +295,9 @@ async function main() {
     perfState.head = (h + 1) % RING; perfState.count++; perfState.frames++;
     acc += gpuCompute; accN++;
     if (now - statT > 500) {
-      $('stats').textContent = `tier ${fft.tier}${fft.pendingTier ? ` (compiling ${fft.pendingTier})` : ''}  t ${ctx.time.toFixed(2)} s\n` +
+      $('stats').textContent = `tier ${fft.tier}${fft.pendingTier ? ` (building ${fft.pendingTier})` : ''}  N ${fft.debug.size()}  t ${ctx.time.toFixed(2)} s\n` +
         `GPU compute ${(acc / Math.max(accN, 1)).toFixed(3)} ms  (FFT pass${checkIdx >= 0 && !results.done ? ' + check' : ''})\n` +
-        `memory ~${(fft.debug.memoryBytes() / 1048576).toFixed(1)} MB  compile ${fft.debug.lastCompileMs().toFixed(0)} ms\n` +
+        `memory ~${(fft.debug.memoryBytes() / 1048576).toFixed(1)} MB  compile ${fft.debug.lastCompileMs().toFixed(0)} ms  build main-thread ${fft.debug.lastBuildMainThreadMs().toFixed(1)} ms\n` +
         `unresolved slope var ${(fft.uniforms.unresolvedSlopeVariance.value as number).toExponential(2)}`;
       statT = now; acc = 0; accN = 0;
     }

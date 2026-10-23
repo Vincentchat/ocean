@@ -1,5 +1,5 @@
 // three adapter (WebGPU / TSL): createOceanGpu wires the GPU FFT (three/fft.ts) to the camera-centred LOD mesh
-// (three/lod.ts). Keep the createOceanGpu signature (spec §3/§5).
+// (three/lod.ts). Keep the createOceanGpu signature (spec Â§3/Â§5).
 //
 // Displacement: the FFT's chained cascade lookup (createFftSampling().sampleDisplacement, reference spectralField)
 // at lod.nodes.tileCoord(P) (world-periodic, floating-origin safe), explicit LOD from the vertex footprint
@@ -12,7 +12,9 @@
 // Radiance x preExposure, no tonemap.
 // Refraction (options.refraction, three/refraction.ts): the water leaves `scene` and is drawn by the 'ocean.water'
 // pass, stage 'transparent', reads scene.color + scene.depth (+ ocean.displacement), writes scene.color. Optional
-// TERRAIN_GPU (options.terrainGpu) for shore / contact thickness. Passes: [ocean.fft (compute), ocean.water].
+// TERRAIN_GPU (options.terrainGpu) for shore / contact thickness.
+// Foam (three/foam.ts): history compute pass 'ocean.foam' after 'ocean.fft'; material foamCoverage = foam coverage.
+// Passes: [ocean.fft (compute), ocean.foam (compute), ocean.water (transparent, with refraction)].
 //
 // Debug views (opts.debug, comma separated; demo ?debug=...):
 //   lod        level colours (hue per level, darker = geomorph), lit by facet normals, wireframe overlay,
@@ -21,15 +23,16 @@
 //   nomesh     hide the ocean (perf baseline).
 //   nosnap     disable LOD snapping (control for the swim test: the surface crawls).
 //   lodoff:u:v offset the LOD's camera foot by (u east, v south) metres (swim test without moving the view).
-//   velocity   screen-space motion of the displaced surface (current - previous position), |NDC v| x 200 per frame.
+//   velocity   screen-space motion of the displaced surface (current - previous position), pixels / frame, log brightness (16 px saturates), hue = direction.
 import { DoubleSide, FrontSide, Mesh, MeshBasicNodeMaterial, Scene } from 'three/webgpu';
 import {
   abs, cameraPosition, cameraProjectionMatrix, cameraViewMatrix, clamp, cross, dFdx, dFdy, dot, float, floor,
-  max, modelWorldMatrix, normalize, pow, positionWorld, smoothstep, uniform, varying, vec3, vec4,
+  length, log2, max, modelWorldMatrix, normalize, pow, positionWorld, screenSize, smoothstep, uniform, varying, vec3, vec4,
 } from 'three/tsl';
 import type { EnvironmentState, FloatingOrigin, SkyLight, TerrainGpuHeight, Vec3, WorldShape } from '../stubs/world-core.ts';
 import { createOceanMaterial, type OceanMaterial, type OceanMaterialOptions } from './material.ts';
 import { createOceanRefraction, type OceanRefraction, type OceanRefractionOptions } from './refraction.ts';
+import { createOceanFoam, type OceanFoam } from './foam.ts';
 import type { Pass, PassContext } from './pass-types.ts';
 import { createOceanLod, type OceanLod } from './lod.ts';
 import { createOceanFft, createFftSampling, FFT_CASCADES, type OceanFft, type FftOceanSource } from './fft.ts';
@@ -43,6 +46,8 @@ export type { OceanFft, FftSampling, FftSampleOptions, FftSurfaceSample, FftTier
 export { createOceanMaterial } from './material.ts';
 export type { OceanMaterial, OceanMaterialOptions, OceanFoamContext, OceanTransmission, OceanTransmissionContext } from './material.ts';
 export { createOceanRefraction } from './refraction.ts';
+export { createOceanFoam, FOAM_TIERS, FOAM_PARAMS } from './foam.ts';
+export type { OceanFoam, OceanFoamNodes, OceanFoamOptions } from './foam.ts';
 export type { OceanRefraction, OceanRefractionOptions } from './refraction.ts';
 
 export type OceanTier = 'low' | 'medium' | 'high' | 'ultra';
@@ -107,6 +112,10 @@ export interface OceanGpu {
   readonly refraction: OceanRefraction | null;
   /** 'ocean.water' transparent-stage pass (null when refraction is off: the mesh is then in `scene`). */
   readonly waterPass: Pass | null;
+  /** Whitecap foam (history compute pass 'ocean.foam' + material nodes, three/foam.ts). */
+  readonly foam: OceanFoam;
+  /** The water material wrapper (uniforms / overrides / update); null in debug views. */
+  readonly water: OceanMaterial | null;
   setTier(t: OceanTier): void;
   dispose(): void;
 }
@@ -147,8 +156,9 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
   // ------------------------------------------------------------------ displacement (vertex)
   const fade = float(1).sub(smoothstep(200, 1200, n.distanceToCamera)); // reference farFade
   const tile = (P: number) => n.tileCoord(P);
-  const disp = sampling.sampleDisplacement(tile, { footprint: n.cellSize }).mul(fade);
-  const dispPrev = sampling.sampleDisplacement(tile, { footprint: n.cellSize, previous: true }).mul(fade);
+  const cubic = !dbg.has('fftbilinear'); // ?debug=fftbilinear: plain trilinear displacement (A/B of the Catmull-Rom)
+  const disp = sampling.sampleDisplacement(tile, { footprint: n.cellSize, cubic }).mul(fade);
+  const dispPrev = sampling.sampleDisplacement(tile, { footprint: n.cellSize, previous: true, cubic }).mul(fade);
   const positionNode = n.localPos.add(disp);
   const previousPositionNode = n.previousLocalPos.add(dispPrev);
 
@@ -162,9 +172,18 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
     return nf.mul(dot(nf, V).greaterThan(0).select(float(-1), float(1))); // face the viewer
   })();
 
+  // ------------------------------------------------------------------ foam (whitecap history, compute; three/foam.ts)
+  const foam: OceanFoam = createOceanFoam({
+    renderer, fft, lod, origin, shape, tier, camera, ocean: opts.ocean as any, perf: opts.perf,
+  });
+
   // ------------------------------------------------------------------ refraction (transparent stage, optional)
   const refraction: OceanRefraction | null = opts.refraction
-    ? createOceanRefraction({ ...(typeof opts.refraction === 'object' ? opts.refraction : {}), origin, shape, terrainGpu: opts.terrainGpu })
+    ? createOceanRefraction({
+      // contact foam lace = pattern R at rest / 18 m, the same binding as the whitecaps
+      contactPattern: (c) => foam.nodes.pattern(c.restLocal, 18).x,
+      ...(typeof opts.refraction === 'object' ? opts.refraction : {}), origin, shape, terrainGpu: opts.terrainGpu,
+    })
     : null;
 
   let material: any;
@@ -212,13 +231,19 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
     const toClip = (p: any) => cameraProjectionMatrix.mul(cameraViewMatrix).mul(modelWorldMatrix).mul(vec4(p, 1));
     const c0 = toClip(positionNode), c1 = toClip(previousPositionNode);
     const vel = varying(c0.xy.div(c0.w).sub(c1.xy.div(c1.w)));
-    material.colorNode = vec3(abs(vel.x).mul(200), abs(vel.y).mul(200), 0.05).mul(envIntensity).mul(preExposure);
+    // Readable scale: motion in PIXELS per frame; direction as hue (red/green = signed x/y, 0.5 = none),
+    // brightness log2(1 + px) / log2(1 + 16): 1 px -> 0.24, 4 px -> 0.57, >= 16 px saturates. (fft r2, minimal edit)
+    const px = vel.mul(screenSize).mul(0.5);
+    const mag = length(px);
+    const dir = px.div(max(mag, 1e-6));
+    const bright = clamp(log2(mag.add(1)).div(Math.log2(17)), 0, 1);
+    material.colorNode = vec3(dir.x.mul(0.5).add(0.5), dir.y.mul(0.5).add(0.5), 0.25).mul(bright).mul(envIntensity).mul(preExposure);
   } else {
     // The water material (three/material.ts): every shading term of the reference fragment shader.
     water = createOceanMaterial({
       fft, sampling, nodes: n, positionNode, displacement: disp,
       skyLight: opts.skyLight, environment: opts.environment, envMap: opts.envMap, envIntensity: opts.envIntensity ?? 1,
-      preExposure, foamCoverage: opts.foamCoverage, transmission: opts.transmission ?? refraction?.transmission, haze: opts.haze,
+      preExposure, foamCoverage: opts.foamCoverage ?? ((c) => foam.nodes.coverage(c.restLocal)), transmission: opts.transmission ?? refraction?.transmission, haze: opts.haze,
       waveScale: opts.waveScale, ocean: opts.ocean as any,
     });
     material = water.material;
@@ -247,20 +272,23 @@ export function createOceanGpu(opts: OceanGpuOptions): OceanGpu {
   };
 
   return {
-    passes: waterPass ? [fftPass, waterPass] : [fftPass],
+    passes: waterPass ? [fftPass, foam.pass, waterPass] : [fftPass, foam.pass],
     fftPass,
     mesh: lod.mesh,
     material,
     lod,
     fft,
-    ready: fft.ready,
+    ready: Promise.all([fft.ready, foam.ready]).then(() => undefined),
     previousPositionNode,
     refraction,
     waterPass,
-    setTier(t) { lod.setTier(t); fft.setTier(t); },
+    foam,
+    water,
+    setTier(t) { lod.setTier(t); fft.setTier(t); foam.setTier(t); },
     dispose() {
       lod.mesh.removeFromParent();
       lod.dispose();
+      foam.dispose();
       fft.dispose();
       material.dispose();
       refraction?.dispose();

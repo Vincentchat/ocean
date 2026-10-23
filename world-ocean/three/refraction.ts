@@ -46,7 +46,7 @@ import {
 } from 'three/webgpu';
 import {
   abs, cameraFar, cameraNear, cameraViewMatrix, clamp, dot, float, length, max, min, mix, perspectiveDepthToViewZ,
-  positionView, positionWorld, refract, screenUV, select, smoothstep, texture, uniform, uv, vec2, vec3, vec4,
+  positionView, positionWorld, refract, screenUV, smoothstep, texture, uniform, uv, vec2, vec3, vec4,
 } from 'three/tsl';
 import type { FloatingOrigin, TerrainGpuHeight, Vec3, WorldShape } from '../stubs/world-core.ts';
 import { OCEAN_ASSETS, resolveAsset } from '../assets.ts';
@@ -68,7 +68,7 @@ export interface OceanRefractionOptions {
   shape?: WorldShape;
   origin: FloatingOrigin;
   /** Contact lace (pattern R) sampler; default: the module's foam pattern asset loaded here. */
-  contactPattern?: (uv: any) => any;
+  contactPattern?: (ctx: OceanTransmissionContext) => any;
   /** Asset hook (same as the foam piece). */
   assets?: { resolve?: (id: string) => string | null; foamPattern?: any };
 }
@@ -76,7 +76,7 @@ export interface OceanRefractionOptions {
 export interface OceanRefraction {
   /** The material hook (three/material.ts `transmission`). */
   readonly transmission: (ctx: OceanTransmissionContext) => OceanTransmission;
-  readonly uniforms: { ior: any; strength: any; contactRange: any; contactGain: any; terrainEnabled: any };
+  readonly uniforms: { ior: any; strength: any; contactRange: any; contactGain: any; terrainEnabled: any; enabled: any };
   /** Bind scene.color / scene.depth textures (the pass does this from ctx.targets; allocation-free). */
   bind(color: any, depth: any): void;
   /** Copy TERRAIN_GPU mapping into uniforms (render-relative centre). Allocation-free; once per frame. */
@@ -95,6 +95,8 @@ export function createOceanRefraction(o: OceanRefractionOptions): OceanRefractio
   const contactRange = uniform(o.contactRange ?? 3.95);
   const contactGain = uniform(o.contactGain ?? 0.2);
   const disposers: (() => void)[] = [];
+  /** 1 = refraction + contact on, 0 = the open-water path everywhere (runtime switch / A-B). */
+  const enabled = uniform(1);
 
   // ------------------------------------------------------------------ scene.color / scene.depth bindings
   const colorPlaceholder = new DataTexture(new Uint16Array(4), 1, 1);
@@ -185,8 +187,12 @@ export function createOceanRefraction(o: OceanRefractionOptions): OceanRefractio
     const waterZ = positionView.z.negate();
     const suv = screenUV;
     const baseZ = viewDepthAt(suv);
-    const hasBackground = isBackground(baseZ).and(baseZ.greaterThan(waterZ));
+    const hasBackground = enabled.greaterThan(0.5).and(isBackground(baseZ)).and(baseZ.greaterThan(waterZ));
     const thickness = max(baseZ.sub(waterZ), 0);
+    // NOTE: no select() / If: TSL's ConditionalNode emits an if/else, which would put the material's derivative
+    // terms (dFdx of N, implicit-LOD samples) into non-uniform control flow. Masks are 0/1 floats and mix(a, b, 0)
+    // is exactly a, so open water stays bit-identical.
+    const bg = float(hasBackground);
 
     // Refraction offset (reference refraction.js:14-18). View-space xy; screen uv has y down in WebGPU.
     const eta = float(1).div(ior);
@@ -210,8 +216,9 @@ export function createOceanRefraction(o: OceanRefractionOptions): OceanRefractio
     const displaced0 = clamp(suv.add(offset), 0.001, 0.999);
     const displacedZ0 = viewDepthAt(displaced0);
     const fallback = isBackground(displacedZ0).not().or(displacedZ0.lessThanEqual(waterZ.add(0.03)));
-    const displaced = select(fallback, suv, displaced0);
-    const displacedZ = select(fallback, baseZ, displacedZ0);
+    const fb = float(fallback);
+    const displaced = mix(displaced0, suv, fb);
+    const displacedZ = mix(displacedZ0, baseZ, fb);
     const path = clamp(displacedZ.sub(waterZ), 0, 120);
     const color = colorNode.sample(displaced).rgb.div(ctx.preExposure);
 
@@ -224,21 +231,21 @@ export function createOceanRefraction(o: OceanRefractionOptions): OceanRefractio
       const ground = terrainNode.sample(tuv).r;
       const waterAlt = tCenterAlt.add(dot(rel, tUp));
       const terrainThickness = waterAlt.sub(ground).div(max(dot(V, ctx.upWorld), 0.25));
-      const terrainValid = terrainEnabled.greaterThan(0.5).and(inside).and(ground.greaterThan(NO_GROUND * 0.5));
-      const t = select(hasBackground, thickness, terrainThickness);
+      const terrainValid = terrainEnabled.mul(enabled).greaterThan(0.5).and(inside).and(ground.greaterThan(NO_GROUND * 0.5));
+      const t = mix(terrainThickness, thickness, bg);
       const active = hasBackground.or(terrainValid);
       const range = contactRange;
       const d = t.div(range.add(0.001));
       const thr = mix(float(1), d.add(0.23), smoothstep(0, 0.3, d));
       const red = contactRed(ctx);
       const foam = smoothstep(thr, thr.add(0.15), red).mul(contactGain);
-      const edgeFade = select(hasBackground, float(1).sub(smoothstep(0, range.mul(0.5), thickness)), float(0));
+      const edgeFade = float(1).sub(smoothstep(0, range.mul(0.5), thickness)).mul(bg);
       const raw = colorNode.sample(suv).rgb.div(ctx.preExposure);
       const mixed = mix(mix(c, raw, edgeFade), vec3(...CONTACT_COLOR).mul(ctx.foamWhite), foam);
-      return select(active, mixed, c);
+      return mix(c, mixed, float(active));
     };
 
-    return { color, path, valid: select(hasBackground, float(1), float(0)), contact };
+    return { color, path, valid: bg, contact };
   }
 
   // ------------------------------------------------------------------ the transparent-stage pass
@@ -303,7 +310,7 @@ export function createOceanRefraction(o: OceanRefractionOptions): OceanRefractio
 
   return {
     transmission,
-    uniforms: { ior, strength, contactRange, contactGain, terrainEnabled },
+    uniforms: { ior, strength, contactRange, contactGain, terrainEnabled, enabled },
     bind,
     update,
     createPass,
@@ -311,4 +318,7 @@ export function createOceanRefraction(o: OceanRefractionOptions): OceanRefractio
       colorPlaceholder.dispose(); depthPlaceholder.dispose(); terrainPlaceholder.dispose(); patternPlaceholder.dispose();
       patternTex?.dispose();
       for (const d of disposers) d();
-      disposers.le
+      disposers.length = 0;
+    },
+  };
+}

@@ -16,7 +16,7 @@ test('zero allocation: tick, tick + 100 heightsAt + 10 velocityAt, velocityAt, h
     `velocityAt ${out.perVelocity.toFixed(2)} B/call, heightsAt ${out.perBatchPoint.toFixed(3)} B/point, heightAt ${out.perHeight.toFixed(2)} B/call`);
   assert.ok(out.acc);
   assert.ok(out.version >= 3, 'the measured run regenerated the spectrum');
-  assert.ok(out.growth < 64 * 1024, `heap grew by ${out.growth} bytes`);
+  assert.ok(out.growth < 32 * 1024, `heap grew by ${out.growth} bytes`);
   // A single 16-byte boxed double per tick would already fail these.
   assert.ok(out.perTick < 8, `tick allocates ${out.perTick} B`);
   assert.ok(out.perTickLoad < 8, `tick + queries allocate ${out.perTickLoad} B`);

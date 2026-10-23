@@ -262,33 +262,33 @@ async function main() {
     ocean, renderer, scene, camera, origin, shape: world.shape, tier: flags.tier, skyLight: sky.skyLight, envMap: sky.envMap,
     environment: env, envIntensity: sky.envIntensity, preExposure, perf, debug: flags.debug,
     // Water in the transparent stage, refracting scene.color / scene.depth; TERRAIN_GPU from the world (optional).
-    refraction: flags.refraction, terrainGpu: world.optional(TERRAIN_GPU),
-    // Reference scenes: the crest glow is normalised by the reference Wave slider (golden .9, azure 1, storm 1.5).
+    refraction: flags.refraction, terrainGpu: world.optional(TERRAIN_GPU),    // Reference scenes: the crest glow is normalised by the reference Wave slider (golden .9, azure 1, storm 1.5).
     waveScale: flags.scene ? REFERENCE_WAVE[flags.scene] : undefined,
   } as any);
   for (const p of gpu.passes) runner.add(p);
 
-  // [foam builder] opt-in foam debug view (?debug=foam | ?debug=foamraw): three/foam.ts history pass + a debug
-  // material with the reference foam composition. Only active with the debug flag; remove once the material
-  // integrates foam.nodes. window.__foam = { foam, view } for tools/foam-check.mjs.
+  // Foam is part of createOceanGpu (gpu.foam, pass 'ocean.foam'). Opt-in foam debug view (?debug=foam | ?debug=foamraw):
+  // a debug material with the reference foam composition. window.__foam = { foam, view } for tools/foam-check.mjs.
   const foamMode = flags.debug.split(',').includes('foamraw') ? 'foamraw' : flags.debug.split(',').includes('foam') ? 'foam' : null;
   if (foamMode && ocean) {
-    const { createOceanFoam, attachFoamDebugView } = await import('../three/foam.ts');
-    const foam = createOceanFoam({ renderer, fft: gpu.fft, lod: gpu.lod, origin, shape: world.shape, tier: flags.tier, camera, ocean });
-    runner.add(foam.pass);
+    const { attachFoamDebugView } = await import('../three/foam.ts');
+    const foam = gpu.foam;
     if (flags.debug.split(',').includes('foamfine')) foam.uniforms.fineInSource.value = 1; // c3 in the source (A/B)
     const view = attachFoamDebugView({
       foam, gpu, envMap: sky.envMap, envIntensity: sky.envIntensity, preExposure, mode: foamMode,
       sunDir: () => (sky.skyLight as any).sunDir,
     });
-    $('tier').addEventListener('change', () => foam.setTier(($('tier') as HTMLSelectElement).value as OceanTier));
     (window as any).__foam = { foam, view };
-    await foam.ready;
-    // Deterministic ?shot: let the FFT finish its async compile before the fixed-step warm-up starts, otherwise
-    // the foam history's start time (and so the shot) depends on how long the compile took.
-    let fftUp = false;
-    void gpu.ready.then(() => { fftUp = true; });
-    while (!fftUp) { for (const p of gpu.passes) p.execute(ctx); await new Promise((r) => setTimeout(r, 16)); }
+  }
+  // Deterministic ?shot (and a clean start): wait until the FFT and foam pipelines are compiled and have run
+  // (gpu.ready) before the fixed-step warm-up starts, otherwise history effects (foam) depend on compile time.
+  if (ocean) {
+    let up = false;
+    void gpu.ready.then(() => { up = true; }, (e) => { console.error('[demo] ocean init failed', e); up = true; });
+    while (!up) {
+      for (const p of gpu.passes) if (p.desc.stage === 'compute') p.execute(ctx);
+      await new Promise((r) => setTimeout(r, 16));
+    }
   }
 
   const camWorld = { x: 0, y: 0, z: 0 };
@@ -423,7 +423,7 @@ async function main() {
   let statsTimer = 0, statsFrames = 0, statsCpu = 0, statsInterval = 0;
   const stats = $('stats');
 
-  (window as any).__demo = { renderer, scene, camera, world, origin, ocean, core, get gpu() { return gpu; }, sky, runner, seabed, terrainGrid, freeCam, flags, perf, adapterInfo };
+  (window as any).__demo = { renderer, scene, camera, world, origin, ocean, core, get gpu() { return gpu; }, sky, runner, seabed, terrainGrid, targets, finalColor, freeCam, flags, perf, adapterInfo };
 
   // ---------------------------------------------------------------------------------- shot state
   const fixedDt = world.fixedDt;

@@ -60,7 +60,7 @@ test('optimised row generator equals spectralDensity (reference formula) to 1e-1
   }
 });
 
-test('seed 1 reproduces the WebGL reference h0 and dispersion bit-for-bit in float32', { skip: !haveReference && 'reference src/ not present' }, async () => {
+test('seed 1 reproduces the WebGL reference h0 and dispersion to float32 precision at the reference g = 9.81', { skip: !haveReference && 'reference src/ not present' }, async () => {
   const ref = await import(pathToFileURL(fileURLToPath(refUrl)).href);
   const spectra = ref.generateSpectra(256, [1024, 96, 9], { ...ref.OCEAN_PARAMETERS, gravity: REF_G });
   const params = referenceParams(REF_G);

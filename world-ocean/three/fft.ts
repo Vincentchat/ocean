@@ -1,112 +1,78 @@
-// GPU FFT ocean (three r186, WebGPU compute in TSL). Owns the per-frame spectrum evolution, the packed
-// inverse FFTs, the derived fields (normals, Jacobian terms, foam compression) and their mip chains.
+// GPU FFT ocean (three r186, WebGPU compute in TSL). Per frame, per cascade: spectrum evolution at the explicit
+// draw time, crossfade of two spectrum slots, packed inverse FFT, derived fields (normal + foam compression) and
+// compute mip chains. Quality tiers, band layout and the pure maths live in fft-tiers.ts (no three import).
 //
-// Conventions: EXACTLY the core's (spectrum.ts header). Per cascade, per frame, at the explicit draw time t:
-//   h0 = lerp(h0[fromSlot], h0[toSlot], w),  w = ocean.blendAt(t),  chop = ocean.choppinessAt(t)
+// Conventions: EXACTLY the core's (spectrum.ts header), for the tier's band layout:
+//   h0 = lerp(h0[from], h0[to], w),  w = ocean.blendAt(t),  chop = ocean.choppinessAt(t)
 //   phase/(2 pi) = fract(((m * T_int) mod 8192 + m * T_frac) / 8192)   (m = integer dispersion index, u32 math)
-//   ht = h0 e^{-i w t} + h0m e^{+i w t};  kl = |k| + 1e-4
+//   ht = h0 e^{-i w t} + h0m e^{+i w t}, h0m = conj(h0(-k)) read at the mirrored cell;  kl = |k| + 1e-4
 //   packed IFFT (unnormalised, exp(+i k x)):  F1 = ht (1 + kx/kl) -> Hraw + i Da,   F2 = -i (kz/kl) ht -> Db
 //   checkerboard s = (-1)^(x+y);  up = -Hraw s,  east = chop Da s,  north = -chop Db s
-//   texel (x, y) = tile position a = x L/N (east), b = y L/N (south);  sample uv = (a_tile + OFF)/L + 0.5/N
-// FFT: radix-2 Cooley-Tukey, one workgroup per row (then per column), N/2 invocations, the whole line in
-// workgroup shared memory (vec4 = two complex values), bit-reversed load, log2 N barriers, f64-built twiddle
-// table. 2 dispatches per cascade group instead of 2 log2 N ping-pong passes.
+//   texel (x, y) = tile position a = x L/N (east), b = y L/N (south);  hardware uv = (a_tile + OFF)/L + 0.5/N
+// FFT: radix-2, one workgroup per line (N/2 invocations, whole line in workgroup memory, bit-reversed load,
+// f64-built twiddles): 2 dispatches for all rows / columns of all cascades.
 //
-// =====================================================================================================
-// TIERS (decided with numbers; see also the report in docs/port):
-//   cascade  tile      band k (rad/m)    lambda          group   low    medium  high   ultra
-//   c0       1024 m    0     .. 0.52     inf .. 12 m     base    256    256     256    256
-//   c1       96 m      0.52  .. 5.59     12  .. 1.1 m    base    256    256     256    256
-//   c2       9 m       5.59  .. 59.6     1.1 .. 0.105 m  detail  128    256     256    512
-//   c3       0.84375 m 59.6  .. 635      0.105 .. 0.01 m detail  -      -       256    512
-// Why c0 / c1 are 256 on EVERY tier:
-//   * Band completeness: the core fixes every band at the 256 master grid (upper = pi 256 / L / 1.5, fade to the
-//     256 Nyquist). A 128 grid for c1 drops k in [4.2, 8.4] = 37 % (64: 75 %) of c1's band edge while c2 only fades
-//     in from 3.7: a visible hole between cascades. Same for c0 (17 % of its slope variance at 128, breeze).
-//   * CPU parity: the core's WATER_QUERY samples c0 / c1 bilinearly on 256 grids. Measured (core CascadeSim,
-//     3000 random points, scratch parity512.ts): drawn 256/256/256 vs CPU: max 0.29 % Hs (breeze), 0.75 % (storm);
-//     drawn 512/512/512 (exact band-limited 2x upsample): p99.9 7.0 % Hs, max 8.2 % (breeze) -> FAILS 2 %.
-//     drawn 256/256/512: max 0.33 %; drawn 256/256/128: max 0.24 % (breeze) / 0.70 % (storm). So only the
-//     detail group may change size.
-//   * 64 grids would need ~6 cascades to cover the same band (each covers only N/6 of k-range ratio), more work.
-// What the detail size does:
-//   * 128 (low): c2 keeps k < 44.7 rad/m (lambda > 0.14 m): loses 11 % of c2's slope variance (0.5 % of its height
-//     variance; 0.006 m^2/m^2 of slope variance, all presets). The lost part is exposed as the uniform
-//     `unresolvedSlopeVariance` (add it to the roughness: it is unresolved micro-slope, like the mip shortening).
-//   * 512 (ultra): the 256-master band zero-padded to 512: same waves, exact band-limited 2x interpolation of the
-//     finest normals for close-ups (replaces bicubic on c2/c3).
-//   * c3 (high, ultra): a 4th tile L3 = 9 / (1024/96) continuing the band (lower = c2 upper, complementary
-//     smoothstep cross-over, so no gap and no double counting). Generated here from spectrum.ts with the
-//     ocean's seed (gaussianField(seed, 3)), same JONSWAP + spreading, gravity dispersion (quantised like the
-//     core). Height sigma ~1.7 mm (CPU parity unaffected: < 0.05 % Hs); slope variance ~= c2's (0.04-0.055):
-//     it adds real micro roughness (the material sees it through the mip shortening / `fineGain`).
-//   GPU cost, whole FFT pass incl. derived fields + mip chains (RTX 2070, compute timestamps, 600 frames,
-//   tools/fft-check.mjs, 2026-10-23; run-to-run spread ~15 %): low 0.24-0.28 ms, medium 0.24-0.32 ms,
-//   high 0.32-0.42 ms, ultra 0.67-0.88 ms. Memory (textures + buffers): low 22 MB, medium/high 36 MB, ultra 71 MB.
-//   Async tier compile ~1.0-1.3 s (renderer.compileComputeAsync), old tier drawn meanwhile.
-//   The base group (fixed) dominates low/medium: shrinking only c2 to 128 saves little; it is kept for weak GPUs.
+// Per frame: row FFT (spectrum evolution fused into its load), column FFT (+ finalize in place), derive level 0 +
+// mips 1-3 in 8x8 workgroup tiles, then reduce kernels of up to 4 mip levels each: low 4 dispatches, others 5.
 //
-// =====================================================================================================
-// OUTPUT TEXTURES (all rgba16float 2D-ARRAY storage textures, Repeat, LinearMipmapLinear, full mip chains
-// written by compute, box-averaged, UNNORMALISED): 2 groups x 3 kinds = 6 textures. The material needs 4
-// (displacement + normal of both groups); `derivatives` is optional (foam / debug).
-//   displacement  layers [cur c_a, cur c_b, prev c_a, prev c_b]   (history ping-pong: layer = i + curLayer)
-//                 texel = (up, east, north, dEast/dNorth)  metres; the derivative is wrt the REST position.
-//   normal        layers [c_a, c_b]  texel = (n.east, n.north, n.up, 1 - compression)   (reference tex1 layout:
-//                 per-cascade normal of the displaced surface, foam = 1 - clamp(1 - minEig(J), 0, 1) masked to
-//                 downwind-facing slopes). Mips average the unnormalised vectors: |n| < 1 = unresolved slope.
-//   derivatives   layers [c_a, c_b]  texel = (dUp/dEast, dUp/dNorth, dEast/dEast, dNorth/dNorth)
-//                 (with dEast/dNorth in displacement.w the full Jacobian: J = (1+Exx)(1+Nyy) - Exy^2).
-// Base group = cascades 0, 1 (256^2, every tier). Detail group = cascades 2, 3 (layer b is zero / unused when the
-// tier has 3 cascades; `fineEnabled` = 0).
-// Derivatives are central finite differences at the cascade's cell size like the reference blend pass
-// (spectral-ocean.js BLEND_FRAGMENT), on the f32 FFT result, chop applied.
+// OUTPUT: ONE rgba16float 2D-ARRAY storage texture per tier ("fields", N x N, 9 layers, Repeat, LinearMipmapLinear,
+// full mip chain written by compute, box-averaged, UNNORMALISED) = one binding for the material:
+//   layers 0-2 / 3-5  displacement of cascades 0-2, this frame / last frame (ping-pong: layer = c + curLayer,
+//                     prev = c + prevLayer = the field at time - frameDt, for motion vectors)
+//                     texel = (up, east, north, dEast/dNorth)  metres (derivative wrt the REST position)
+//   layers 6-8        normal of cascade c (NORMAL_LAYER + c): (n.east, n.north, n.up, 1 - compression) (reference
+//                     tex1 layout: per-cascade normal of the displaced surface; compression = clamp(1 - minEig(J), 0, 1)
+//                     masked to downwind-facing slopes). Mip-averaged unnormalised vectors: |n| < 1 = unresolved slope.
+// fft.nodes.displacement and fft.nodes.normal are two texture nodes of that same texture.
+// (Round 1's 'derivatives' textures, base/detail groups, 4th cascade and f32 mip pyramids are gone.)
 //
-// Sampling (material / LOD / foam): use createFftSampling(fft).sampleDisplacement(tileCoord, footprint?) etc.
-// tileCoord(P) = the LOD's periodic (east, south) tile coordinate for period P (lod.nodes.tileCoord).
+// Displacement sampling (createFftSampling): chained lookup (reference spectralField), explicit LOD from the
+// footprint, and Catmull-Rom bicubic (16 exact loads) where LOD < 0.5, blended to trilinear by
+// smoothstep(0, 0.5, LOD) like the reference's B-spline. Catmull-Rom (interpolating) instead of the reference's
+// B-spline (smoothing): it is the core query's 'cubic' filter, so the CPU can match the drawn heights exactly; a
+// B-spline shrinks the 47 m swell by ~5 % (transfer (2 + cos kh)/3), i.e. a few % of Hs of parity error.
+//
+// COST (RTX 2070, compute timestamps, p50 of 600 frames, best of 3 runs, GPU shared with other jobs, 2026-10-23;
+// tools/fft-check.mjs --no-check):  low 0.05-0.07 ms, medium 0.14-0.18 ms, high / ultra 0.65-0.68 ms.
+// Memory (textures + buffers): low 3.2 MB, medium 12.8 MB, high / ultra 51.4 MB (reference FFT ~20 MB).
+// Traffic ~185 B per texel-layer per frame: low 9 MB, medium 36 MB, high / ultra 145 MB per frame; on a ~25 GB/s
+// integrated GPU that is ~0.4 / 1.5 / 6 ms (+ ~0.1 ms of dispatch latency). On the 2070 low is not 1/4 of medium in
+// time only because 4 dependent small dispatches are latency-bound there.
+// Tier switch: setTier() returns in < 1 ms; build steps on the main thread total 1-3 ms (largest frame during a
+// medium -> ultra switch 5 ms CPU, no long task); compile 0.3-1 s async; the old tier is drawn meanwhile.
+//
+// Spectrum slots on the GPU: 2 entries (from / to) of h0 only (h0m read mirrored) = 8 bytes per cell per slot.
+// The reference tier (medium) uploads the core's slot arrays; the other tiers' spectra are generated in a Web
+// Worker (fft-worker.ts) for the core slot's parameters, prefetched when the core announces a pending slot.
+// Tier change: everything heavy is async (worker omega + spectra, resources created across frames,
+// renderer.compileComputeAsync); the old tier stays drawn until the new one is ready.
 import {
   HalfFloatType, LinearFilter, LinearMipmapLinearFilter, RGBAFormat, RepeatWrapping, StorageArrayTexture,
-  StorageBufferAttribute, Vector2,
+  StorageBufferAttribute, StorageTextureNode, Vector2,
 } from 'three/webgpu';
 import {
-  Fn, If, clamp, cos, cross, dot, float, floor, fract, globalId, int, length, localId, log2, max, mix,
-  normalize, select, sin, smoothstep, sqrt, storage, storageTexture, texture, textureStore, uint, uniform,
+  Fn, If, clamp, cos, cross, dot, float, floor, fract, globalId, int, ivec2, length, localId, log2, max, mix,
+  nodeObject, normalize, select, sin, smoothstep, sqrt, storage, texture, textureStore, uint, uniform,
   uvec2, vec2, vec3, vec4, workgroupArray, workgroupBarrier, workgroupId,
 } from 'three/tsl';
-import {
-  referenceCascades, resampleCentred, omegaIndicesSized, gaussianField, spectrumScalars, generateRawRows,
-  packInitialSpectrum,
-} from '../spectrum.ts';
-import type { CascadeDef, SpectrumScalars } from '../spectrum.ts';
+import { CASCADES } from '../spectrum.ts';
+import type { CascadeDef } from '../spectrum.ts';
+import { FFT_TIERS, NUM_CASCADES, tierCascades, stripMasterH0, type OceanTier, type FftTierSpec } from './fft-tiers.ts';
+import { handleFftJob } from './fft-worker.ts';
 import type { Pass, PassContext } from './pass-types.ts';
 
-export type OceanTier = 'low' | 'medium' | 'high' | 'ultra';
-
-/** Per-tier FFT layout. Base group (cascades 0, 1) is always 256^2. */
-export interface FftTierConfig {
-  /** Grid size of the detail group (cascades 2 and 3). */
-  readonly detailSize: number;
-  /** 3 or 4 cascades (4 = the extra 0.84 m tile). */
-  readonly cascades: 3 | 4;
-}
-
-export const FFT_TIERS: Readonly<Record<OceanTier, FftTierConfig>> = Object.freeze({
-  low: Object.freeze({ detailSize: 128, cascades: 3 as const }),
-  medium: Object.freeze({ detailSize: 256, cascades: 3 as const }),
-  high: Object.freeze({ detailSize: 256, cascades: 4 as const }),
-  ultra: Object.freeze({ detailSize: 512, cascades: 4 as const }),
-});
-
+export { FFT_TIERS, TIER_NAMES, tierCascades, tierQueryLayout } from './fft-tiers.ts';
+export type { OceanTier, FftTierSpec } from './fft-tiers.ts';
+/** @deprecated round-1 name. */
+export type FftTierConfig = FftTierSpec;
+/** Tile sizes and offsets (identical on every tier; the band split per tier is tierCascades(t)). */
+export const FFT_CASCADES: readonly CascadeDef[] = CASCADES;
+/** @deprecated round-1 constants (no base / detail groups and no 4th cascade any more). */
 export const BASE_SIZE = 256;
-const MASTER = 256;
-/** Tile of the extra fine cascade: the reference's ratio 1024/96 applied once more below 9 m. */
 export const FINE_DOMAIN = 9 / (1024 / 96);
-/** The four cascade definitions (the first three are the core's CASCADES, bit-identical). */
-export const FFT_CASCADES: readonly CascadeDef[] = Object.freeze(referenceCascades([1024, 96, 9, FINE_DOMAIN]));
+
 const LOOP = 8192;
-const NUM_SLOTS = 3;
-/** Rows of the extra cascade's spectrum generated per frame (amortised regeneration). */
-const FINE_ROWS_PER_FRAME = 32;
+const L = NUM_CASCADES;
 
 /** Minimal view of the core ocean the adapter reads (index.ts Ocean). */
 export interface FftOceanSource {
@@ -123,53 +89,21 @@ export interface OceanFftOptions {
   perf?: { begin(module: string, phase: string): void; end(): void };
 }
 
-/** One cascade group's GPU resources + kernels (see header). */
-interface Group {
-  readonly n: number;
-  readonly log2n: number;
-  /** Global cascade indices of the layers (length 2). */
-  readonly cascades: readonly number[];
-  /** Layers actually computed (1 or 2). */
-  readonly active: number;
-  readonly displacement: any;
-  readonly normal: any;
-  readonly derivatives: any;
-  /** f32 field buffer (up, east, north, 0) per texel, layer-major: readback for parity checks. */
-  readonly fieldAttr: any;
-  readonly h0Attr: any;
-  readonly h0Size: number;
-  readonly kernels: any[];
-  readonly bytes: number;
-  /** Version of each core slot uploaded (per layer). */
-  readonly uploaded: Int32Array;
-}
-
 interface TierState {
   readonly tier: OceanTier;
-  readonly config: FftTierConfig;
-  readonly detail: Group;
-  readonly list: any[];
+  readonly n: number;
+  /** The fields array texture (displacement cur / prev layers + normal layers). */
+  readonly fields: any;
+  readonly fieldAttr: any;
+  readonly h0Attr: any;
+  readonly kernels: any[];
   readonly bytes: number;
+  /** GPU slot entries: core slot index / version held (-1 = none). */
+  readonly entrySlot: Int32Array;
+  readonly entryVer: Int32Array;
+  readonly entryUnres: Float64Array;
+  readonly omega: Float32Array;
 }
-
-// ------------------------------------------------------------------------------------------------------
-// Shared uniforms (set once per frame in execute; used by every tier's kernels).
-// ------------------------------------------------------------------------------------------------------
-function createUniforms() {
-  return {
-    timeInt: uniform(0, 'uint'),
-    timeFrac: uniform(0),
-    blend: uniform(0),
-    chop: uniform(1),
-    fromSlot: uniform(0, 'uint'),
-    toSlot: uniform(0, 'uint'),
-    /** Wind direction (towards) in the tile frame (a = east, b = south), unit. */
-    windAB: uniform(new Vector2(0.540302306, 0.841470985)),
-    /** First displacement layer written this frame (0 or 2). */
-    curLayer: uniform(0, 'uint'),
-  };
-}
-type Uniforms = ReturnType<typeof createUniforms>;
 
 function makeArrayTexture(n: number, layers: number, name: string) {
   const t = new StorageArrayTexture(n, n, layers);
@@ -184,7 +118,6 @@ function makeArrayTexture(n: number, layers: number, name: string) {
   return t;
 }
 
-/** Bit reversal of a uint node over `bits` bits (unrolled). */
 function bitReverse(i: any, bits: number) {
   let r: any = null;
   for (let b = 0; b < bits; b++) {
@@ -193,97 +126,81 @@ function bitReverse(i: any, bits: number) {
   }
   return r;
 }
-
 const cmul = (a: any, b: any) => vec2(a.x.mul(b.x).sub(a.y.mul(b.y)), a.x.mul(b.y).add(a.y.mul(b.x)));
+const perLayer = (c: any, v: readonly number[]) => select(c.equal(uint(0)), float(v[0]), select(c.equal(uint(1)), float(v[1]), float(v[2])));
+const nextTask = () => new Promise<void>((r) => setTimeout(r, 0));
 
-/** Per-layer constant (2 layers) as a node. */
-const perLayer = (c: any, v0: number, v1: number) => select(c.equal(uint(0)), float(v0), float(v1));
+/**
+ * Storage-texture node bound to ONE mip level. three r186 shares one binding between texture nodes of the same
+ * texture in a shader (uniform hash = texture uuid), which would put every mip write of a kernel on the first
+ * node's level; hashing the level in keeps one binding per written level (subclass, no prototype patching).
+ */
+class MipStorageTextureNode extends (StorageTextureNode as any) {
+  getUniformHash() { return `${(this as any).value.uuid}#mip${(this as any).mipLevel}`; }
+}
+const mipStore = (tex: any, level: number): any => nodeObject(new (MipStorageTextureNode as any)(tex, null).setMipLevel(level));
 
-// ------------------------------------------------------------------------------------------------------
-// Group builder
-// ------------------------------------------------------------------------------------------------------
-function buildGroup(u: Uniforms, n: number, cascades: readonly number[], active: number, label: string, omegaFor: (c: number, n: number, out: Float32Array) => void): Group {
+function createUniforms() {
+  return {
+    timeInt: uniform(0, 'uint'),
+    timeFrac: uniform(0),
+    blend: uniform(0),
+    chop: uniform(1),
+    fromGpu: uniform(0, 'uint'),
+    toGpu: uniform(0, 'uint'),
+    windAB: uniform(new Vector2(0.540302306, 0.841470985)),
+    curLayer: uniform(0, 'uint'),
+  };
+}
+type Uniforms = ReturnType<typeof createUniforms>;
+
+/** First layer of the normals in the fields array (displacement cur/prev occupy layers 0 .. 2L-1). */
+export const NORMAL_LAYER = 2 * L;
+
+/**
+ * TSL kernels of one tier (built synchronously; cheap JS graph construction):
+ *   1 row FFT with the spectrum evolution fused into its load, 2 column FFT + finalize (in place),
+ *   3 derive level 0 + mips 1..3 in an 8x8 tile (workgroup memory), 4.. reduce kernels writing up to 4 mip levels
+ *   each from the previous kernel's last level (f32 buffer). low: 4 dispatches, medium / high / ultra: 5.
+ */
+function buildKernels(u: Uniforms, n: number, cascades: readonly CascadeDef[], h0Attr: any, omegaAttr: any, twAttr: any, fieldAttr: any, redD: any, redN: any, redOff: number[], fields: any) {
   const log2n = Math.round(Math.log2(n));
-  if (1 << log2n !== n || n < 16 || n > 512) throw new RangeError(`fft: unsupported size ${n}`);
-  const L = 2; // layers per group (fixed so the material code is tier-agnostic)
-  const nn = n * n;
-  const half = n >> 1;
-  const h0Size = Math.min(n, MASTER);
-  const defs = cascades.map((c) => FFT_CASCADES[c]);
-  const dk = defs.map((d) => (2 * Math.PI) / d.domain);
-  const cell = defs.map((d) => d.domain / n);
-
-  // ---- buffers
-  const h0Attr = new StorageBufferAttribute(new Float32Array(NUM_SLOTS * L * h0Size * h0Size * 4), 4);
-  h0Attr.name = `ocean.fft.${label}.h0`;
-  const omega = new Float32Array(L * nn);
-  for (let l = 0; l < L; l++) omegaFor(cascades[l], n, omega.subarray(l * nn, (l + 1) * nn));
-  const omegaAttr = new StorageBufferAttribute(omega, 1);
-  const tw = new Float32Array(half * 2);
-  for (let j = 0; j < half; j++) { tw[2 * j] = Math.cos((2 * Math.PI * j) / n); tw[2 * j + 1] = Math.sin((2 * Math.PI * j) / n); }
-  const twAttr = new StorageBufferAttribute(tw, 2);
-  const workAttr = new StorageBufferAttribute(L * nn, 4);
-  workAttr.name = `ocean.fft.${label}.work`;
-  const fieldAttr = new StorageBufferAttribute(L * nn, 4);
-  fieldAttr.name = `ocean.fft.${label}.field`;
-  // Mip pyramid (levels 1..log2n) of the 3 derived textures, f32 (source of the next level).
-  const levelOff: number[] = [0, 0];
-  let pyr = 0;
-  for (let lv = 1; lv <= log2n; lv++) { levelOff[lv] = pyr; pyr += (n >> lv) * (n >> lv) * L; }
-  const pyrAttr = [0, 1, 2].map(() => new StorageBufferAttribute(Math.max(pyr, 1), 4));
-
-  const h0 = storage(h0Attr, 'vec4', h0Attr.count).toReadOnly();
+  const nn = n * n, half = n >> 1;
+  const NNu = uint(nn), mask = uint(n - 1);
+  const slotStride = uint(L * nn);
+  const dk = cascades.map((d) => (2 * Math.PI) / d.domain);
+  const cell = cascades.map((d) => d.domain / n);
+  const h0 = storage(h0Attr, 'vec2', h0Attr.count).toReadOnly();
   const om = storage(omegaAttr, 'float', omegaAttr.count).toReadOnly();
   const twn = storage(twAttr, 'vec2', twAttr.count).toReadOnly();
-  const work = storage(workAttr, 'vec4', workAttr.count);
-  const field = storage(fieldAttr, 'vec4', fieldAttr.count);
-  const pyrN = pyrAttr.map((a) => storage(a, 'vec4', a.count));
-
-  // ---- textures
-  const displacement = makeArrayTexture(n, 2 * L, `ocean.displacement.${label}`);
-  const normal = makeArrayTexture(n, L, `ocean.normal.${label}`);
-  const derivatives = makeArrayTexture(n, L, `ocean.derivatives.${label}`);
-
+  const work = storage(fieldAttr, 'vec4', fieldAttr.count);
+  const rD = storage(redD, 'vec4', redD.count), rN = storage(redN, 'vec4', redN.count);
   const kernels: any[] = [];
-  const NNu = uint(nn);
-  const mask = uint(n - 1);
 
-  // ---- 1. evolve: (x, y, layer) -> packed spectra in natural order
-  const evolve = Fn(() => {
-    const x = globalId.x, y = globalId.y, c = globalId.z;
+  /** Evolved packed spectra (F1, F2) of cell (x, y) of cascade c. */
+  function evolveAt(x: any, y: any, c: any) {
     const i = c.mul(NNu).add(y.mul(uint(n))).add(x);
-    const h = vec4(0).toVar();
-    const slot = uint(L * h0Size * h0Size);
-    if (n <= MASTER) {
-      const hi = c.mul(uint(h0Size * h0Size)).add(y.mul(uint(h0Size))).add(x);
-      h.assign(mix(h0.element(u.fromSlot.mul(slot).add(hi)), h0.element(u.toSlot.mul(slot).add(hi)), u.blend));
-    } else {
-      const off = (n - MASTER) / 2;
-      const mx = int(x).sub(int(off)), my = int(y).sub(int(off));
-      If(mx.greaterThanEqual(int(0)).and(mx.lessThan(int(MASTER))).and(my.greaterThanEqual(int(0))).and(my.lessThan(int(MASTER))), () => {
-        const hi = c.mul(uint(MASTER * MASTER)).add(uint(my).mul(uint(MASTER))).add(uint(mx));
-        h.assign(mix(h0.element(u.fromSlot.mul(slot).add(hi)), h0.element(u.toSlot.mul(slot).add(hi)), u.blend));
-      });
-    }
-    const m = om.element(i);
+    const j = c.mul(NNu).add(uint(n).sub(y).bitAnd(mask).mul(uint(n))).add(uint(n).sub(x).bitAnd(mask));
+    const fa = u.fromGpu.mul(slotStride), ta = u.toGpu.mul(slotStride);
+    const h = mix(h0.element(fa.add(i)), h0.element(ta.add(i)), u.blend).toVar();
+    const hmr = mix(h0.element(fa.add(j)), h0.element(ta.add(j)), u.blend).toVar();
+    const hm = vec2(hmr.x, hmr.y.negate()).toVar(); // conj(h0(-k))
+    const m = om.element(i).toVar();
     const p = uint(m).mul(u.timeInt).bitAnd(uint(LOOP - 1));
-    const cyc = fract(float(p).add(m.mul(u.timeFrac)).div(LOOP));
+    const cyc = fract(float(p).add(m.mul(u.timeFrac)).div(LOOP)).toVar();
     const th = cyc.sub(floor(cyc.add(0.5))).mul(2 * Math.PI).toVar();
     const cs = cos(th).toVar(), sn = sin(th).toVar();
-    // a = h0 e^{-i th}, b = h0m e^{+i th}
-    const htr = h.x.mul(cs).add(h.y.mul(sn)).add(h.z.mul(cs).sub(h.w.mul(sn))).toVar();
-    const hti = h.y.mul(cs).sub(h.x.mul(sn)).add(h.w.mul(cs).add(h.z.mul(sn))).toVar();
-    const dkc = perLayer(c, dk[0], dk[1]);
-    const kx = float(int(x).sub(int(half))).mul(dkc);
-    const kz = float(int(y).sub(int(half))).mul(dkc);
+    const htr = h.x.mul(cs).add(h.y.mul(sn)).add(hm.x.mul(cs).sub(hm.y.mul(sn))).toVar();
+    const hti = h.y.mul(cs).sub(h.x.mul(sn)).add(hm.y.mul(cs).add(hm.x.mul(sn))).toVar();
+    const dkc = perLayer(c, dk).toVar();
+    const kx = float(int(x).sub(int(half))).mul(dkc).toVar();
+    const kz = float(int(y).sub(int(half))).mul(dkc).toVar();
     const kl = sqrt(kx.mul(kx).add(kz.mul(kz))).add(1e-4).toVar();
     const kxn = kx.div(kl), kzn = kz.div(kl).toVar();
-    const one = kxn.add(1);
-    work.element(i).assign(vec4(htr.mul(one), hti.mul(one), kzn.mul(hti), kzn.mul(htr).negate()));
-  })().compute([Math.ceil(n / 8), Math.ceil(n / 8), active], [8, 8, 1]);
-  kernels.push(evolve);
+    const one = kxn.add(1).toVar();
+    return vec4(htr.mul(one), hti.mul(one), kzn.mul(hti), kzn.mul(htr).negate());
+  }
 
-  // ---- 2./3. line FFTs in shared memory (rows, then columns + finalize)
   function lineFft(columns: boolean) {
     return Fn(() => {
       const j = localId.x;
@@ -292,14 +209,19 @@ function buildGroup(u: Uniforms, n: number, cascades: readonly number[], active:
       const base = columns ? c.mul(NNu).add(line) : c.mul(NNu).add(line.mul(uint(n)));
       const stride = uint(columns ? n : 1);
       const j2 = j.add(uint(half));
-      sh.element(bitReverse(j, log2n)).assign(work.element(base.add(j.mul(stride))));
-      sh.element(bitReverse(j2, log2n)).assign(work.element(base.add(j2.mul(stride))));
+      if (!columns) {
+        sh.element(bitReverse(j, log2n)).assign(evolveAt(j, line, c));
+        sh.element(bitReverse(j2, log2n)).assign(evolveAt(j2, line, c));
+      } else {
+        sh.element(bitReverse(j, log2n)).assign(work.element(base.add(j.mul(stride))));
+        sh.element(bitReverse(j2, log2n)).assign(work.element(base.add(j2.mul(stride))));
+      }
       workgroupBarrier();
       for (let s = 0; s < log2n; s++) {
-        const h = 1 << s;
-        const k = j.bitAnd(uint(h - 1));
+        const hs = 1 << s;
+        const k = j.bitAnd(uint(hs - 1));
         const a = j.shiftRight(uint(s)).shiftLeft(uint(s + 1)).add(k);
-        const b = a.add(uint(h));
+        const b = a.add(uint(hs));
         const w = twn.element(k.shiftLeft(uint(log2n - 1 - s))).toVar();
         const xa = sh.element(a).toVar();
         const xb = sh.element(b).toVar();
@@ -312,30 +234,24 @@ function buildGroup(u: Uniforms, n: number, cascades: readonly number[], active:
         work.element(base.add(j)).assign(sh.element(j));
         work.element(base.add(j2)).assign(sh.element(j2));
       } else {
-        // finalize: checkerboard, fields, chop  -> f32 field buffer
-        const x = line;
         for (const yy of [j, j2]) {
           const v = sh.element(yy).toVar();
-          const s = float(1).sub(float(x.add(yy).bitAnd(uint(1))).mul(2));
-          field.element(base.add(yy.mul(stride))).assign(vec4(
-            v.x.mul(s).negate(), v.y.mul(s).mul(u.chop), v.z.mul(s).mul(u.chop).negate(), 0,
-          ));
+          const sg = float(1).sub(float(line.add(yy).bitAnd(uint(1))).mul(2));
+          work.element(base.add(yy.mul(stride))).assign(vec4(v.x.mul(sg).negate(), v.y.mul(sg).mul(u.chop), v.z.mul(sg).mul(u.chop).negate(), 0));
         }
       }
-    })().compute([n, active, 1], [half, 1, 1]);
+    })().compute([n, L, 1], [half, 1, 1]);
   }
   kernels.push(lineFft(false), lineFft(true));
 
-  // ---- 4. derived fields at level 0 (central differences, reference BLEND_FRAGMENT)
-  /** Returns { disp, nrm, der } vec4 nodes for texel (x, y) of layer c (uint nodes, wrapped). */
+  // derived fields (central differences at the cell size, reference BLEND_FRAGMENT)
   function derive(x: any, y: any, c: any) {
-    const at = (xx: any, yy: any) => field.element(c.mul(NNu).add(yy.bitAnd(mask).mul(uint(n))).add(xx.bitAnd(mask)));
+    const at = (xx: any, yy: any) => work.element(c.mul(NNu).add(yy.bitAnd(mask).mul(uint(n))).add(xx.bitAnd(mask)));
     const ctr = at(x, y).toVar();
-    const px = at(x.add(uint(1)), y), mx = at(x.add(uint(n - 1)), y);
-    const py = at(x, y.add(uint(1))), my = at(x, y.add(uint(n - 1)));
-    const inv2c = float(1).div(perLayer(c, cell[0], cell[1]).mul(2));
-    // reference displacement vector d = (east, up, south) in the tile frame (a = east, b = south)
-    const dA = vec3(px.y.sub(mx.y), px.x.sub(mx.x), mx.z.sub(px.z)).mul(inv2c).toVar(); // d/da
+    const px = at(x.add(uint(1)), y).toVar(), mx = at(x.add(uint(n - 1)), y).toVar();
+    const py = at(x, y.add(uint(1))).toVar(), my = at(x, y.add(uint(n - 1))).toVar();
+    const inv2c = float(1).div(perLayer(c, cell).mul(2));
+    const dA = vec3(px.y.sub(mx.y), px.x.sub(mx.x), mx.z.sub(px.z)).mul(inv2c).toVar(); // d(east, up, south)/da
     const dB = vec3(py.y.sub(my.y), py.x.sub(my.x), my.z.sub(py.z)).mul(inv2c).toVar(); // d/db
     const tx = vec3(1, 0, 0).add(dA).toVar();
     const tz = vec3(0, 0, 1).add(dB).toVar();
@@ -343,127 +259,126 @@ function buildGroup(u: Uniforms, n: number, cascades: readonly number[], active:
     const dd = tx.x.sub(tz.z);
     const eig = tx.x.add(tz.z).sub(sqrt(max(dd.mul(dd).add(tx.z.mul(tz.x).mul(4)), 0))).mul(0.5);
     const comp = clamp(float(1).sub(eig), 0, 1).mul(smoothstep(0, 0.2, dot(vec2(nr.x, nr.z), u.windAB)));
-    return {
-      // (up, east, north, dEast/dNorth = -d east/db)
-      disp: vec4(ctr.x, ctr.y, ctr.z, dB.x.negate()),
-      // (n.east, n.north, n.up, 1 - compression)
-      nrm: vec4(nr.x, nr.z.negate(), nr.y, float(1).sub(comp)),
-      // (dUp/dEast, dUp/dNorth, dEast/dEast, dNorth/dNorth)
-      der: vec4(dA.y, dB.y.negate(), dA.x, dB.z),
-    };
-  }
-  const tDisp0 = storageTexture(displacement).setMipLevel(0);
-  const tNrm0 = storageTexture(normal).setMipLevel(0);
-  const tDer0 = storageTexture(derivatives).setMipLevel(0);
-  kernels.push(Fn(() => {
-    const x = globalId.x, y = globalId.y, c = globalId.z;
-    const d = derive(x, y, c);
-    const xy = uvec2(x, y);
-    textureStore(tDisp0.depth(int(c.add(u.curLayer))), xy, d.disp);
-    textureStore(tNrm0.depth(int(c)), xy, d.nrm);
-    textureStore(tDer0.depth(int(c)), xy, d.der);
-  })().compute([Math.ceil(n / 8), Math.ceil(n / 8), active], [8, 8, 1]));
-
-  // ---- 5. mip chain: level 1 from 2x2 derived texels, levels >= 2 from the f32 pyramid
-  for (let lv = 1; lv <= log2n; lv++) {
-    const m = n >> lv;
-    const tD = storageTexture(displacement).setMipLevel(lv);
-    const tN = storageTexture(normal).setMipLevel(lv);
-    const tR = storageTexture(derivatives).setMipLevel(lv);
-    const wg = Math.min(8, m);
-    kernels.push(Fn(() => {
-      const x = globalId.x, y = globalId.y, c = globalId.z;
-      const sD = vec4(0).toVar(), sN = vec4(0).toVar(), sR = vec4(0).toVar();
-      for (let jj = 0; jj < 2; jj++) for (let ii = 0; ii < 2; ii++) {
-        const sx = x.mul(uint(2)).add(uint(ii)), sy = y.mul(uint(2)).add(uint(jj));
-        if (lv === 1) {
-          const d = derive(sx, sy, c);
-          sD.addAssign(d.disp); sN.addAssign(d.nrm); sR.addAssign(d.der);
-        } else {
-          const ms = m * 2;
-          const idx = uint(levelOff[lv - 1]).add(c.mul(uint(ms * ms))).add(sy.mul(uint(ms))).add(sx);
-          sD.addAssign(pyrN[0].element(idx)); sN.addAssign(pyrN[1].element(idx)); sR.addAssign(pyrN[2].element(idx));
-        }
-      }
-      sD.mulAssign(0.25); sN.mulAssign(0.25); sR.mulAssign(0.25);
-      const xy = uvec2(x, y);
-      textureStore(tD.depth(int(c.add(u.curLayer))), xy, sD);
-      textureStore(tN.depth(int(c)), xy, sN);
-      textureStore(tR.depth(int(c)), xy, sR);
-      if (lv < log2n) {
-        const o = uint(levelOff[lv]).add(c.mul(uint(m * m))).add(y.mul(uint(m))).add(x);
-        pyrN[0].element(o).assign(sD); pyrN[1].element(o).assign(sN); pyrN[2].element(o).assign(sR);
-      }
-    })().compute([Math.ceil(m / wg), Math.ceil(m / wg), active], [wg, wg, 1]));
+    return { disp: vec4(ctr.x, ctr.y, ctr.z, dB.x.negate()), nrm: vec4(nr.x, nr.z.negate(), nr.y, float(1).sub(comp)) };
   }
 
-  // ---- memory estimate (bytes)
-  let texels = 0;
-  for (let lv = 0; lv <= log2n; lv++) texels += (n >> lv) * (n >> lv);
-  const bytes = h0Attr.array.byteLength + omega.byteLength + tw.byteLength + 2 * L * nn * 16 + 3 * pyr * 16 +
-    texels * 8 * (2 * L + L + L);
-  return {
-    n, log2n, cascades, active, displacement, normal, derivatives, fieldAttr, h0Attr, h0Size, kernels, bytes,
-    uploaded: new Int32Array(NUM_SLOTS * L).fill(-1),
-  };
+  /**
+   * Tile reduction: T x T threads each hold one texel of level `src` (disp, normal); writes levels src+1 ..
+   * src+log2(T) of the texture (src = -1: the tile also derives and writes level 0) and, if levels remain, the
+   * last level into the f32 buffer section `outOff`.
+   */
+  function reduceKernel(src: number, T: number, inOff: number, outOff: number) {
+    const k = Math.round(Math.log2(T));
+    const first = src < 0 ? 0 : src + 1;
+    const last = (src < 0 ? 0 : src) + k;          // last level written (src -1: levels 0..k with T = 8 -> 0..3)
+    const lastLevel = src < 0 ? k : last;
+    const tex: any[] = [];
+    for (let lv = first; lv <= lastLevel; lv++) tex[lv] = mipStore(fields, lv);
+    const ns = src < 0 ? n : n >> src;                // texels per side of the source level
+    return Fn(() => {
+      const lx = localId.x, ly = localId.y, c = workgroupId.z;
+      const gx = globalId.x, gy = globalId.y;
+      const shD = workgroupArray('vec4', T * T), shN = workgroupArray('vec4', T * T);
+      const li = ly.mul(uint(T)).add(lx);
+      const d = vec4(0).toVar(), m4 = vec4(0).toVar();
+      if (src < 0) {
+        const r = derive(gx, gy, c);
+        d.assign(r.disp); m4.assign(r.nrm);
+        const xy = uvec2(gx, gy);
+        textureStore(tex[0].depth(int(c.add(u.curLayer))), xy, d);
+        textureStore(tex[0].depth(int(c.add(uint(NORMAL_LAYER)))), xy, m4);
+      } else {
+        const idx = uint(inOff).add(c.mul(uint(ns * ns))).add(gy.mul(uint(ns))).add(gx);
+        d.assign(rD.element(idx)); m4.assign(rN.element(idx));
+      }
+      shD.element(li).assign(d); shN.element(li).assign(m4);
+      workgroupBarrier();
+      const lv0 = src < 0 ? 0 : src;
+      for (let s = 1; s <= k; s++) {
+        const m = T >> s;
+        const on = lx.lessThan(uint(m)).and(ly.lessThan(uint(m)));
+        const a = vec4(0).toVar(), b = vec4(0).toVar();
+        If(on, () => {
+          const i00 = ly.mul(uint(2 * T)).add(lx.mul(uint(2)));
+          a.assign(shD.element(i00).add(shD.element(i00.add(uint(1)))).add(shD.element(i00.add(uint(T)))).add(shD.element(i00.add(uint(T + 1)))).mul(0.25));
+          b.assign(shN.element(i00).add(shN.element(i00.add(uint(1)))).add(shN.element(i00.add(uint(T)))).add(shN.element(i00.add(uint(T + 1)))).mul(0.25));
+        });
+        workgroupBarrier();
+        const lv = lv0 + s;
+        If(on, () => {
+          shD.element(li).assign(a); shN.element(li).assign(b);
+          const xy = uvec2(workgroupId.x.mul(uint(m)).add(lx), workgroupId.y.mul(uint(m)).add(ly));
+          textureStore(tex[lv].depth(int(c.add(u.curLayer))), xy, a);
+          textureStore(tex[lv].depth(int(c.add(uint(NORMAL_LAYER)))), xy, b);
+          if (s === k && lv < log2n) {
+            const no = n >> lv;
+            const o = uint(outOff).add(c.mul(uint(no * no))).add(xy.y.mul(uint(no))).add(xy.x);
+            rD.element(o).assign(a); rN.element(o).assign(b);
+          }
+        });
+        workgroupBarrier();
+      }
+    })().compute([ns / T, ns / T, L], [T, T, 1]);
+  }
+  // level 0..3 in 8x8 tiles, then 16x16 (or smaller) tiles from the last written level
+  kernels.push(reduceKernel(-1, 8, 0, redOff[3]));
+  let lv = 3;
+  while (lv < log2n) {
+    const ns = n >> lv;
+    const T = Math.min(16, ns);
+    const k = Math.round(Math.log2(T));
+    kernels.push(reduceKernel(lv, T, redOff[lv], redOff[lv + k] ?? 0));
+    lv += k;
+  }
+  return kernels;
 }
-
-function disposeGroup(g: Group) {
-  g.displacement.dispose(); g.normal.dispose(); g.derivatives.dispose();
-  for (const k of g.kernels) k.dispose?.();
-}
-
-// ------------------------------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------
 // Public API
-// ------------------------------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------
 export interface OceanFftTextures {
-  /** 2D-array textures (see header). base: cascades 0, 1; detail: cascades 2, 3. */
-  readonly displacementBase: any;
-  readonly displacementDetail: any;
-  readonly normalBase: any;
-  readonly normalDetail: any;
-  readonly derivativesBase: any;
-  readonly derivativesDetail: any;
+  /** 2D-array textures, N x N per tier; layer = cascade (+ curLayer / prevLayer for the displacement). */
+  readonly displacement: any;
+  readonly normal: any;
 }
 
 export interface OceanFft {
-  /** Render-graph pass (stage compute). execute() allocates nothing. */
+  /** Render-graph pass (stage compute). execute() allocates nothing in steady state. */
   readonly pass: Pass;
-  /** Resolves when the first tier is compiled and has been uploaded. */
+  /** Resolves when the first tier is compiled and has run once. */
   readonly ready: Promise<void>;
-  /** Tier currently drawn (the old tier stays live while a new one compiles). */
   readonly tier: OceanTier;
   readonly pendingTier: OceanTier | null;
   /** Texture NODES (their .value swaps on tier change; build samples from them, e.g. via createFftSampling). */
   readonly nodes: OceanFftTextures;
-  /** Uniform nodes the sampling helpers / material use. */
   readonly uniforms: {
-    /** First layer of this frame's / last frame's displacement (0 or 2), float. */
+    /** First displacement layer of this frame / last frame (0 or 3), float. */
     readonly dispCurLayer: any;
     readonly dispPrevLayer: any;
-    /** Detail group grid size (float) and texel size of c2 / c3 (m). */
+    /** Grid size N of the active tier (float); detailSize is the round-1 alias. */
+    readonly size: any;
     readonly detailSize: any;
-    /** 1 when the 4th cascade is drawn (high / ultra), else 0. */
+    /** int N - 1 (texel wrap mask for exact loads). */
+    readonly sizeMask: any;
+    /** @deprecated always 0 (no 4th cascade). */
     readonly fineEnabled: any;
-    /** Slope variance not resolved by the detail grid (low tier: c2 truncated at 128), m^2/m^2. */
+    /** Slope variance of the full spectrum the tier does not draw (low: above its band top), m^2/m^2. */
     readonly unresolvedSlopeVariance: any;
-    /** Wind direction (towards) in the tile frame (east, south). */
+    /** Wind direction (towards) of the drawn (crossfaded) spectrum in the tile frame (east, south). */
     readonly windAB: any;
   };
   setTier(t: OceanTier): void;
-  /** Readback helpers for the parity check (async, never awaited on the render path). */
   readonly debug: {
-    /** f32 (up, east, north, 0) fields: base layers 0,1 then detail. Group n via groupSize(). */
-    readFields(group: 'base' | 'detail'): Promise<Float32Array>;
-    groupSize(group: 'base' | 'detail'): number;
-    /** Cascade definitions used for each layer (global index). */
-    readonly cascades: readonly CascadeDef[];
-    /** Master-size h0 (256^2 x 4) of cascade 3 for slot s, as uploaded (for CPU comparisons). */
-    fineH0(slot: number): Float32Array;
-    /** Bytes of GPU memory (textures + buffers) of the active tier, approximately. */
+    /** f32 (up, east, north, 0) fields of the active tier, layer-major (resolved after this frame's GPU work). */
+    readFields(): Promise<Float32Array>;
+    size(): number;
+    /** The tier's h0 (h0-only layout, per cascade) that the GPU uses for core slot s, or null. */
+    spectrum(slot: number): Float32Array[] | null;
+    /** Omega index table (per cascade concatenated) of the active tier. */
+    omega(): Float32Array | null;
     memoryBytes(): number;
-    /** Last tier compile time, ms. */
     lastCompileMs(): number;
+    /** Main-thread ms spent in the last tier build (sum of its synchronous steps). */
+    lastBuildMainThreadMs(): number;
   };
   dispose(): void;
 }
@@ -475,144 +390,155 @@ export function createOceanFft(opts: OceanFftOptions): OceanFft {
   const g = st0.gravity as number;
   const seed = (st0.seed ?? 1) as number;
 
-  const omegaFor = (c: number, n: number, out: Float32Array) => { omegaIndicesSized(FFT_CASCADES[c], g, n, out); };
-  // Shared base group (identical on every tier).
-  const base = buildGroup(u, BASE_SIZE, [0, 1], 2, 'base', omegaFor);
-
-  // ---- cascade 3 spectrum (adapter-generated, per core slot, amortised)
-  const fineXi = gaussianField(seed, 3, new Float64Array(2 * MASTER * MASTER));
-  const fineRaw = new Float64Array(2 * MASTER * MASTER);
-  const fineH0: Float32Array[] = [];
-  for (let s = 0; s < NUM_SLOTS; s++) fineH0.push(new Float32Array(MASTER * MASTER * 4));
-  const fineVersion = new Int32Array(NUM_SLOTS).fill(-1);   // slot version the fineH0 holds
-  const fineScalars: SpectrumScalars = { g: 0, U: 0, dirGrid: 0, wp: 0 };
-  let fineJobSlot = -1, fineJobRow = 0, fineJobVersion = 0;
-  function fineGenerateSync(s: number, version: number, params: any) {
-    spectrumScalars(params, g, fineScalars);
-    generateRawRows(params, fineScalars, FFT_CASCADES[3], fineXi, fineRaw, 0, MASTER);
-    packInitialSpectrum(fineRaw, params.standing, fineH0[s]);
-    fineVersion[s] = version;
+  // ---- worker (spectra + omega tables); synchronous fallback where Worker is unavailable
+  let worker: Worker | null = null;
+  try {
+    if (typeof Worker !== 'undefined') worker = new Worker(new URL('./fft-worker.ts', import.meta.url), { type: 'module' });
+  } catch { worker = null; }
+  let jobId = 0;
+  const jobs = new Map<number, (r: any) => void>();
+  if (worker) {
+    worker.onmessage = (e: MessageEvent) => {
+      const cb = jobs.get(e.data.id);
+      jobs.delete(e.data.id);
+      if (e.data.error) console.error('[ocean.fft] worker job failed', e.data.error);
+      cb?.(e.data);
+    };
   }
-  function fineStep(state: any) {
-    if (fineJobSlot < 0) {
-      for (let s = 0; s < NUM_SLOTS; s++) {
-        const sl = state.slots[s];
-        if (sl.version !== fineVersion[s] && sl.version > 0) {
-          fineJobSlot = s; fineJobRow = 0; fineJobVersion = sl.version;
-          spectrumScalars(sl.params, g, fineScalars);
-          break;
-        }
-      }
-      if (fineJobSlot < 0) return;
-    }
-    const sl = state.slots[fineJobSlot];
-    if (sl.version !== fineJobVersion) { fineJobSlot = -1; return; } // regenerated meanwhile: restart next frame
-    const r1 = Math.min(MASTER, fineJobRow + FINE_ROWS_PER_FRAME);
-    generateRawRows(sl.params, fineScalars, FFT_CASCADES[3], fineXi, fineRaw, fineJobRow, r1);
-    fineJobRow = r1;
-    if (r1 >= MASTER) {
-      packInitialSpectrum(fineRaw, sl.params.standing, fineH0[fineJobSlot]);
-      fineVersion[fineJobSlot] = fineJobVersion;
-      fineJobSlot = -1;
-    }
-  }
-  // Initial: synchronous for the slots in use.
-  for (let s = 0; s < NUM_SLOTS; s++) if (st0.slots[s].version > 0) fineGenerateSync(s, st0.slots[s].version, st0.slots[s].params);
-
-  // ---- unresolved slope variance (low tier): per slot, master c2 energy outside the detail grid
-  const lostSlope = new Float64Array(NUM_SLOTS);
-  function computeLostSlope(s: number, n: number, masterH0: Float32Array) {
-    if (n >= MASTER) { lostSlope[s] = 0; return; }
-    const dk = (2 * Math.PI) / FFT_CASCADES[2].domain, h = n / 2;
-    let sum = 0;
-    for (let y = 0; y < MASTER; y++) {
-      const ky = y - MASTER / 2;
-      for (let x = 0; x < MASTER; x++) {
-        const kx = x - MASTER / 2;
-        if (kx >= -h + 1 && kx < h && ky >= -h + 1 && ky < h) continue;
-        const i = 4 * (y * MASTER + x);
-        const e = masterH0[i] ** 2 + masterH0[i + 1] ** 2 + masterH0[i + 2] ** 2 + masterH0[i + 3] ** 2;
-        sum += e * (kx * kx + ky * ky) * dk * dk;
-      }
-    }
-    lostSlope[s] = sum;
+  function job(msg: any): Promise<any> {
+    const id = ++jobId;
+    msg.id = id;
+    if (!worker) return Promise.resolve(handleFftJob(msg).result);
+    return new Promise((resolve) => { jobs.set(id, resolve); worker!.postMessage(msg); });
   }
 
-  // ---- upload of h0 for a group when core slot versions change (setup / regeneration only)
-  const tmp512 = new Float32Array(MASTER * MASTER * 4);
-  function uploadGroup(grp: Group, state: any, force: boolean) {
-    const L = 2, hs = grp.h0Size, slotStride = L * hs * hs * 4;
-    let any = false;
-    for (let s = 0; s < NUM_SLOTS; s++) {
-      for (let l = 0; l < L; l++) {
-        const c = grp.cascades[l];
-        let ver: number, src: Float32Array;
-        if (c < 3) { ver = state.slots[s].version; src = state.slots[s].h0[c]; }
-        else { ver = fineVersion[s]; src = fineH0[s]; }
-        if (ver <= 0 || (!force && grp.uploaded[s * L + l] === ver)) continue;
-        if (c === 3 && grp.active < 2) continue;
-        const off = s * slotStride + l * hs * hs * 4;
-        const dst = (grp.h0Attr.array as Float32Array).subarray(off, off + hs * hs * 4);
-        if (hs === MASTER) dst.set(src);
-        else { resampleCentred(src, tmp512, hs, 4, true); dst.set(tmp512.subarray(0, hs * hs * 4)); }
-        if (c === 2) computeLostSlope(s, grp.n, src);
-        grp.h0Attr.addUpdateRange(off, hs * hs * 4);
-        grp.uploaded[s * L + l] = ver;
-        any = true;
-      }
+  // ---- spectra per (tier, core slot, version)
+  interface SpecEntry { version: number; h0: Float32Array[] | null; unresolved: number; pending: boolean }
+  const specs = new Map<string, SpecEntry>();
+  const key = (t: OceanTier, s: number) => `${t}:${s}`;
+  /** Spectrum of core slot s for tier t if ready (requests it otherwise). */
+  function spectrumFor(t: OceanTier, s: number, state: any): SpecEntry | null {
+    const sl = state.slots[s];
+    if (!sl || !(sl.version > 0)) return null;
+    const k = key(t, s);
+    let e = specs.get(k);
+    if (e && e.version === sl.version) return e.h0 ? e : null;
+    if (FFT_TIERS[t].reference) {
+      const n = FFT_TIERS[t].size;
+      const h0 = [0, 1, 2].map((c) => stripMasterH0(sl.h0[c], new Float32Array(2 * n * n)));
+      e = { version: sl.version, h0, unresolved: 0, pending: false };
+      specs.set(k, e);
+      return e;
     }
-    if (any) grp.h0Attr.needsUpdate = true;
+    if (e && e.pending && e.version === sl.version) return null;
+    const entry: SpecEntry = { version: sl.version, h0: null, unresolved: 0, pending: true };
+    specs.set(k, entry);
+    job({ kind: 'spectrum', tier: t, params: { ...sl.params }, seed, g }).then((r) => {
+      if (specs.get(k) !== entry || !r.h0) return;
+      entry.h0 = r.h0; entry.unresolved = r.unresolved; entry.pending = false;
+    });
+    return null;
   }
 
   // ---- tiers
   let active: TierState | null = null;
   let pending: TierState | null = null;
   let pendingTier: OceanTier | null = null;
-  let compileMs = 0;
+  let buildToken = 0;
+  let compileMs = 0, buildMainMs = 0;
   let requested: OceanTier = opts.tier ?? 'high';
   let retired: TierState | null = null;
   let retireFrames = 0;
 
-  function makeDetail(t: OceanTier): Group {
-    const config = FFT_TIERS[t];
-    return buildGroup(u, config.detailSize, [2, 3], config.cascades === 4 ? 2 : 1, `detail${config.detailSize}`, omegaFor);
-  }
-  async function buildTier(t: OceanTier, prebuilt: Group | null): Promise<TierState> {
-    const config = FFT_TIERS[t];
-    const detail = prebuilt ?? makeDetail(t);
-    const list = [...base.kernels, ...detail.kernels];
-    const t0 = performance.now();
-    await renderer.compileComputeAsync(list);
-    compileMs = performance.now() - t0;
-    return { tier: t, config, detail, list, bytes: base.bytes + detail.bytes };
+  function disposeTier(ts: TierState) {
+    ts.fields.dispose();
+    for (const k of ts.kernels) k.dispose?.();
   }
 
-  function startBuild(t: OceanTier, prebuilt: Group | null = null) {
+  function createTextures(t: OceanTier) {
+    const n = FFT_TIERS[t].size;
+    return makeArrayTexture(n, 3 * L, `ocean.fft.fields.${t}`);
+  }
+
+  async function buildTier(t: OceanTier, token: number, tex: any): Promise<TierState | null> {
+    const spec = FFT_TIERS[t], n = spec.size, nn = n * n, log2n = Math.round(Math.log2(n));
+    const cascades = tierCascades(t);
+    let main = 0;
+    const tick = () => performance.now();
+    // omega table (worker)
+    const om = await job({ kind: 'omega', tier: t, g });
+    if (token !== buildToken) return null;
+    // spectra of the slots in use (worker; poll until generated)
+    for (let tries = 0; ; tries++) {
+      const state = ocean.getState();
+      const a = spectrumFor(t, state.toSlot, state);
+      const b = state.fromSlot === state.toSlot ? a : spectrumFor(t, state.fromSlot, state);
+      if (a && b) break;
+      await new Promise((r) => setTimeout(r, 16));
+      if (token !== buildToken) return null;
+      if (tries > 2000) throw new Error('ocean.fft: spectrum generation timed out');
+    }
+    // resources, a few per task so no single main-thread step is long
+    let t0 = tick();
+    const h0Attr = new StorageBufferAttribute(new Float32Array(2 * L * nn * 2), 2);
+    h0Attr.name = `ocean.fft.${t}.h0`;
+    const omegaAttr = new StorageBufferAttribute(om.omega as Float32Array, 1);
+    const tw = new Float32Array(n);
+    for (let j = 0; j < n / 2; j++) { tw[2 * j] = Math.cos((2 * Math.PI * j) / n); tw[2 * j + 1] = Math.sin((2 * Math.PI * j) / n); }
+    const twAttr = new StorageBufferAttribute(tw, 2);
+    main += tick() - t0; await nextTask(); if (token !== buildToken) return null; t0 = tick();
+    const fieldAttr = new StorageBufferAttribute(L * nn, 4);
+    fieldAttr.name = `ocean.fft.${t}.field`;
+    main += tick() - t0; await nextTask(); if (token !== buildToken) return null; t0 = tick();
+    // f32 hand-over levels between the mip reduction kernels (3 and 7)
+    const redOff: number[] = [];
+    redOff[3] = 0;
+    redOff[7] = (n >> 3) * (n >> 3) * L;
+    const redCount = redOff[7] + Math.max(1, (n >> 7) * (n >> 7) * L);
+    const redD = new StorageBufferAttribute(redCount, 4), redN = new StorageBufferAttribute(redCount, 4);
+    const fields = tex ?? createTextures(t);
+    main += tick() - t0; await nextTask(); if (token !== buildToken) return null; t0 = tick();
+    const kernels = buildKernels(u, n, cascades, h0Attr, omegaAttr, twAttr, fieldAttr, redD, redN, redOff, fields);
+    main += tick() - t0; await nextTask(); if (token !== buildToken) { for (const k of kernels) k.dispose?.(); return null; }
+    const c0 = tick();
+    await renderer.compileComputeAsync(kernels);
+    compileMs = tick() - c0;
+    buildMainMs = main;
+    if (token !== buildToken) { for (const k of kernels) k.dispose?.(); return null; }
+    let texels = 0;
+    for (let lv = 0; lv <= log2n; lv++) texels += (n >> lv) * (n >> lv);
+    const bytes = h0Attr.array.byteLength + omegaAttr.array.byteLength + tw.byteLength + L * nn * 16 + 2 * redCount * 16 + texels * 8 * 3 * L;
+    return {
+      tier: t, n, fields, fieldAttr, h0Attr, kernels, bytes,
+      entrySlot: new Int32Array([-1, -1]), entryVer: new Int32Array([-1, -1]), entryUnres: new Float64Array(2),
+      omega: omegaAttr.array as Float32Array,
+    };
+  }
+
+  function startBuild(t: OceanTier, tex: any = null) {
+    const token = ++buildToken;
     pendingTier = t;
-    buildTier(t, prebuilt).then((ts) => {
-      if (pendingTier !== t) { disposeGroup(ts.detail); return; } // superseded
+    buildTier(t, token, tex).then((ts) => {
+      if (!ts) return;
+      if (token !== buildToken) { disposeTier(ts); return; }
+      if (pending) disposeTier(pending);
       pending = ts;
-    }, (e) => { console.error('[ocean.fft] tier build failed', e); if (pendingTier === t) pendingTier = null; });
+    }, (e) => { console.error('[ocean.fft] tier build failed', e); if (token === buildToken) pendingTier = null; });
   }
 
-  // Texture nodes for the material (values swap on tier change). The first tier's detail group is created now
-  // (only its compilation is async) so every node starts with its own distinct texture: three merges texture
-  // nodes that share a texture into one binding when a shader is built, so a shared placeholder would alias
-  // the detail lookups to the base textures for the material's whole life.
-  const firstDetail = makeDetail(requested);
-  const nodes: OceanFftTextures = {
-    displacementBase: texture(base.displacement),
-    normalBase: texture(base.normal),
-    derivativesBase: texture(base.derivatives),
-    displacementDetail: texture(firstDetail.displacement),
-    normalDetail: texture(firstDetail.normal),
-    derivativesDetail: texture(firstDetail.derivatives),
-  };
+  // Texture nodes: the first tier's textures exist from the start (three merges texture nodes sharing a texture
+  // into one binding when a shader is built, so no shared placeholder).
+  const firstTex = createTextures(requested);
+  // displacement and normal are layers of ONE array texture (both nodes share its single binding).
+  const nodes: OceanFftTextures = { displacement: texture(firstTex), normal: texture(firstTex) };
+  const sizeU = uniform(FFT_TIERS[requested].size);
   const uniforms = {
     dispCurLayer: uniform(0),
     dispPrevLayer: uniform(0),
-    detailSize: uniform(FFT_TIERS[requested].detailSize),
-    fineEnabled: uniform(FFT_TIERS[requested].cascades === 4 ? 1 : 0),
+    size: sizeU,
+    detailSize: sizeU,
+    sizeMask: uniform(FFT_TIERS[requested].size - 1, 'int'),
+    fineEnabled: uniform(0),
     unresolvedSlopeVariance: uniform(0),
     windAB: u.windAB,
   };
@@ -623,68 +549,90 @@ export function createOceanFft(opts: OceanFftOptions): OceanFft {
   let parity = 0;
   let freshHistory = true;
 
-  function activate(ts: TierState, state: any) {
-    if (retired) { disposeGroup(retired.detail); retired = null; }
+  /** Make core slot s resident in a GPU entry (not `keep`); returns the entry or -1 if its spectrum is not ready. */
+  function resident(ts: TierState, s: number, keep: number, state: any): number {
+    const ver = state.slots[s]?.version ?? -1;
+    for (let e = 0; e < 2; e++) if (ts.entrySlot[e] === s && ts.entryVer[e] === ver) return e;
+    const sp = spectrumFor(ts.tier, s, state);
+    if (!sp) { // not generated yet: keep using an older copy of this slot if resident
+      for (let e = 0; e < 2; e++) if (ts.entrySlot[e] === s) return e;
+      return -1;
+    }
+    const e = keep === 0 ? 1 : keep === 1 ? 0 : (ts.entrySlot[0] === -1 ? 0 : ts.entrySlot[1] === -1 ? 1 : (ts.entrySlot[0] === s ? 0 : 1));
+    const nn = ts.n * ts.n, arr = ts.h0Attr.array as Float32Array;
+    for (let c = 0; c < L; c++) arr.set(sp.h0![c], (e * L + c) * nn * 2);
+    ts.h0Attr.addUpdateRange(e * L * nn * 2, L * nn * 2);
+    ts.h0Attr.needsUpdate = true;
+    ts.entrySlot[e] = s; ts.entryVer[e] = ver; ts.entryUnres[e] = sp.unresolved;
+    return e;
+  }
+
+  function activate(ts: TierState) {
+    if (retired) { disposeTier(retired); retired = null; }
     if (active) { retired = active; retireFrames = 3; }
     active = ts;
     pending = null;
     pendingTier = null;
-    ts.detail.uploaded.fill(-1);
-    uploadGroup(ts.detail, state, true);
-    nodes.displacementDetail.value = ts.detail.displacement;
-    nodes.normalDetail.value = ts.detail.normal;
-    nodes.derivativesDetail.value = ts.detail.derivatives;
-    uniforms.detailSize.value = ts.config.detailSize;
-    uniforms.fineEnabled.value = ts.config.cascades === 4 ? 1 : 0;
+    nodes.displacement.value = ts.fields;
+    nodes.normal.value = ts.fields;
+    sizeU.value = ts.n;
+    uniforms.sizeMask.value = ts.n - 1;
     freshHistory = true;
   }
 
-  startBuild(requested, firstDetail);
+  startBuild(requested, firstTex);
 
   const pass: Pass = {
-    desc: {
-      id: 'ocean.fft', module: 'world/ocean', stage: 'compute', reads: [],
-      writes: ['ocean.displacement', 'ocean.normal', 'ocean.derivatives'],
-    },
+    desc: { id: 'ocean.fft', module: 'world/ocean', stage: 'compute', reads: [], writes: ['ocean.displacement', 'ocean.normal'] },
     execute(ctx: PassContext) {
       if (opts.perf) opts.perf.begin('world/ocean', 'ocean.fft');
-      const state = ocean.getState();
-      if (retired && --retireFrames <= 0) { disposeGroup(retired.detail); retired = null; }
-      if (pending) activate(pending, state);
+      if (retired && --retireFrames <= 0) { disposeTier(retired); retired = null; }
+      if (pending) activate(pending);
       if (!active) { if (opts.perf) opts.perf.end(); return; }
-      // spectrum slots -> GPU (only on version changes)
-      fineStep(state);
-      uploadGroup(base, state, false);
-      uploadGroup(active.detail, state, false);
-      // time / crossfade uniforms
+      const state = ocean.getState();
       const t = ctx.time;
+      const crossing = state.fromSlot !== state.toSlot;
+      const w = crossing ? ocean.blendAt(t) : 1;
+      // spectrum slots -> GPU entries (uploads only when a slot / version changes)
+      const needFrom = crossing && w < 1;
+      let holdFrom = -1;
+      if (needFrom) for (let e = 0; e < 2; e++) if (active.entrySlot[e] === state.fromSlot) holdFrom = e;
+      const eTo = resident(active, state.toSlot, holdFrom, state);
+      let eFrom = eTo;
+      if (needFrom && eTo >= 0) { const e = resident(active, state.fromSlot, eTo, state); if (e >= 0) eFrom = e; }
+      else if (state.pendingSlot >= 0) resident(active, state.pendingSlot, eTo, state); // prefetch the next one
+      if (eTo < 0) { if (opts.perf) opts.perf.end(); return; }
+      u.fromGpu.value = eFrom;
+      u.toGpu.value = eTo;
+      u.blend.value = eFrom === eTo ? 1 : w;
+      // time / chop
       let tm = t % LOOP;
       if (tm < 0) tm += LOOP;
       const ti = Math.floor(tm);
       u.timeInt.value = ti;
       u.timeFrac.value = tm - ti;
-      u.blend.value = state.fromSlot === state.toSlot ? 1 : ocean.blendAt(t);
       u.chop.value = ocean.choppinessAt(t);
-      u.fromSlot.value = state.fromSlot;
-      u.toSlot.value = state.toSlot;
-      const wd = state.windDirection as number;
-      (u.windAB.value as any).set(Math.cos(wd), -Math.sin(wd));
-      const w = u.blend.value as number;
-      uniforms.unresolvedSlopeVariance.value = lostSlope[state.fromSlot] + (lostSlope[state.toSlot] - lostSlope[state.fromSlot]) * w;
+      // foam mask wind = the drawn (crossfaded) spectrum's direction
+      const wa = state.slots[state.fromSlot].params.windDirection as number, wb = state.slots[state.toSlot].params.windDirection as number;
+      let dw = (wb - wa) % (2 * Math.PI);
+      if (dw > Math.PI) dw -= 2 * Math.PI; else if (dw < -Math.PI) dw += 2 * Math.PI;
+      const wd = wa + dw * w;
+      (u.windAB.value as Vector2).set(Math.cos(wd), -Math.sin(wd));
+      uniforms.unresolvedSlopeVariance.value = active.entryUnres[eFrom] + (active.entryUnres[eTo] - active.entryUnres[eFrom]) * (u.blend.value as number);
       // history ping-pong
       parity ^= 1;
-      const cur = parity * 2;
+      const cur = parity * L;
       u.curLayer.value = cur;
       uniforms.dispCurLayer.value = cur;
-      uniforms.dispPrevLayer.value = freshHistory ? cur : 2 - cur;
+      uniforms.dispPrevLayer.value = freshHistory ? cur : L - cur;
       freshHistory = false;
-      ctx.renderer.compute(active.list);
+      ctx.renderer.compute(active.kernels);
       if (!readyResolved) { readyResolved = true; resolveReady(); }
       if (opts.perf) opts.perf.end();
     },
   };
 
-  const fft: OceanFft = {
+  return {
     pass,
     ready,
     get tier() { return active ? active.tier : requested; },
@@ -695,46 +643,50 @@ export function createOceanFft(opts: OceanFftOptions): OceanFft {
       if (!FFT_TIERS[t]) throw new Error(`ocean.fft: unknown tier ${t}`);
       requested = t;
       if (pendingTier === t) return;
-      if (active && active.tier === t && !pendingTier) return;
-      if (pending) { disposeGroup(pending.detail); pending = null; }
-      if (active && active.tier === t) { pendingTier = null; return; }
+      if (!pendingTier && active && active.tier === t) return;
+      if (pending) { disposeTier(pending); pending = null; }
+      if (active && active.tier === t) { buildToken++; pendingTier = null; return; }
       startBuild(t);
     },
     debug: {
-      async readFields(group) {
-        const grp = group === 'base' ? base : active?.detail;
-        if (!grp) throw new Error('no active tier');
-        const buf = await renderer.getArrayBufferAsync(grp.fieldAttr);
-        return new Float32Array(buf);
+      async readFields() {
+        if (!active) throw new Error('no active tier');
+        return new Float32Array(await renderer.getArrayBufferAsync(active.fieldAttr));
       },
-      groupSize(group) { return group === 'base' ? base.n : (active?.detail.n ?? 0); },
-      cascades: FFT_CASCADES,
-      fineH0(slot: number) { return fineH0[slot]; },
-      memoryBytes() { return active ? active.bytes : base.bytes; },
+      size() { return active ? active.n : 0; },
+      spectrum(slot: number) {
+        if (!active) return null;
+        const e = specs.get(key(active.tier, slot));
+        return e?.h0 ?? null;
+      },
+      omega() { return active ? active.omega : null; },
+      memoryBytes() { return active ? active.bytes : 0; },
       lastCompileMs() { return compileMs; },
+      lastBuildMainThreadMs() { return buildMainMs; },
     },
     dispose() {
-      if (active) disposeGroup(active.detail);
-      if (pending) disposeGroup(pending.detail);
-      if (retired) disposeGroup(retired.detail);
-      disposeGroup(base);
+      buildToken++;
+      if (active) disposeTier(active);
+      if (pending) disposeTier(pending);
+      if (retired) disposeTier(retired);
       active = pending = retired = null;
       pendingTier = null;
+      worker?.terminate();
     },
   };
-  return fft;
 }
 
-// ------------------------------------------------------------------------------------------------------
-// Sampling helpers for the material / LOD / foam (TSL). Chained lookup of the reference (spectralField /
-// spectralSurface), explicit LOD from a footprint, bilinear at LOD 0 (what the CPU query assumes).
-// ------------------------------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------
+// Sampling helpers (TSL) for the material / LOD / foam.
+// ------------------------------------------------------------------------------------------------------------
 export interface FftSampleOptions {
   /** Footprint in metres (vertex: grid cell size; fragment: max |d rest / d screen|). Default 0 = LOD 0. */
   footprint?: any;
   /** Sample LAST frame's displacement (motion vectors). */
   previous?: boolean;
-  /** Use only the first 3 cascades (diagnostics: compare with the CPU query, which has no cascade 3). */
+  /** Catmull-Rom where LOD < 0.5 (default: true for sampleDisplacement, false for sampleSurface's chaining). */
+  cubic?: boolean;
+  /** @deprecated (no 4th cascade any more). */
   threeCascades?: boolean;
 }
 
@@ -754,52 +706,73 @@ export interface FftSampling {
   sampleDisplacement(tileCoord: (period: number) => any, opts?: FftSampleOptions): any;
   /** Displacement + per-cascade normals (fragment / foam). */
   sampleSurface(tileCoord: (period: number) => any, opts?: FftSampleOptions): FftSurfaceSample;
+  /** Raw normal texel (n.east, n.north, n.up, 1 - compression) of cascade c at tile coordinate tc (east, south). */
+  normal(c: number, tc: any, lod: any): any;
+  /** Hardware uv of cascade c at tile coordinate tc. */
+  uv(c: number, tc: any): any;
+  readonly cascades: number;
 }
 
 export function createFftSampling(fft: OceanFft): FftSampling {
   const { nodes, uniforms } = fft;
   const C = FFT_CASCADES;
-  const baseTexel = (c: number) => C[c].domain / BASE_SIZE;
-  const detailTexel = (c: number) => uniforms.detailSize.reciprocal().mul(C[c].domain);
+  const invN = uniforms.size.reciprocal();
+  const uvOf = (c: number, tc: any) => tc.add(C[c].offset).div(C[c].domain).add(invN.mul(0.5));
+  const lodOf = (c: number, footprint: any) => (footprint ? max(log2(max(footprint, 1e-6).mul(uniforms.size).div(C[c].domain)), 0) : float(0));
 
-  function uvOf(c: number, tc: any) {
-    const halfTexel = c < 2 ? float(0.5 / BASE_SIZE) : uniforms.detailSize.reciprocal().mul(0.5);
-    return tc.add(C[c].offset).div(C[c].domain).add(halfTexel);
+  /** Catmull-Rom of the displacement texture, 16 exact level-0 loads (core 'cubic' weights and texel mapping). */
+  function catmullRom(c: number, tc: any, layer: any) {
+    // (every reused intermediate is a var: TSL inlines shared sub-expressions otherwise, which blew the WGSL up)
+    const s = tc.add(C[c].offset).div(C[c].domain).mul(uniforms.size).toVar();
+    const f = floor(s).toVar();
+    const t = s.sub(f).toVar();
+    const t2 = t.mul(t).toVar(), t3 = t2.mul(t).toVar();
+    const w0 = t3.mul(-0.5).add(t2).sub(t.mul(0.5)).toVar();
+    const w1 = t3.mul(1.5).sub(t2.mul(2.5)).add(1).toVar();
+    const w2 = t3.mul(-1.5).add(t2.mul(2)).add(t.mul(0.5)).toVar();
+    const w3 = t3.mul(0.5).sub(t2.mul(0.5)).toVar();
+    const W = [w0, w1, w2, w3];
+    const b = ivec2(f).toVar();
+    let sum: any = null;
+    for (let r = 0; r < 4; r++) {
+      let row: any = null;
+      const yy = b.y.add(r - 1).bitAnd(uniforms.sizeMask).toVar();
+      for (let q = 0; q < 4; q++) {
+        const xx = b.x.add(q - 1).bitAnd(uniforms.sizeMask).toVar();
+        const v = nodes.displacement.load(ivec2(xx, yy)).depth(layer).level(int(0)).mul(W[q].x);
+        row = row === null ? v : row.add(v);
+      }
+      const rr = row.mul(W[r].y);
+      sum = sum === null ? rr : sum.add(rr);
+    }
+    return sum;
   }
-  function lodOf(c: number, footprint: any) {
-    if (!footprint) return float(0);
-    const texel = c < 2 ? float(baseTexel(c)) : detailTexel(c);
-    return max(log2(max(footprint, 1e-6).div(texel)), 0);
-  }
-  function dispTex(c: number) { return c < 2 ? nodes.displacementBase : nodes.displacementDetail; }
-  function nrmTex(c: number) { return c < 2 ? nodes.normalBase : nodes.normalDetail; }
-  const layerOf = (c: number) => c & 1;
 
-  function fetchDisp(c: number, tc: any, lod: any, previous: boolean) {
-    const layer = (previous ? uniforms.dispPrevLayer : uniforms.dispCurLayer).add(layerOf(c));
-    return dispTex(c).sample(uvOf(c, tc)).depth(int(layer)).level(lod);
+  function fetchDisp(c: number, tc: any, lod: any, previous: boolean, cubic: boolean) {
+    const layer = int((previous ? uniforms.dispPrevLayer : uniforms.dispCurLayer).add(c));
+    const tri = nodes.displacement.sample(uvOf(c, tc)).depth(layer).level(lod);
+    if (!cubic) return tri;
+    return Fn(() => {
+      const v = vec4(tri).toVar();
+      If(lod.lessThan(0.5), () => { v.assign(mix(catmullRom(c, tc, layer), tri, smoothstep(0, 0.5, lod))); });
+      return v;
+    })();
   }
 
-  function chain(tileCoord: (p: number) => any, o: FftSampleOptions | undefined, withNormal: boolean) {
+  function chain(tileCoord: (p: number) => any, o: FftSampleOptions | undefined, withNormal: boolean, cubicDefault: boolean) {
     const previous = !!o?.previous;
-    let sum: any = null;          // (up, east, north) accumulated
-    let nSum: any = null, foamSum: any = null, varSum: any = null;
-    const count = o?.threeCascades ? 3 : 4;
-    for (let c = 0; c < count; c++) {
-      const lod = lodOf(c, o?.footprint);
-      // chained tile coordinate: rest + horizontal displacement of the larger cascades (east, south)
-      const tc = sum === null ? tileCoord(C[c].domain) : tileCoord(C[c].domain).add(vec2(sum.y, sum.z.negate()));
-      const d = fetchDisp(c, tc, lod, previous);
-      const gate = c === 3 ? uniforms.fineEnabled : null;
-      const dv = gate ? d.xyz.mul(gate) : d.xyz;
-      sum = sum === null ? dv : sum.add(dv);
+    const cubic = o?.cubic ?? cubicDefault;
+    let sum: any = null, nSum: any = null, foamSum: any = null, varSum: any = null;
+    for (let c = 0; c < L; c++) {
+      const lod = lodOf(c, o?.footprint).toVar();
+      const tc = (sum === null ? tileCoord(C[c].domain) : tileCoord(C[c].domain).add(vec2(sum.y, sum.z.negate()))).toVar();
+      const d = vec4(fetchDisp(c, tc, lod, previous, cubic)).toVar();
+      sum = (sum === null ? d.xyz : sum.add(d.xyz)).toVar();
       if (withNormal) {
-        const nm = nrmTex(c).sample(uvOf(c, tc)).depth(int(layerOf(c))).level(lod);
-        // tilt = n - up (so the sum of C normals minus (C-1) up), foam term 1 - a, shortening 1 - |n|
-        let tilt: any = nm.xyz.sub(vec3(0, 0, 1));
-        let foam: any = float(1).sub(nm.w);
-        let short: any = max(float(1).sub(length(nm.xyz)), 0);
-        if (gate) { tilt = tilt.mul(gate); foam = foam.mul(gate); short = short.mul(gate); }
+        const nm = nodes.normal.sample(uvOf(c, tc)).depth(int(c + NORMAL_LAYER)).level(lod);
+        const tilt = nm.xyz.sub(vec3(0, 0, 1));
+        const foam = float(1).sub(nm.w);
+        const short = max(float(1).sub(length(nm.xyz)), 0);
         nSum = nSum === null ? tilt : nSum.add(tilt);
         foamSum = foamSum === null ? foam : foamSum.add(foam);
         varSum = varSum === null ? short : varSum.add(short);
@@ -809,12 +782,15 @@ export function createFftSampling(fft: OceanFft): FftSampling {
   }
 
   return {
+    cascades: L,
+    uv: uvOf,
+    normal(c, tc, lod) { return nodes.normal.sample(uvOf(c, tc)).depth(int(c + NORMAL_LAYER)).level(lod); },
     sampleDisplacement(tileCoord, o) {
-      const { sum } = chain(tileCoord, o, false);
+      const { sum } = chain(tileCoord, o, false, true);
       return vec3(sum.y, sum.x, sum.z.negate());
     },
     sampleSurface(tileCoord, o) {
-      const { sum, nSum, foamSum, varSum } = chain(tileCoord, o, true);
+      const { sum, nSum, foamSum, varSum } = chain(tileCoord, o, true, false);
       const nLocal = nSum.add(vec3(0, 0, 1)); // (east, north, up)
       return {
         displacement: vec3(sum.y, sum.x, sum.z.negate()),
@@ -825,4 +801,3 @@ export function createFftSampling(fft: OceanFft): FftSampling {
     },
   };
 }
-
