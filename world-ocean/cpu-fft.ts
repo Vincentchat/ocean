@@ -323,6 +323,9 @@ export class CascadeSim {
   computed = 0;
   /** Snapshots that had to be computed synchronously (prefetch missed; diagnostics). */
   syncComputed = 0;
+  /** Lazy blocks filled so far (positions / velocities; diagnostics). */
+  posBlocksFilled = 0;
+  velBlocksFilled = 0;
 
   private readonly omegaIndex: Float64Array;
   private readonly kxn: Float64Array;
@@ -749,6 +752,7 @@ export class CascadeSim {
       }
     }
     this.blockValid[f][by * this.nb + bx] = 1;
+    this.posBlocksFilled++;
   }
 
   private fillVelBlock(f: number, bx: number, by: number): void {
@@ -768,6 +772,7 @@ export class CascadeSim {
       }
     }
     this.velValid[f][by * this.nb + bx] = 1;
+    this.velBlocksFilled++;
   }
 
   /** Snapshot data the frame's Hermite interpolation reads (A = time index j, B = j + 1). For direct sampling. */

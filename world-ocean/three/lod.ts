@@ -170,8 +170,13 @@ export function createOceanLod(opts: OceanLodOptions): OceanLod {
   // inside whichever branch references it first, leaving it unset for the other vertices.)
   const vdir = cameraViewMatrix.mul(modelWorldMatrix.mul(vec4(dirH.x, 0, dirH.y, 0))).xyz;
   const cosView = max(vdir.z.negate(), 0.2); // cos(angle to the view axis); directions > 78 deg off-axis are off-screen
-  const tFar = min(cameraFar.mul(0.999), 1e6).div(cosView);
-  const pOut = dirH.mul(select(top, tFar, tFar.mul(0.995)));
+  // View depth of local point (dirH * t, y) = t * cosView - (y - h) * upView.z  ->  solve t for the target depth.
+  const upViewZ = cameraViewMatrix.mul(modelWorldMatrix.mul(vec4(0, 1, 0, 0))).z;
+  const depthFar = min(cameraFar.mul(0.999), 1e6);
+  const depthTarget = select(top, depthFar, depthFar.mul(0.995));
+  const yOffset = select(top, float(0), uCamHeight.negate()); // vertex height - camera height
+  const tOut = max(depthTarget.add(yOffset.mul(upViewZ)), depthTarget.mul(0.5)).div(cosView);
+  const pOut = dirH.mul(tOut);
   const pl = select(outer, pOut, pg);
   const ql = select(outer, pOut.add(uPhi), q2);
   const y = select(top, uCamHeight, float(0));

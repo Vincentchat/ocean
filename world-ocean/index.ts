@@ -153,6 +153,11 @@ export interface Ocean extends WorldSystem {
   heightsAt(points: Float64Array, time: number, out: Float64Array, count?: number): Float64Array;
   /** Surface point that rests at local (east, north): displaced position, height, velocity. */
   sampleRest(east: number, north: number, time: number, out: RestSample): RestSample;
+  /**
+   * Diagnostics per cascade c: out[4c] snapshots computed, out[4c+1] of them synchronously (prefetch
+   * missed or cold time), out[4c+2] / out[4c+3] lazy position / velocity blocks filled.
+   */
+  cpuStats(out: number[]): number[];
   /** Diagnostics: CPU snapshots computed per cascade so far. */
   snapshotCounts(out: number[]): number[];
 }
@@ -918,6 +923,15 @@ export function createOcean(opts: OceanOptions = {}): Ocean {
       ST[S_E] += se; ST[S_N] += sn;
       out.east = ST[S_E]; out.north = ST[S_N]; out.up = ST[S_H];
       out.vEast = ST[S_VE]; out.vNorth = ST[S_VN]; out.vUp = ST[S_VH];
+      return out;
+    },
+
+    cpuStats(out: number[]): number[] {
+      for (let k = 0; k < K; k++) {
+        const sm = kSim[k], c = kCascade[k];
+        out[4 * c] = sm.computed; out[4 * c + 1] = sm.syncComputed;
+        out[4 * c + 2] = sm.posBlocksFilled; out[4 * c + 3] = sm.velBlocksFilled;
+      }
       return out;
     },
 

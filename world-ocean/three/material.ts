@@ -15,8 +15,10 @@
 //   Fresnel     split-sum env BRDF (Karis mobile fit), F0 .0180094 (= IOR 1.31) (:114-118, :297).
 //   reflection  prefiltered env (PMREM) at roughness min(.22 + rough, 1) (:131-132, :295).
 //   water body  deep (.0159963,.0612461,.0998987) x mediumLight, mediumLight = diffuseSky .8 + sun (.12 + .18 NoL);
-//               transmitted scene x Beer-Lambert exp(-sigma path) when a `transmission` input is plugged in
-//               (refraction piece), else the reference's no-refraction path (valid = 0) (:282-290).
+//               transmitted scene x Beer-Lambert exp(-sigma path) + in-scatter deep x mediumLight x (1 - exp) when a
+//               `transmission` input is plugged in (three/refraction.ts) and a background exists; else (open water,
+//               sky behind) exactly the reference's no-refraction path (valid = 0) (:282-290).
+//   contact     transmission.contact(color) after foam, before haze: edge fade to the raw scene + contact foam (:337-348).
 //   SSS / crest transmissionTint (.0159963,.1356333,.0908417) x smoothstep(-.3,.85, height / waveScale)
 //               x (.12 + .6 backLight) x (diffuseSky .4 + sun 2.2), backLight = max(V . -norm(L + .4 N), 0)^2 (:283, :291-293).
 //   foam        coverage from the `foamCoverage` input (foam piece; default: the FFT compression); grey foam
@@ -37,7 +39,7 @@
 import { DoubleSide, MeshBasicNodeMaterial, Vector3 } from 'three/webgpu';
 import {
   cameraPosition, clamp, dFdx, dFdy, dot, exp, exp2, float, length, max, min, mix, modelWorldMatrix, normalize,
-  pmremTexture, pow, positionWorld, reflect, smoothstep, sqrt, uniform, varying, vec2, vec3, vec4,
+  pmremTexture, pow, positionWorld, reflect, select, smoothstep, sqrt, uniform, varying, vec2, vec3, vec4,
 } from 'three/tsl';
 import type { EnvironmentState, SkyLight } from '../stubs/world-core.ts';
 import type { FftSampling, OceanFft } from './fft.ts';
@@ -60,6 +62,35 @@ export interface OceanFoamContext {
   windAB: any;
 }
 
+/** What the transmission (refraction) hook gets (fragment-stage TSL nodes). */
+export interface OceanTransmissionContext {
+  /** Refraction normal (reference mix(surfaceNormal, N, .22), viewer-facing), world axes. */
+  normalWorld: any;
+  /** Unit vector fragment -> camera, world axes. */
+  viewDir: any;
+  positionWorld: any;
+  /** Local up (shape), world axes. */
+  upWorld: any;
+  /** Periodic rest-tile coordinate for period P (m), varying (contact pattern). */
+  tileCoord(period: number): any;
+  /** The material's preExposure node (scene.color = radiance x preExposure). */
+  preExposure: any;
+  /** Foam / contact white level (cd/m^2 per reference unit). */
+  foamWhite: any;
+}
+
+/** What the transmission hook returns. */
+export interface OceanTransmission {
+  /** Transmitted scene radiance (cd/m^2, NOT pre-exposed). */
+  color: any;
+  /** Optical path through the water, m. */
+  path: any;
+  /** 1 where a background exists under the water, 0 = open water (deep-water path, exactly). */
+  valid: any;
+  /** Optional contact / shoreline composite, applied after foam and before haze (radiance in, radiance out). */
+  contact?: (color: any) => any;
+}
+
 export interface OceanMaterialOptions {
   fft: OceanFft;
   sampling: FftSampling;
@@ -79,8 +110,8 @@ export interface OceanMaterialOptions {
   preExposure: any;
   /** Foam coverage 0..1 (node, or a builder receiving the surface context). Default: from the FFT compression. */
   foamCoverage?: any | ((ctx: OceanFoamContext) => any);
-  /** Transmitted scene (refraction piece): { color (cd/m^2, vec3), path (m), valid (0..1) } built from the context. */
-  transmission?: (ctx: { normalWorld: any; viewDir: any; positionWorld: any }) => { color: any; path: any; valid: any };
+  /** Transmitted scene (refraction piece, three/refraction.ts) built from the context. */
+  transmission?: (ctx: OceanTransmissionContext) => OceanTransmission;
   /** Distance haze. false = none (engine atmosphere does it). Default: reference Gaussian haze to the env horizon. */
   haze?: false | { distance?: any; color?: (dir: any) => any };
   /** Wave height normaliser of the crest glow (reference uWave). Default: expectedHs / 2.575 (Hs at amplitude 1). */
@@ -180,14 +211,17 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
   // ---------------------------------------------------------------- water body (absorption + scatter)
   const deep = vec3(...DEEP);
   const mediumLight = diffuseSky.mul(0.8).add(sunRef.mul(NoL.mul(0.18).add(0.12)));
-  let water: any;
+  let water: any = deep.mul(mediumLight); // reference with refractionValid = 0 (open water / no pre-pass)
+  let transmitted: OceanTransmission | null = null;
   if (o.transmission) {
     const refractionNormal = faceV(normalize(mix(surfaceNormal, N, 0.22)));
-    const t = o.transmission({ normalWorld: refractionNormal, viewDir: V, positionWorld });
-    const ext = exp(vec3(...SIGMA).negate().mul(t.path)).mul(t.valid);
-    water = t.color.mul(ext).add(deep.mul(mediumLight).mul(float(1).sub(ext)));
-  } else {
-    water = deep.mul(mediumLight); // reference with refractionValid = 0 (open water / no pre-pass)
+    transmitted = o.transmission({
+      normalWorld: refractionNormal, viewDir: V, positionWorld, upWorld: upW, tileCoord: tileF,
+      preExposure: o.preExposure, foamWhite,
+    });
+    const ext = exp(vec3(...SIGMA).negate().mul(transmitted.path));
+    // select (not x valid): open water stays bit-identical to the no-refraction path.
+    water = select(transmitted.valid.greaterThan(0.5), transmitted.color.mul(ext).add(water.mul(float(1).sub(ext))), water);
   }
   // crest translucency (subsurface glow)
   const crest = smoothstep(-0.3, 0.85, height.div(max(waveScale, 0.1)));
@@ -215,6 +249,8 @@ export function createOceanMaterial(o: OceanMaterialOptions): OceanMaterial {
   color = color.sub(sunSpec.mul(float(1).sub(clamp(float(1).sub(foam.mul(2)), 0, 1))));
   const foamColor = vec3(clamp(dot(surfaceNormal, L), 0, 1).mul(0.7).add(0.3)).mul(foamWhite);
   color = mix(color, foamColor, foam);
+  // contact / shoreline (refraction piece; reference :337-348): soft intersection + contact foam over rocks.
+  if (transmitted?.contact) color = transmitted.contact(color);
 
   // ---------------------------------------------------------------- distance haze (Gaussian, to the horizon env)
   if (o.haze !== false) {

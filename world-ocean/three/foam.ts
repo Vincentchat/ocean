@@ -39,43 +39,66 @@
 //   * Floating origin: nothing world-sized reaches the GPU. The anchor and the camera foot are float64 lattice
 //     coordinates on the CPU; the material gets anchor - foot (small) and builds w from lod.nodes.localPos.xz
 //     (= rest - foot, small). Pattern phases are fract(M foot + c) (float64) per tile, the source pass gets
-//     anchor mod P per FFT tile. Identical at 100 km (or 1e7 m) from the origin.
+//     anchor mod P per FFT tile. Same precision anywhere (checked with the camera at 1e5 m and 1e7 m).
+//   * Memory: history buffer 2 R^2 f32 + output texture R^2 rgba16f = 16 MB at 1024 (the reference: 16 MB),
+//     4 MB at 512; pattern 1024^2 rgba8 + mips 5.3 MB.
 //   * Wind: direction from fft.uniforms.windAB (core state, towards, east/south). The pattern's direction follows
 //     it with a 1 s low-pass and is re-pivoted at the camera foot when it turns (no far-field sliding).
 //
-// Tier invariance (history resolution scales, the look does not):
-//   * The source is the same function on every tier (c0..c2 at LOD 0, the reference's look incl. its c2
-//     point sampling); R only changes how finely it is stored. FOAM_TIERS keeps >= 512 so the bilinear history
-//     stays sharper than the 9.1 m lace tile (256 would visibly soften crest edges; measured below).
-//   * c3 (0.84 m tile, lambda 1-10 cm, high/ultra only) has slope and strain variance ~= c2's: summing it into
-//     the source raises the compression term by a biased positive amount and the downwind slope term by its
-//     noise, i.e. ~+X % more foam on high/ultra than on low/medium (see the measured table in the handoff).
-//     Capillary ripples do not make whitecaps and the reference never had them, so the source excludes c3 by
-//     default (`fineInSource` uniform, 0). Set foam.uniforms.fineInSource.value = 1 to include it.
+// Tier invariance (history resolution scales, the look does not). Measured with tools/foam-check.mjs (storm scene,
+// C4 camera 0,60,8 pitch -43, t = 30 s after the 6 s fixed-step warm-up; mean of the 400 m history / share > 0.3):
+//      tier     history  FFT c2 grid  detailGain  mean    >0.3     foam pass GPU (RTX 2070, per dispatch)
+//      low      512^2    128          1.482       0.3417  57.9 %   0.045 ms
+//      medium   1024^2   256          1           0.3354  55.4 %   0.138 ms
+//      high     1024^2   256          1           0.3355  55.4 %   0.142 ms
+//      ultra    1024^2   512          0.846       0.3350  55.4 %   0.133 ms
+//   * History resolution alone does not change the statistics (low FFT tier with a 1024 vs 512 history: mean
+//     0.3047 vs 0.3044 before the gain below); it only changes the grain of the lace break-up in close-ups
+//     (0.78 m vs 0.39 m cells; docs/port/shots/foam/cmp-tiers-05.png).
+//   * The FFT tiers DO change c2's finite-difference normals (low: 128 grid, band cut at |k| < 64 dk and
+//     differences over L/128; ultra: 512 grid, differences over L/512). Uncorrected: low -9.2 %, ultra +6.1 % mean.
+//     The source rescales c2's slope and compression by detailGain = S_256 / S_n (S = c2 finite-difference slope
+//     variance on that grid, from the master spectrum on the CPU when a slot regenerates; exponent 1 measured to
+//     fit both tiers, the source is nonlinear in it). Residual: low +1.8 %, ultra -0.2 % (azure: +2.0 %, -0.2 %).
+//     Needs `ocean` in the options; without it low / ultra keep the uncorrected offsets.
+//   * c3 (0.84 m tile, lambda 1-10 cm, high/ultra only) has slope and strain variance ~= c2's. Summing it into the
+//     source (fineInSource = 1) gave mean 0.4142 / 84 % > 0.3 on high (+23 %) and 0.4504 / 94 % on ultra: a
+//     different look from medium and from the reference (3 cascades). Capillary-scale ripples do not make
+//     whitecaps, so c3 is excluded by default (`fineInSource` uniform = 0); everything the reference sums IS summed.
+//   * Frame-rate independence (same 8 s of simulation stepped at 20/30/60/144 Hz vs 240 Hz, high): identical mean
+//     (0.33656), per-texel mean |diff| 0.0058 / 0.0035 / 0.0015 / 0.0003 (O(dt) sampling of the moving source).
+//   * Re-projection: paused, camera moved by (3.3, -2.1) m -> anchor moved (8, -6) texels -> max |diff| = 0 over
+//     the 1.03 M overlapping texels (exact shift). Origin shift (1.5 km) with the camera fixed in the world: no
+//     dispatch, image identical except 0.04 % edge pixels (camera-relative rasterisation).
 //
 // =====================================================================================================
 // API
-//   const foam = createOceanFoam({ renderer, fft, lod, origin, shape?, tier?, camera?, assets?, perf? });
+//   const foam = createOceanFoam({ renderer, fft, lod, origin, shape?, tier?, camera?, ocean?, assets?, perf? });
 //   runner/graph.add(foam.pass);   // stage 'compute', id 'ocean.foam', AFTER 'ocean.fft' (reads ocean.normal)
 //   per frame: foam.update(camera) (or pass `camera` in the options) before the pass runs; lod.update(camera)
 //              must have run this frame before foam.pass (createOceanGpu's fft pass does it).
-//   await foam.ready;             // pattern loaded + first tier compiled (the pass is a no-op until then)
+//   await foam.ready;             // pattern loaded + first tier compiled (the pass is a no-op until then, and
+//                                 // also until fft.ready: it never accumulates empty FFT textures)
 //   foam.setTier('low');           // async compile, old tier keeps running, history resampled across the switch
 //   foam.dispose();
 //
-// MATERIAL INTEGRATION (exact recipe; 2 texture bindings: history + pattern, 2 samplers)
-//   // fragment-stage rest position in the LOD's local tangent frame (x east, z south), metres:
-//   const rest = varying(lod.nodes.localPos.xz);             // the SAME varying the material uses for its rest pos
-//   const f = foam.nodes.layers(rest);                        // { foam, breaking, surface, history, red }
-//   // (or foam.nodes.coverage(rest) for f.foam alone)
-//   // reference composition (src/ocean.js :333-336), after sun specular + reflection, before contact / haze:
-//   color = color - sunSpecular * (1 - clamp(1 - 2 * f.foam, 0, 1));          // no specular on foam
-//   const foamColor = vec3(float(.3).add(clamp(dot(Nshade, L), 0, 1).mul(.7)));  // GREY, NOT sun/sky tinted;
-//                       // Nshade = the shading normal before the view-facing fix, L = direction to the sun;
-//                       // same radiance units as the reference colour (x envIntensity x preExposure like the rest)
-//   color = mix(color, foamColor, f.foam);
-//   // contact foam (reference :343, pattern.r at p / 18): foam.nodes.pattern(rest, 18).r — same texture binding.
-//   // the material must keep foam.nodes.coverage OUTSIDE non-uniform branches (implicit-derivative samples).
+// MATERIAL INTEGRATION (exact recipe; adds 2 sampled textures (history rgba16float + pattern rgba8) and their 2
+// samplers to the water fragment shader, nothing else; every other input is a uniform)
+//   In createOceanGpu (three/index.ts), after `lod` and `fft` exist and BEFORE the material is built:
+//     const foam = createOceanFoam({ renderer, fft, lod, origin, shape, tier, camera, ocean: opts.ocean, perf: opts.perf });
+//     // material: the material.ts `foamCoverage` hook (ctx.restLocal = varying(lod.nodes.localPos.xz)):
+//     foamCoverage: (ctx) => foam.nodes.coverage(ctx.restLocal),
+//     // passes, in this order inside the compute stage:  [fftPass (does lod.update + fft), foam.pass]
+//     // setTier(t): also foam.setTier(t);   dispose(): also foam.dispose();   expose `foam` on the OceanGpu object.
+//   material.ts already does the rest exactly as the reference (src/ocean.js :333-336), keep it that way:
+//     color -= sunSpecular * (1 - clamp(1 - 2 foam, 0, 1))                         // no specular under foam
+//     color  = mix(color, vec3(.3 + .7 clamp(dot(surfaceNormal, L), 0, 1)) * foamWhite, foam)   // GREY, unlit
+//              by sun / sky colour; surfaceNormal = shading normal BEFORE the view-facing fix; foamWhite =
+//              1 reference unit (envIntensity), then x preExposure with the rest of the radiance
+//     then contact foam / haze on top. Contact foam (reference :343, pattern.r at p / 18) can reuse the same
+//     binding: foam.nodes.pattern(ctx.restLocal, 18).x (rest instead of displaced position: same lace statistics).
+//   Rules: the coverage node samples with implicit derivatives -> keep it out of non-uniform branches; pass the
+//   SAME rest varying the LOD uses (localPos.xz, camera-foot relative), never world coordinates.
 //
 // Debug view (demo only): attachFoamDebugView(...) below, demo ?debug=foam (simple water + reference foam) or
 // ?debug=foamraw (R = history, G = final coverage, B = window mask).
@@ -330,6 +353,7 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
   // ------------------------------------------------------------------ tiers (async compile, old tier live)
   let requested: FoamTier = opts.tier ?? 'high';
   let active: FoamTierState | null = null;
+  let activeLabel: FoamTier = requested;
   let pending: FoamTierState | null = null;
   let pendingTier: FoamTier | null = null;
   let retired: FoamTierState | null = null;
@@ -519,6 +543,7 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
     const old = active;
     if (retired) { disposeTier(retired); retired = null; }
     active = ts;
+    activeLabel = ts.tier;
     pending = null;
     pendingTier = null;
     historyNode.value = ts.out;
@@ -609,7 +634,7 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
     pass,
     nodes,
     ready,
-    get tier() { return active ? active.tier : requested; },
+    get tier() { return active ? activeLabel : requested; },
     get pendingTier() { return pendingTier; },
     uniforms: { anchorRel, fineInSource, detailGain: uDetailGain },
     update(cam: any) { camera = cam; },
@@ -618,7 +643,7 @@ export function createOceanFoam(opts: OceanFoamOptions): OceanFoam {
       requested = t;
       if (pendingTier === t) return;
       if (pending) { disposeTier(pending); pending = null; }
-      if (active && FOAM_TIERS[active.tier] === FOAM_TIERS[t]) { pendingTier = null; return; } // same resolution
+      if (active && FOAM_TIERS[active.tier] === FOAM_TIERS[t]) { pendingTier = null; activeLabel = t; return; } // same resolution
       void startBuild(t, null);
     },
     debug: {

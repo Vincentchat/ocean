@@ -9,8 +9,11 @@
     ".": "./index.ts",
     "./three": "./three/index.ts"
   },
+  "engines": {
+    "node": ">=22.6"
+  },
   "scripts": {
-    "test": "node --experimental-strip-types --test \"tests/*.test.ts\"",
+    "test": "node --experimental-strip-types --test --test-concurrency=1 \"tests/**/*.test.ts\"",
     "demo": "vite --config vite.config.mjs --host 127.0.0.1 --port 5180 --strictPort",
     "reference": "node tools/serve.mjs --reference --port 5173",
     "capture": "node tools/capture.mjs",

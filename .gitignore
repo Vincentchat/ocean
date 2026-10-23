@@ -7,3 +7,10 @@ dist/
 .DS_Store
 __pycache__/
 .venv/
+
+# Port evidence (large captures stay local)
+docs/port/shots/*
+!docs/port/shots/latest/
+!docs/port/shots/milestones/
+docs/port/reviews/scratch/
+

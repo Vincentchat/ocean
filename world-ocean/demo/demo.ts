@@ -21,17 +21,24 @@
 //   ?debug=name                  debug view name handed to createOceanGpu (e.g. velocity).
 //   ?exposure=x                  extra tonemap exposure (default 1).  ?dpr=x pixel ratio cap (default 1.75).
 //   ?parity                      reserved for the ocean parity check (handed through as window.__demo.flags).
+//   ?seabed=1|0|nomesh           demo seabed (reference sand + rocks + caustics; default 1). 0 = open ocean only.
+//                                nomesh = TERRAIN_QUERY / TERRAIN_GPU provided but the mesh not drawn (contract test).
+//   ?refraction=1|0              water in the transparent stage refracting scene.color / scene.depth (default 1).
+//                                0 = the water is a plain scene mesh (no refraction, the pre-refraction path).
+//   ?msaa=1|0                    4x MSAA transparent-stage target (default 1). 0 = the water draws into scene.color
+//                                itself (the single-target path of the ocean.water pass).
 import {
-  HalfFloatType, LinearSRGBColorSpace, NoToneMapping, NodeMaterial, PerspectiveCamera, QuadMesh, RenderTarget,
-  Scene, Vector3, WebGPURenderer,
+  ClampToEdgeWrapping, DataTexture, DataUtils, DepthTexture, FloatType, HalfFloatType, LinearFilter, LinearSRGBColorSpace,
+  NoToneMapping, NodeMaterial, PerspectiveCamera, QuadMesh, RedFormat, RenderTarget, Scene, Vector3, WebGPURenderer,
 } from 'three/webgpu';
 import { Fn, clamp, max, pow, texture, uniform, uv, vec3, vec4 } from 'three/tsl';
 import { setAssetResolver, OCEAN_ASSETS, DEMO_ASSETS } from '../assets.ts';
 import { createOceanGpu, type OceanTier, type Pass, type PassContext, type OceanGpu } from '../three/index.ts';
 import {
-  createFloatingOrigin, createStubWorld, createStubWind, createStubEnvironment,
+  createFloatingOrigin, createStubWorld, createStubWind, createStubEnvironment, createStubTerrainGrid,
 } from '../stubs/impl.ts';
-import { ENVIRONMENT, SKY_LIGHT, WIND_QUERY, type FrameInfo } from '../stubs/world-core.ts';
+import { ENVIRONMENT, SKY_LIGHT, TERRAIN_GPU, TERRAIN_QUERY, WIND_QUERY, type FrameInfo } from '../stubs/world-core.ts';
+import { createDemoSeabed, type DemoSeabed } from './seabed.ts';
 import { createPassRunner } from './pass-runner.ts';
 import { createFreeCamera } from './free-camera.ts';
 import { createPhotoSky, REF_NITS, SKY_PRESETS, type SkyPresetName } from './photo-sky.ts';
@@ -56,6 +63,9 @@ const flags = {
   cam: parseNumbers(params.get('cam'), 5),
   origin: parseNumbers(params.get('origin'), 3),
   wind: parseNumbers(params.get('wind'), 2),
+  seabed: params.get('seabed') ?? '1',
+  refraction: params.get('refraction') !== '0',
+  msaa: params.get('msaa') !== '0',
 };
 function parseNumbers(s: string | null, n: number): number[] | null {
   if (!s) return null;
@@ -161,6 +171,29 @@ async function main() {
   world.provide(ENVIRONMENT, env);
   if (flags.wind) world.provide(WIND_QUERY, createStubWind(flags.wind[0], flags.wind[1], world.shape));
 
+  // Demo seabed (demo only): opaque mesh in the scene pass + TERRAIN_QUERY / TERRAIN_GPU stand-ins. The ocean only
+  // sees it through scene.color / scene.depth and the contracts.
+  let seabed: DemoSeabed | null = null;
+  let terrainGrid: ReturnType<typeof createStubTerrainGrid> | null = null;
+  if (flags.seabed !== '0') {
+    seabed = createDemoSeabed({ origin, preExposure, refNits: REF_NITS });
+    if (flags.seabed !== 'nomesh') scene.add(seabed.mesh);
+    world.provide(TERRAIN_QUERY, seabed.query);
+    const RES = 256;
+    const half = new Uint16Array(RES * RES);
+    const terrainTex = new DataTexture(half, RES, RES, RedFormat, HalfFloatType);
+    terrainTex.minFilter = LinearFilter; terrainTex.magFilter = LinearFilter;
+    terrainTex.wrapS = ClampToEdgeWrapping; terrainTex.wrapT = ClampToEdgeWrapping;
+    terrainTex.generateMipmaps = false;
+    terrainTex.name = 'demo.terrain.height';
+    terrainGrid = createStubTerrainGrid(seabed.query, world.shape, {
+      size: 256, resolution: RES,
+      onChange(g) { for (let i = 0; i < half.length; i++) half[i] = DataUtils.toHalfFloat(g.data[i]); terrainTex.needsUpdate = true; },
+    });
+    terrainGrid.texture = terrainTex;
+    world.provide(TERRAIN_GPU, terrainGrid);
+  }
+
   // Core ocean (written by the core builder). Loaded dynamically so the shell runs before it exists.
   let core: any = null, ocean: any = null;
   try {
@@ -182,11 +215,29 @@ async function main() {
   const perf = createPerfSink();
   const runner = createPassRunner(perf);
   const size = { w: 1, h: 1 };
-  const sceneColor = new RenderTarget(1, 1, { type: HalfFloatType, samples: 4, depthBuffer: true });
+  // Render-graph stand-in targets.
+  //   refraction on : 'scene.color' = opaque scene (sky + seabed), 1x RGBA16F, + 'scene.depth' (depth32float texture),
+  //                   written by demo.scene and sampled by ocean.water; 'scene.color.transparent' = 4x MSAA RGBA16F the
+  //                   transparent stage draws into (ocean.water resolves scene.color/depth into it, then draws the
+  //                   water); the tonemap reads it. ?msaa=0: no transparent target, the water draws into scene.color.
+  //   refraction off: 'scene.color' = 4x MSAA RGBA16F, everything (water included) drawn by demo.scene (old path).
+  const sceneColor = new RenderTarget(1, 1, { type: HalfFloatType, samples: flags.refraction ? 0 : 4, depthBuffer: true });
   sceneColor.texture.name = 'scene.color';
+  if (flags.refraction) {
+    sceneColor.depthTexture = new DepthTexture(1, 1);
+    sceneColor.depthTexture.type = FloatType;
+    sceneColor.depthTexture.name = 'scene.depth';
+  }
+  const transparentTarget = flags.refraction && flags.msaa
+    ? new RenderTarget(1, 1, { type: HalfFloatType, samples: 4, depthBuffer: true }) : null;
+  if (transparentTarget) transparentTarget.texture.name = 'scene.color.transparent';
+  const finalColor = transparentTarget ?? sceneColor;
+  const targets: Record<string, any> = { 'scene.color': sceneColor };
+  if (sceneColor.depthTexture) targets['scene.depth'] = sceneColor.depthTexture;
+  if (transparentTarget) targets['scene.color.transparent'] = transparentTarget;
   const ctx: PassContext = {
     renderer, dt: 0, frame: 0, width: 1, height: 1, tier: flags.tier, time: 0,
-    targets: { 'scene.color': sceneColor },
+    targets,
   };
   function resize() {
     renderer.setPixelRatio(Math.min(devicePixelRatio, flags.dpr));
@@ -195,6 +246,7 @@ async function main() {
     size.w = Math.max(1, Math.floor(innerWidth * pr));
     size.h = Math.max(1, Math.floor(innerHeight * pr));
     sceneColor.setSize(size.w, size.h);
+    transparentTarget?.setSize(size.w, size.h);
     ctx.width = size.w; ctx.height = size.h;
     camera.aspect = innerWidth / innerHeight;
     camera.updateProjectionMatrix();
@@ -209,6 +261,8 @@ async function main() {
   let gpu: OceanGpu = createOceanGpu({
     ocean, renderer, scene, camera, origin, shape: world.shape, tier: flags.tier, skyLight: sky.skyLight, envMap: sky.envMap,
     environment: env, envIntensity: sky.envIntensity, preExposure, perf, debug: flags.debug,
+    // Water in the transparent stage, refracting scene.color / scene.depth; TERRAIN_GPU from the world (optional).
+    refraction: flags.refraction, terrainGpu: world.optional(TERRAIN_GPU),
     // Reference scenes: the crest glow is normalised by the reference Wave slider (golden .9, azure 1, storm 1.5).
     waveScale: flags.scene ? REFERENCE_WAVE[flags.scene] : undefined,
   } as any);
@@ -230,11 +284,28 @@ async function main() {
     $('tier').addEventListener('change', () => foam.setTier(($('tier') as HTMLSelectElement).value as OceanTier));
     (window as any).__foam = { foam, view };
     await foam.ready;
+    // Deterministic ?shot: let the FFT finish its async compile before the fixed-step warm-up starts, otherwise
+    // the foam history's start time (and so the shot) depends on how long the compile took.
+    let fftUp = false;
+    void gpu.ready.then(() => { fftUp = true; });
+    while (!fftUp) { for (const p of gpu.passes) p.execute(ctx); await new Promise((r) => setTimeout(r, 16)); }
   }
 
+  const camWorld = { x: 0, y: 0, z: 0 };
   const scenePass: Pass = {
-    desc: { id: 'demo.scene', module: 'demo', stage: 'scene', reads: ['ocean.displacement', 'demo.env'], writes: ['scene.color', 'scene.depth'] },
+    desc: {
+      id: 'demo.scene', module: 'demo', stage: 'scene',
+      reads: flags.refraction ? ['demo.env'] : ['ocean.displacement', 'demo.env'], writes: ['scene.color', 'scene.depth'],
+    },
     execute(c) {
+      if (seabed) {
+        const sl = sky.skyLight;
+        seabed.update(c.time, sl.sunDir, sl.reference.solarColor, sl.reference.storminess);
+      }
+      if (terrainGrid) {
+        camWorld.x = freeCam.x; camWorld.y = freeCam.y; camWorld.z = freeCam.z;
+        terrainGrid.update(camWorld);
+      }
       c.renderer.setRenderTarget(sceneColor);
       c.renderer.render(scene, camera);
     },
@@ -243,7 +314,7 @@ async function main() {
   const tonemapMaterial = new NodeMaterial();
   tonemapMaterial.name = 'demo.tonemap';
   tonemapMaterial.fragmentNode = Fn(() => {
-    const x = max(texture(sceneColor.texture, uv()).rgb.mul(exposure), vec3(0));
+    const x = max(texture(finalColor.texture, uv()).rgb.mul(exposure), vec3(0));
     const mapped = clamp(x.mul(x.mul(2.51).add(0.03)).div(x.mul(x.mul(2.43).add(0.59)).add(0.14)), 0, 1);
     return vec4(pow(mapped, vec3(1 / 2.2)), 1);
   })();
@@ -352,7 +423,7 @@ async function main() {
   let statsTimer = 0, statsFrames = 0, statsCpu = 0, statsInterval = 0;
   const stats = $('stats');
 
-  (window as any).__demo = { renderer, scene, camera, world, origin, ocean, core, get gpu() { return gpu; }, sky, runner, freeCam, flags, perf, adapterInfo };
+  (window as any).__demo = { renderer, scene, camera, world, origin, ocean, core, get gpu() { return gpu; }, sky, runner, seabed, terrainGrid, freeCam, flags, perf, adapterInfo };
 
   // ---------------------------------------------------------------------------------- shot state
   const fixedDt = world.fixedDt;

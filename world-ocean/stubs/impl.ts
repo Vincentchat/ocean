@@ -9,6 +9,8 @@ import type {
   RGB,
   SkyLight,
   TangentFrame,
+  TerrainGpuHeight,
+  TerrainQuery,
   TickInfo,
   TickPhase,
   Vec3,
@@ -307,6 +309,85 @@ export function createStubSkyLight(sunElevationDeg = 38, cloudCover = 0.2): Stub
   };
   sky.update(sunElevationDeg, cloudCover);
   return sky;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Terrain (TERRAIN_QUERY + TERRAIN_GPU stand-ins)
+// ---------------------------------------------------------------------------------------------
+/** TERRAIN_QUERY from a height function (world point -> ground height above sea level along up, m). */
+export function createStubTerrain(heightAt: (p: Readonly<Vec3>) => number): TerrainQuery {
+  return { heightAt };
+}
+
+export interface StubTerrainGrid extends TerrainGpuHeight {
+  /** Set by the host (three adapter: a DataTexture over `data`). */
+  texture: unknown;
+  readonly center: Vec3;
+  readonly east: Vec3;
+  readonly north: Vec3;
+  readonly up: Vec3;
+  readonly size: number;
+  readonly resolution: number;
+  version: number;
+  /** R heights (m above sea level), row j = north, column i = east: texel (i, j) centre at
+   *  uv = ((i + .5) / res, (j + .5) / res) with uv = (dot(p - center, east), dot(p - center, north)) / size + .5. */
+  readonly data: Float32Array;
+  /** Re-centre on `p` (world, e.g. the camera) when it is more than `recenter` x size from the centre (or on the first
+   *  call): snaps the centre to the texel lattice, refills `data` from the query, bumps `version`, calls onChange.
+   *  Returns true when refilled. Allocation-free. */
+  update(p: Readonly<Vec3>): boolean;
+}
+
+/**
+ * TERRAIN_GPU stand-in: a camera-centred height grid filled on the CPU from a TerrainQuery (spec 3 GpuGridSource uv
+ * convention). The host owns the GPU texture (no three import here) and uploads `data` in onChange.
+ */
+export function createStubTerrainGrid(query: TerrainQuery, shape: WorldShape, opts: {
+  size?: number; resolution?: number; recenter?: number; onChange?: (grid: StubTerrainGrid) => void;
+} = {}): StubTerrainGrid {
+  const size = opts.size ?? 256, res = opts.resolution ?? 256, recenter = opts.recenter ?? 0.125;
+  const texel = size / res;
+  const frame: TangentFrame = { east: vec3(), north: vec3(), up: vec3() };
+  const foot = vec3(), q = vec3();
+  let first = true;
+  const grid: StubTerrainGrid = {
+    texture: null,
+    center: vec3(), east: vec3(1, 0, 0), north: vec3(0, 0, -1), up: vec3(0, 1, 0),
+    size, resolution: res, version: 0,
+    data: new Float32Array(res * res),
+    update(p) {
+      shape.atAltitude(p, 0, foot);
+      const c = grid.center;
+      const dx = foot.x - c.x, dy = foot.y - c.y, dz = foot.z - c.z;
+      if (!first && dx * dx + dy * dy + dz * dz < (recenter * size) ** 2) return false;
+      first = false;
+      shape.tangentFrame(foot, frame);
+      set(grid.east, frame.east.x, frame.east.y, frame.east.z);
+      set(grid.north, frame.north.x, frame.north.y, frame.north.z);
+      set(grid.up, frame.up.x, frame.up.y, frame.up.z);
+      // Snap the centre to the texel lattice along east / north (world-anchored, so texels never swim).
+      const e = Math.round((foot.x * frame.east.x + foot.y * frame.east.y + foot.z * frame.east.z) / texel) * texel;
+      const n = Math.round((foot.x * frame.north.x + foot.y * frame.north.y + foot.z * frame.north.z) / texel) * texel;
+      const u = foot.x * frame.up.x + foot.y * frame.up.y + foot.z * frame.up.z;
+      set(c, e * frame.east.x + n * frame.north.x + u * frame.up.x,
+        e * frame.east.y + n * frame.north.y + u * frame.up.y,
+        e * frame.east.z + n * frame.north.z + u * frame.up.z);
+      const d = grid.data;
+      for (let j = 0; j < res; j++) {
+        const nn = ((j + 0.5) / res - 0.5) * size;
+        for (let i = 0; i < res; i++) {
+          const ee = ((i + 0.5) / res - 0.5) * size;
+          set(q, c.x + ee * frame.east.x + nn * frame.north.x, c.y + ee * frame.east.y + nn * frame.north.y,
+            c.z + ee * frame.east.z + nn * frame.north.z);
+          d[j * res + i] = query.heightAt(q);
+        }
+      }
+      grid.version++;
+      opts.onChange?.(grid);
+      return true;
+    },
+  };
+  return grid;
 }
 
 // ---------------------------------------------------------------------------------------------
